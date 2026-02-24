@@ -1,0 +1,18 @@
+# Xcode
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.xcresult
+
+# SPM
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# SSH keys (safety net — demo key is intentionally bundled in Resources/)
+*.pem
+id_rsa*
+!Resources/id_rsa_zd

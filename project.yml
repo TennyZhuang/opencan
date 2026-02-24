@@ -1,0 +1,34 @@
+name: OpenCAN
+options:
+  bundleIdPrefix: com.tianyizhuang
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+
+packages:
+  Citadel:
+    url: https://github.com/orlandos-nl/Citadel
+    from: "0.7.0"
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui
+    from: "2.4.0"
+
+targets:
+  OpenCAN:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+      - path: Resources
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - package: Citadel
+      - package: MarkdownUI
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        SWIFT_VERSION: "5.10"
+        PRODUCT_BUNDLE_IDENTIFIER: com.tianyizhuang.OpenCAN
