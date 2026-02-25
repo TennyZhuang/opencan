@@ -1,18 +1,26 @@
 import Foundation
 import SwiftUI
+import SwiftData
 
 /// Root state coordinator connecting SSH, ACP, and UI.
 @MainActor @Observable
 final class AppState {
-    // Connection
-    var serverConfig = ServerConfig.demo
+    // Active connection context
+    var activeNode: Node?
+    var activeWorkspace: Workspace?
+    var activeSession: Session?
     var connectionStatus: ConnectionStatus = .disconnected
     var connectionError: String?
+
+    // Navigation
+    var shouldPopToRoot = false
+
+    // All remote sessions discovered via session/list
+    var remoteSessions: [(sessionId: String, cwd: String?, title: String?)] = []
 
     // Chat
     var messages: [ChatMessage] = []
     var currentSessionId: String?
-    var sessions: [SessionInfo] = []
     var isPrompting = false
     var scrollTrigger = 0
 
@@ -33,22 +41,52 @@ final class AppState {
 
     // MARK: - Connection
 
-    func connect() {
-        guard connectionStatus != .connecting && connectionStatus != .connected else { return }
+    /// Connect to a workspace's node via SSH and initialize ACP.
+    /// After this, call createNewSession() or resumeSession() to start chatting.
+    /// If already connected, disconnects first.
+    func connect(workspace: Workspace) {
+        if connectionStatus == .connected || connectionStatus == .connecting {
+            disconnect()
+        }
+        guard let node = workspace.node, let key = node.sshKey else {
+            connectionError = "Node or SSH key not configured"
+            return
+        }
+
         connectionStatus = .connecting
         connectionError = nil
+        activeWorkspace = workspace
+        activeNode = node
+
+        // Build jump server params
+        let jumpHost = node.jumpServer?.host
+        let jumpPort = node.jumpServer?.port
+        let jumpUsername = node.jumpServer?.username
+        let jumpKeyPEM = node.jumpServer?.sshKey?.privateKeyPEM
+
+        let params = SSHConnectionManager.ConnectionParams(
+            host: node.host,
+            port: node.port,
+            username: node.username,
+            privateKeyPEM: key.privateKeyPEM,
+            command: node.command,
+            jumpHost: jumpHost,
+            jumpPort: jumpPort,
+            jumpUsername: jumpUsername,
+            jumpKeyPEM: jumpKeyPEM
+        )
 
         Task {
             do {
-                let t = try await sshManager.connect(config: serverConfig)
+                let t = try await sshManager.connect(params: params)
                 self.transport = t
 
-                ptyTask = Task.detached { [sshManager, serverConfig] in
+                ptyTask = Task.detached { [sshManager] in
                     do {
                         if #available(macOS 15.0, iOS 18.0, *) {
                             try await sshManager.startPTY(
                                 transport: t,
-                                command: serverConfig.command
+                                command: params.command
                             )
                         }
                     } catch {
@@ -72,20 +110,19 @@ final class AppState {
                 Log.app.info("ACP initialized: \(String(describing: initResult))")
                 Log.toFile("[AppState] ACP initialized")
 
-                // Skip auth — agent has it pre-configured on the server
-
                 // Small delay to let the agent fully initialize
                 try await Task.sleep(for: .seconds(1))
 
-                Log.toFile("[AppState] Creating session...")
-                let sessionId = try await service.createSession(cwd: serverConfig.cwd)
-                self.currentSessionId = sessionId
-                self.sessions = [SessionInfo(sessionId: sessionId)]
-
-                startNotificationListener()
+                // List all remote sessions
+                do {
+                    self.remoteSessions = try await service.listSessions()
+                    Log.toFile("[AppState] Found \(self.remoteSessions.count) remote sessions")
+                } catch {
+                    Log.toFile("[AppState] session/list failed: \(error), will create new")
+                    self.remoteSessions = []
+                }
 
                 self.connectionStatus = .connected
-                self.addSystemMessage("Connected to \(self.serverConfig.name)")
             } catch {
                 Log.app.error("Connection error: \(error)")
                 Log.toFile("[AppState] Connection error: \(error)")
@@ -95,8 +132,69 @@ final class AppState {
         }
     }
 
+    /// Create a new ACP session on the active workspace.
+    func createNewSession(modelContext: ModelContext) async throws {
+        guard let service = acpService,
+              let workspace = activeWorkspace else {
+            throw AppStateError.notConnected
+        }
+
+        messages = []
+
+        Log.toFile("[AppState] Creating session...")
+        let sessionId = try await service.createSession(cwd: workspace.path)
+        self.currentSessionId = sessionId
+
+        let session = Session(sessionId: sessionId, workspace: workspace)
+        modelContext.insert(session)
+        try? modelContext.save()
+        self.activeSession = session
+
+        startNotificationListener()
+        addSystemMessage("New session on \(workspace.name)")
+    }
+
+    /// Resume an existing ACP session by loading it.
+    /// If loading fails, falls back to creating a new session and notifies the user.
+    func resumeSession(sessionId: String, modelContext: ModelContext) async throws {
+        guard let service = acpService,
+              let workspace = activeWorkspace else {
+            throw AppStateError.notConnected
+        }
+
+        messages = []
+
+        Log.toFile("[AppState] Loading session \(sessionId)...")
+        do {
+            try await service.loadSession(sessionId: sessionId, cwd: workspace.path)
+        } catch {
+            Log.toFile("[AppState] Load failed, creating new session: \(error)")
+            addSystemMessage("Could not resume session, starting new")
+            try await createNewSession(modelContext: modelContext)
+            return
+        }
+
+        self.currentSessionId = sessionId
+
+        // Find or create local Session record
+        let descriptor = FetchDescriptor<Session>(
+            predicate: #Predicate { $0.sessionId == sessionId }
+        )
+        if let existing = try? modelContext.fetch(descriptor).first {
+            existing.lastUsedAt = Date()
+            self.activeSession = existing
+        } else {
+            let session = Session(sessionId: sessionId, workspace: workspace)
+            modelContext.insert(session)
+            self.activeSession = session
+        }
+        try? modelContext.save()
+
+        startNotificationListener()
+        addSystemMessage("Loaded session")
+    }
+
     func disconnect() {
-        // Capture references before clearing, so the cleanup Task can use them
         let client = acpClient
         let t = transport
         notificationTask?.cancel()
@@ -106,7 +204,12 @@ final class AppState {
         transport = nil
         connectionStatus = .disconnected
         currentSessionId = nil
+        activeSession = nil
+        activeNode = nil
+        activeWorkspace = nil
+        remoteSessions = []
         messages = []
+        shouldPopToRoot = true
         Task.detached { [sshManager] in
             if let client { await client.stop() }
             if let t { await t.close() }
@@ -165,7 +268,7 @@ final class AppState {
 
         case .agentMessageDelta(let text):
             // If the last assistant message already has tool calls,
-            // create a new message so text appears after tool cards
+            // create a new message so text renders below tool cards.
             let msg = lastAssistantMessage()
             if !msg.toolCalls.isEmpty {
                 msg.isStreaming = false
@@ -177,7 +280,7 @@ final class AppState {
             }
 
         case .toolCall(let id, let name, let input):
-            // Tool call starting — previous text is done streaming
+            // Tool call starting — mark previous text as done streaming.
             let msg = lastAssistantMessage()
             if !msg.content.isEmpty {
                 msg.isStreaming = false
@@ -208,7 +311,7 @@ final class AppState {
             lastAssistantMessage().content += "\n> \(text)"
 
         case .promptComplete(_):
-            // Stop streaming on ALL assistant messages from this turn
+            // Stop streaming on ALL assistant messages from this turn.
             for msg in messages where msg.role == .assistant && msg.isStreaming {
                 msg.isStreaming = false
             }
@@ -229,5 +332,15 @@ final class AppState {
 
     private func addSystemMessage(_ text: String) {
         messages.append(ChatMessage(role: .system, content: text))
+    }
+}
+
+enum AppStateError: Error, LocalizedError {
+    case notConnected
+
+    var errorDescription: String? {
+        switch self {
+        case .notConnected: "Not connected to a workspace"
+        }
     }
 }

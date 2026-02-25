@@ -1,10 +1,5 @@
 import Foundation
 
-struct SessionInfo: Identifiable {
-    let sessionId: String
-    var id: String { sessionId }
-}
-
 struct ToolCallInfo: Identifiable {
     let id: String
     var name: String

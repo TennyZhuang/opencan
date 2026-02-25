@@ -37,3 +37,18 @@ targets:
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_LSRequiresIPhoneOS: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+
+  OpenCANUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
+    dependencies:
+      - target: OpenCAN
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.10"
+        PRODUCT_BUNDLE_IDENTIFIER: com.tianyizhuang.OpenCAN.UITests
+        DEVELOPMENT_TEAM: K9329AKMW8
+        CODE_SIGN_STYLE: Automatic

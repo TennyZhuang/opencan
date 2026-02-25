@@ -19,20 +19,38 @@ actor SSHConnectionManager {
 
     private(set) var state: State = .disconnected
 
-    func connect(config: ServerConfig) async throws -> SSHStdioTransport {
+    struct ConnectionParams {
+        let host: String
+        let port: Int
+        let username: String
+        let privateKeyPEM: Data
+        let command: String
+        // Optional jump host
+        let jumpHost: String?
+        let jumpPort: Int?
+        let jumpUsername: String?
+        let jumpKeyPEM: Data?  // nil = use same key as target
+    }
+
+    func connect(params: ConnectionParams) async throws -> SSHStdioTransport {
         state = .connecting
         Log.ssh.warning("Host key verification is disabled — connections are vulnerable to MITM")
 
         do {
-            let privateKey = try loadPrivateKey(named: config.privateKeyName)
+            let privateKey = try loadPrivateKey(pem: params.privateKeyPEM)
 
-            // Connect to jump host if configured
-            if let jumpHost = config.jumpHost {
-                let jumpUser = config.jumpUsername ?? config.username
+            if let jumpHost = params.jumpHost {
+                let jumpUser = params.jumpUsername ?? params.username
+                let jumpKey = if let jumpPEM = params.jumpKeyPEM {
+                    try loadPrivateKey(pem: jumpPEM)
+                } else {
+                    privateKey
+                }
+
                 var jumpSettings = SSHClientSettings(
                     host: jumpHost,
-                    port: Int(config.jumpPort ?? 22),
-                    authenticationMethod: { .rsa(username: jumpUser, privateKey: privateKey) },
+                    port: params.jumpPort ?? 22,
+                    authenticationMethod: { .rsa(username: jumpUser, privateKey: jumpKey) },
                     hostKeyValidator: .acceptAnything()
                 )
                 jumpSettings.algorithms = .all
@@ -44,26 +62,26 @@ actor SSHConnectionManager {
                 Log.ssh.info("Connected to jump host")
                 Log.toFile("[SSH] Connected to jump host")
 
-                let targetUser = config.username
+                let targetUser = params.username
                 var targetSettings = SSHClientSettings(
-                    host: config.host,
-                    port: Int(config.port),
+                    host: params.host,
+                    port: params.port,
                     authenticationMethod: { .rsa(username: targetUser, privateKey: privateKey) },
                     hostKeyValidator: .acceptAnything()
                 )
                 targetSettings.algorithms = .all
 
-                Log.ssh.info("Jumping to target \(config.host)...")
-                Log.toFile("[SSH] Jumping to target \(config.host)...")
+                Log.ssh.info("Jumping to target \(params.host)...")
+                Log.toFile("[SSH] Jumping to target \(params.host)...")
                 let target = try await jump.jump(to: targetSettings)
                 self.targetClient = target
                 Log.ssh.info("Connected to target")
                 Log.toFile("[SSH] Connected to target")
             } else {
-                let user = config.username
+                let user = params.username
                 var settings = SSHClientSettings(
-                    host: config.host,
-                    port: Int(config.port),
+                    host: params.host,
+                    port: params.port,
                     authenticationMethod: { .rsa(username: user, privateKey: privateKey) },
                     hostKeyValidator: .acceptAnything()
                 )
@@ -99,32 +117,24 @@ actor SSHConnectionManager {
         state = .disconnected
     }
 
-    private func loadPrivateKey(named name: String) throws -> Insecure.RSA.PrivateKey {
-        if let url = Bundle.main.url(forResource: name, withExtension: nil)
-            ?? Bundle.main.url(forResource: name, withExtension: "pem") {
-            let keyString = try String(contentsOf: url, encoding: .utf8)
-            return try Insecure.RSA.PrivateKey(sshRsa: keyString)
+    private func loadPrivateKey(pem data: Data) throws -> Insecure.RSA.PrivateKey {
+        guard let keyString = String(data: data, encoding: .utf8) else {
+            throw SSHError.invalidKeyData
         }
-        // On macOS, fall back to ~/.ssh/
-        #if os(macOS)
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        let keyPath = homeDir.appendingPathComponent(".ssh/\(name)")
-        let keyString = try String(contentsOf: keyPath, encoding: .utf8)
         return try Insecure.RSA.PrivateKey(sshRsa: keyString)
-        #else
-        throw SSHError.keyNotFound(name)
-        #endif
     }
 }
 
 enum SSHError: Error, LocalizedError {
     case notConnected
     case keyNotFound(String)
+    case invalidKeyData
 
     var errorDescription: String? {
         switch self {
         case .notConnected: "SSH client not connected"
         case .keyNotFound(let name): "SSH key '\(name)' not found"
+        case .invalidKeyData: "Invalid SSH key data"
         }
     }
 }
