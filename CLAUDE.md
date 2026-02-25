@@ -23,7 +23,7 @@ CONTAINER=$(xcrun simctl get_app_container $SIM com.tianyizhuang.OpenCAN data)
 cat "$CONTAINER/Documents/opencan.log"
 ```
 
-No test target exists yet. No linter is configured.
+No linter is configured. A UI test target (`OpenCANUITests`) exists in `project.yml`.
 
 ## Architecture
 
@@ -35,11 +35,13 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 
 2. **JSON-RPC** — `JSONRPCFramer` (actor) buffers PTY bytes, skips non-JSON noise, extracts newline-delimited messages. `JSONRPCMessage` is the envelope enum (request/response/notification/error). `JSONValue` is a generic JSON type with subscript access.
 
-3. **ACP** — `ACPClient` (actor) correlates request IDs to continuations, dispatches notifications, filters PTY echoes via `sentRequestIds`, and auto-approves `session/request_permission`. `ACPService` provides typed methods: `initialize`, `createSession`, `sendPrompt`. `SessionUpdateParser` maps `session/update` notifications to `SessionEvent` cases.
+3. **ACP** — `ACPClient` (actor) correlates request IDs to continuations, dispatches notifications, filters PTY echoes via `sentRequestIds`, and auto-approves `session/request_permission`. `ACPService` provides typed methods: `initialize`, `createSession`, `sendPrompt`, `listSessions`, `loadSession`. `SessionUpdateParser` maps `session/update` notifications to `SessionEvent` cases.
 
-4. **AppState** — `@MainActor @Observable` coordinator. Owns the connection lifecycle, chat messages, and notification listener. `handleSessionEvent()` routes events to the message model. Creates new `ChatMessage` bubbles when text arrives after tool calls.
+4. **Persistence** — SwiftData models: `Node` (SSH host config + optional jump server), `Workspace` (remote cwd on a node), `Session` (ACP session tied to a workspace), `SSHKeyPair` (RSA key data). Cascade delete: Node → Workspaces → Sessions. Demo data seeded on first launch via `seedDemoDataIfNeeded()`.
 
-5. **SwiftUI** — `ContentView` switches between `ConnectionView` and `ChatView`. Messages render with MarkdownUI. Tool calls are expandable cards with truncated output.
+5. **AppState** — `@MainActor @Observable` coordinator. `connect(workspace:)` establishes SSH + ACP. `createNewSession()` / `resumeSession()` manage ACP sessions with SwiftData persistence. `handleSessionEvent()` routes notifications to the message model. Creates new `ChatMessage` bubbles when text arrives after tool calls.
+
+6. **SwiftUI** — `ContentView` hosts a `NavigationStack` rooted at `NodeListView`. Drill-down: `NodeListView → WorkspaceListView → SessionPickerView → ChatView`. Messages render with MarkdownView. Tool calls are expandable cards with truncated output.
 
 **Key protocol details:**
 - Client initiates `initialize` (not the server). Client IDs start at 1000 to avoid collision with server-initiated request IDs (0, 1, 2...).
@@ -53,12 +55,13 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 - When a `tool_call` starts, the current message's `isStreaming` is set to false.
 - When text arrives after tool calls, a new `ChatMessage` is created so text renders below tool cards.
 - `promptComplete` sets all streaming messages to `isStreaming = false`.
+- `lastAssistantMessage()` sets `isStreaming` to `isPrompting` (not hardcoded `true`) so notifications arriving outside a prompt (e.g., after `session/load`) don't leave stale spinners.
 
 ## Conventions
 
+- **SwiftData** for persistent config (`Node`, `Workspace`, `Session`, `SSHKeyPair`).
 - **Actors** for thread-safe protocol state (`ACPClient`, `JSONRPCFramer`, `SSHStdioTransport`).
 - **`@MainActor @Observable`** for UI state (`AppState`, `ChatMessage`).
 - **`AsyncStream`** for message/notification pipelines.
 - **`Log.toFile()`** for debugging on simulator (os_log doesn't reliably surface `print()` output).
 - **XcodeGen** (`project.yml`) generates the `.xcodeproj`. Run `xcodegen generate` after adding files.
-- Auto-connect is enabled in `ConnectionView.onAppear` for faster iteration.

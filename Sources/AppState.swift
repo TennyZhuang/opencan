@@ -272,7 +272,7 @@ final class AppState {
             let msg = lastAssistantMessage()
             if !msg.toolCalls.isEmpty {
                 msg.isStreaming = false
-                let newMsg = ChatMessage(role: .assistant, isStreaming: true)
+                let newMsg = ChatMessage(role: .assistant, isStreaming: isPrompting)
                 newMsg.content = text
                 messages.append(newMsg)
             } else {
@@ -325,7 +325,7 @@ final class AppState {
         if let last = messages.last, last.role == .assistant {
             return last
         }
-        let msg = ChatMessage(role: .assistant, isStreaming: true)
+        let msg = ChatMessage(role: .assistant, isStreaming: isPrompting)
         messages.append(msg)
         return msg
     }
