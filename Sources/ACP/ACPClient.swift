@@ -42,10 +42,23 @@ actor ACPClient {
         nextId += 1
         sentRequestIds.insert(id)
         let message = JSONRPCMessage.request(id: id, method: method, params: params)
-        try await transport.send(message)
+        // Store continuation BEFORE sending so the response can't arrive first
         return try await withCheckedThrowingContinuation { cont in
             pendingRequests[id] = cont
+            Task { [weak self] in
+                do {
+                    try await self?.transport.send(message)
+                } catch {
+                    if let self, let c = await self.removePending(id) {
+                        c.resume(throwing: error)
+                    }
+                }
+            }
         }
+    }
+
+    private func removePending(_ id: JSONRPCMessage.JSONRPCID) -> CheckedContinuation<JSONValue, Error>? {
+        pendingRequests.removeValue(forKey: id)
     }
 
     /// Send a notification (no response expected).
@@ -57,12 +70,16 @@ actor ACPClient {
     private func handleMessage(_ message: JSONRPCMessage) {
         switch message {
         case .response(let id, let result):
+            sentRequestIds.remove(id)
             if let c = pendingRequests.removeValue(forKey: id) {
                 c.resume(returning: result)
             }
         case .error(let id, let code, let msg, _):
-            if let id, let c = pendingRequests.removeValue(forKey: id) {
-                c.resume(throwing: ACPError.rpcError(code: code, message: msg))
+            if let id {
+                sentRequestIds.remove(id)
+                if let c = pendingRequests.removeValue(forKey: id) {
+                    c.resume(throwing: ACPError.rpcError(code: code, message: msg))
+                }
             }
         case .notification(_, _):
             notificationContinuation.yield(message)

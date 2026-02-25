@@ -6,26 +6,31 @@ import os
 
 /// ACP transport over SSH PTY using Citadel.
 /// Uses withPTY for bidirectional stdin/stdout access.
-final class SSHStdioTransport: ACPTransport, @unchecked Sendable {
+actor SSHStdioTransport: ACPTransport {
     private let framer = JSONRPCFramer()
-    private let continuation: AsyncStream<JSONRPCMessage>.Continuation
-    let messages: AsyncStream<JSONRPCMessage>
+    private let messageContinuation: AsyncStream<JSONRPCMessage>.Continuation
+    nonisolated let messages: AsyncStream<JSONRPCMessage>
     private var stdinWriter: ((String) async throws -> Void)?
     private var isClosed = false
-    private var readyContinuation: CheckedContinuation<Void, Never>?
+    private var readyStream: AsyncStream<Void>?
+    private var readySignal: AsyncStream<Void>.Continuation?
 
     init() {
-        let (stream, cont) = AsyncStream<JSONRPCMessage>.makeStream()
-        self.messages = stream
-        self.continuation = cont
+        let (msgStream, msgCont) = AsyncStream<JSONRPCMessage>.makeStream()
+        self.messages = msgStream
+        self.messageContinuation = msgCont
+        let (rStream, rCont) = AsyncStream<Void>.makeStream()
+        self.readyStream = rStream
+        self.readySignal = rCont
     }
 
     /// Wait until the PTY is connected and ready to send.
     func waitUntilReady() async {
         if stdinWriter != nil { return }
-        await withCheckedContinuation { cont in
-            self.readyContinuation = cont
-        }
+        guard let stream = readyStream else { return }
+        // Consume the first (and only) element — blocks until signalled
+        for await _ in stream { break }
+        readyStream = nil
     }
 
     func send(_ message: JSONRPCMessage) async throws {
@@ -39,9 +44,33 @@ final class SSHStdioTransport: ACPTransport, @unchecked Sendable {
         try await writer(line + "\n")
     }
 
-    func close() async {
+    func close() {
         isClosed = true
-        continuation.finish()
+        messageContinuation.finish()
+        // Unblock any waitUntilReady() callers
+        readySignal?.finish()
+        readySignal = nil
+        readyStream = nil
+    }
+
+    // MARK: - Internal helpers called from the withPTY closure
+
+    private func setWriter(_ writer: @escaping (String) async throws -> Void) {
+        self.stdinWriter = writer
+        readySignal?.yield()
+        readySignal?.finish()
+        readySignal = nil
+    }
+
+    private func feedData(_ data: Data) async {
+        if let raw = String(data: data, encoding: .utf8) {
+            Log.toFile("[stdout] \(raw.prefix(500))")
+        }
+        let parsed = await framer.feed(data)
+        for msg in parsed {
+            Log.toFile("[Transport] Parsed JSON-RPC message")
+            messageContinuation.yield(msg)
+        }
     }
 
     /// Run the PTY session. Blocks until the PTY closes.
@@ -63,16 +92,12 @@ final class SSHStdioTransport: ACPTransport, @unchecked Sendable {
             ])
         )
 
-        try await client.withPTY(ptyRequest) { inbound, outbound in
-            self.stdinWriter = { [outbound] text in
+        try await client.withPTY(ptyRequest) { [self] inbound, outbound in
+            await self.setWriter { [outbound] text in
                 var buf = ByteBufferAllocator().buffer(capacity: text.utf8.count)
                 buf.writeString(text)
                 try await outbound.write(buf)
             }
-
-            // Signal that the transport is ready
-            self.readyContinuation?.resume()
-            self.readyContinuation = nil
 
             // Send the command to launch claude-agent-acp
             var cmdBuf = ByteBufferAllocator().buffer(capacity: command.utf8.count + 1)
@@ -84,21 +109,13 @@ final class SSHStdioTransport: ACPTransport, @unchecked Sendable {
                 switch event {
                 case .stdout(let buffer):
                     let data = Data(buffer: buffer)
-                    if let raw = String(data: data, encoding: .utf8) {
-                        Log.toFile("[stdout] \(raw.prefix(500))")
-                    }
-                    let parsed = await self.framer.feed(data)
-                    for msg in parsed {
-                        Log.toFile("[Transport] Parsed JSON-RPC message")
-                        self.continuation.yield(msg)
-                    }
+                    await self.feedData(data)
                 case .stderr(let buffer):
-                    let text = String(buffer: buffer)
-                    Log.toFile("[stderr] \(text)")
+                    Log.toFile("[stderr] \(String(buffer: buffer))")
                 }
             }
 
-            self.continuation.finish()
+            self.messageContinuation.finish()
         }
     }
 }
