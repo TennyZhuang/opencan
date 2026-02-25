@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import os
 
 /// Root state coordinator connecting SSH, ACP, and UI.
 @Observable
@@ -58,16 +59,26 @@ final class AppState {
                     }
                 }
 
+                // Wait for PTY to be ready before sending ACP messages
+                await t.waitUntilReady()
+
                 let client = ACPClient(transport: t)
                 await client.start()
                 self.acpClient = client
                 let service = ACPService(client: client)
                 self.acpService = service
 
-                let _ = try await service.initialize()
-                print("[AppState] ACP initialized")
+                let initResult = try await service.initialize()
+                Log.app.info("ACP initialized: \(String(describing: initResult))")
+                Log.toFile("[AppState] ACP initialized")
 
-                let sessionId = try await service.createSession(cwd: "/tmp/opencan-workspace")
+                // Skip auth — agent has it pre-configured on the server
+
+                // Small delay to let the agent fully initialize
+                try await Task.sleep(for: .seconds(1))
+
+                Log.toFile("[AppState] Creating session...")
+                let sessionId = try await service.createSession(cwd: serverConfig.cwd)
                 self.currentSessionId = sessionId
                 self.sessions = [SessionInfo(sessionId: sessionId)]
 
@@ -78,6 +89,8 @@ final class AppState {
                     self.addSystemMessage("Connected to \(self.serverConfig.name)")
                 }
             } catch {
+                Log.app.error("Connection error: \(error)")
+                Log.toFile("[AppState] Connection error: \(error)")
                 await MainActor.run {
                     self.connectionError = error.localizedDescription
                     self.connectionStatus = .failed
@@ -120,13 +133,17 @@ final class AppState {
             do {
                 let _ = try await service.sendPrompt(sessionId: sessionId, text: text)
                 await MainActor.run {
-                    assistantMsg.isStreaming = false
+                    for msg in self.messages where msg.role == .assistant && msg.isStreaming {
+                        msg.isStreaming = false
+                    }
                     self.isPrompting = false
                 }
             } catch {
                 await MainActor.run {
-                    assistantMsg.content += "\n[Error: \(error.localizedDescription)]"
-                    assistantMsg.isStreaming = false
+                    self.lastAssistantMessage().content += "\n[Error: \(error.localizedDescription)]"
+                    for msg in self.messages where msg.role == .assistant && msg.isStreaming {
+                        msg.isStreaming = false
+                    }
                     self.isPrompting = false
                 }
             }
@@ -146,28 +163,71 @@ final class AppState {
     }
 
     private func handleSessionEvent(_ event: SessionEvent) {
-        guard let last = messages.last(where: { $0.role == .assistant }) else { return }
         switch event {
         case .agentMessage(let text):
-            last.content = text
+            lastAssistantMessage().content = text
+
         case .agentMessageDelta(let text):
-            last.content += text
+            // If the last assistant message already has tool calls,
+            // create a new message so text appears after tool cards
+            let msg = lastAssistantMessage()
+            if !msg.toolCalls.isEmpty {
+                msg.isStreaming = false
+                let newMsg = ChatMessage(role: .assistant, isStreaming: true)
+                newMsg.content = text
+                messages.append(newMsg)
+            } else {
+                msg.content += text
+            }
+
         case .toolCall(let id, let name, let input):
-            last.toolCalls.append(ToolCallInfo(id: id, name: name, input: input))
-        case .toolCallUpdate(let id, let output):
-            if let i = last.toolCalls.firstIndex(where: { $0.id == id }) {
-                last.toolCalls[i].output = (last.toolCalls[i].output ?? "") + output
+            // Tool call starting — previous text is done streaming
+            let msg = lastAssistantMessage()
+            if !msg.content.isEmpty {
+                msg.isStreaming = false
             }
-        case .toolCallComplete(let id):
-            if let i = last.toolCalls.firstIndex(where: { $0.id == id }) {
-                last.toolCalls[i].isComplete = true
+            msg.toolCalls.append(
+                ToolCallInfo(id: id, name: name, input: input)
+            )
+
+        case .toolCallUpdate(let id, let title, let input, let output):
+            let msg = lastAssistantMessage()
+            if let i = msg.toolCalls.firstIndex(where: { $0.id == id }) {
+                if let title { msg.toolCalls[i].name = title }
+                if let input { msg.toolCalls[i].input = input }
+                if let output { msg.toolCalls[i].output = output }
             }
+
+        case .toolCallComplete(let id, let title, let input, let output, let failed):
+            let msg = lastAssistantMessage()
+            if let i = msg.toolCalls.firstIndex(where: { $0.id == id }) {
+                if let title { msg.toolCalls[i].name = title }
+                if let input { msg.toolCalls[i].input = input }
+                if let output { msg.toolCalls[i].output = output }
+                msg.toolCalls[i].isComplete = true
+                msg.toolCalls[i].isFailed = failed
+            }
+
         case .thought(let text):
-            last.content += "\n> \(text)"
+            lastAssistantMessage().content += "\n> \(text)"
+
         case .promptComplete:
-            last.isStreaming = false
+            // Stop streaming on ALL assistant messages from this turn
+            for msg in messages where msg.role == .assistant && msg.isStreaming {
+                msg.isStreaming = false
+            }
             isPrompting = false
         }
+    }
+
+    /// Get or create the current assistant message for appending content.
+    private func lastAssistantMessage() -> ChatMessage {
+        if let last = messages.last, last.role == .assistant {
+            return last
+        }
+        let msg = ChatMessage(role: .assistant, isStreaming: true)
+        messages.append(msg)
+        return msg
     }
 
     private func addSystemMessage(_ text: String) {

@@ -21,14 +21,19 @@ targets:
     sources:
       - Sources
       - path: Resources
-        type: folder
         buildPhase: resources
     dependencies:
       - package: Citadel
       - package: MarkdownUI
     settings:
       base:
-        GENERATE_INFOPLIST_FILE: true
-        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        GENERATE_INFOPLIST_FILE: YES
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.10"
         PRODUCT_BUNDLE_IDENTIFIER: com.tianyizhuang.OpenCAN
+        DEVELOPMENT_TEAM: K9329AKMW8
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_LSRequiresIPhoneOS: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait

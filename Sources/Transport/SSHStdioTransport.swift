@@ -2,6 +2,7 @@ import Foundation
 import Citadel
 import NIO
 import NIOSSH
+import os
 
 /// ACP transport over SSH PTY using Citadel.
 /// Uses withPTY for bidirectional stdin/stdout access.
@@ -11,11 +12,20 @@ final class SSHStdioTransport: ACPTransport, @unchecked Sendable {
     let messages: AsyncStream<JSONRPCMessage>
     private var stdinWriter: ((String) async throws -> Void)?
     private var isClosed = false
+    private var readyContinuation: CheckedContinuation<Void, Never>?
 
     init() {
         let (stream, cont) = AsyncStream<JSONRPCMessage>.makeStream()
         self.messages = stream
         self.continuation = cont
+    }
+
+    /// Wait until the PTY is connected and ready to send.
+    func waitUntilReady() async {
+        if stdinWriter != nil { return }
+        await withCheckedContinuation { cont in
+            self.readyContinuation = cont
+        }
     }
 
     func send(_ message: JSONRPCMessage) async throws {
@@ -44,7 +54,13 @@ final class SSHStdioTransport: ACPTransport, @unchecked Sendable {
             terminalRowHeight: 50,
             terminalPixelWidth: 0,
             terminalPixelHeight: 0,
-            terminalModes: .init([:])
+            terminalModes: .init([
+                .ECHO: 0,
+                .ECHOE: 0,
+                .ECHOK: 0,
+                .ECHONL: 0,
+                .ICANON: 0,
+            ])
         )
 
         try await client.withPTY(ptyRequest) { inbound, outbound in
@@ -53,6 +69,10 @@ final class SSHStdioTransport: ACPTransport, @unchecked Sendable {
                 buf.writeString(text)
                 try await outbound.write(buf)
             }
+
+            // Signal that the transport is ready
+            self.readyContinuation?.resume()
+            self.readyContinuation = nil
 
             // Send the command to launch claude-agent-acp
             var cmdBuf = ByteBufferAllocator().buffer(capacity: command.utf8.count + 1)
@@ -64,15 +84,17 @@ final class SSHStdioTransport: ACPTransport, @unchecked Sendable {
                 switch event {
                 case .stdout(let buffer):
                     let data = Data(buffer: buffer)
+                    if let raw = String(data: data, encoding: .utf8) {
+                        Log.toFile("[stdout] \(raw.prefix(500))")
+                    }
                     let parsed = await self.framer.feed(data)
                     for msg in parsed {
+                        Log.toFile("[Transport] Parsed JSON-RPC message")
                         self.continuation.yield(msg)
                     }
                 case .stderr(let buffer):
                     let text = String(buffer: buffer)
-                    print("[SSH stderr] \(text)")
-                default:
-                    break
+                    Log.toFile("[stderr] \(text)")
                 }
             }
 

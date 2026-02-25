@@ -15,6 +15,7 @@ struct ServerConfig: Codable, Identifiable {
     var jumpUsername: String?
 
     var command: String
+    var cwd: String
 
     static let demo = ServerConfig(
         name: "cp32 via cp01",
@@ -25,6 +26,7 @@ struct ServerConfig: Codable, Identifiable {
         jumpHost: "42.62.6.84",
         jumpPort: 22,
         jumpUsername: "tyzhuang",
-        command: "claude-agent-acp"
+        command: "claude-agent-acp",
+        cwd: "/home/tyzhuang"
     )
 }

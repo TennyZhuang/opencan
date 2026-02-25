@@ -7,33 +7,36 @@ struct ACPService {
     /// Initialize the ACP connection.
     func initialize() async throws -> JSONValue {
         let params: JSONValue = .object([
-            "protocolVersion": .string("2025-11-16"),
-            "capabilities": .object([
-                "prompts": .object([
-                    "textContent": .bool(true)
-                ])
-            ]),
+            "protocolVersion": .int(1),
+            "clientCapabilities": .object([:]),
             "clientInfo": .object([
-                "name": .string("OpenCAN"),
+                "name": .string("opencan"),
+                "title": .string("OpenCAN"),
                 "version": .string("0.1.0")
             ])
         ])
-        let result = try await client.sendRequest(
+        return try await client.sendRequest(
             method: ACPMethods.initialize,
             params: params
         )
-        // Send initialized notification
-        try await client.sendNotification(
-            method: ACPMethods.initialized,
-            params: .object([:])
+    }
+
+    /// Authenticate with the agent using the specified auth method.
+    func authenticate(methodId: String) async throws -> JSONValue {
+        let params: JSONValue = .object([
+            "methodId": .string(methodId)
+        ])
+        return try await client.sendRequest(
+            method: "authenticate",
+            params: params
         )
-        return result
     }
 
     /// Create a new session.
     func createSession(cwd: String) async throws -> String {
         let params: JSONValue = .object([
-            "cwd": .string(cwd)
+            "cwd": .string(cwd),
+            "mcpServers": .array([])
         ])
         let result = try await client.sendRequest(
             method: ACPMethods.sessionNew,
@@ -45,8 +48,7 @@ struct ACPService {
         return sessionId
     }
 
-    /// Send a prompt to a session. Returns when the prompt completes.
-    /// Session updates arrive as notifications on client.notifications.
+    /// Send a prompt to a session.
     func sendPrompt(sessionId: String, text: String) async throws -> StopReason {
         let params: JSONValue = .object([
             "sessionId": .string(sessionId),
@@ -63,20 +65,5 @@ struct ACPService {
         )
         let reasonStr = result["stopReason"]?.stringValue ?? "end_turn"
         return StopReason(rawValue: reasonStr) ?? .unknown
-    }
-
-    /// List active sessions.
-    func listSessions() async throws -> [SessionInfo] {
-        let result = try await client.sendRequest(
-            method: ACPMethods.sessionList,
-            params: .object([:])
-        )
-        guard let sessions = result["sessions"]?.arrayValue else {
-            return []
-        }
-        return sessions.compactMap { val in
-            guard let id = val["sessionId"]?.stringValue else { return nil }
-            return SessionInfo(sessionId: id)
-        }
     }
 }

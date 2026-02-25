@@ -2,6 +2,7 @@ import Foundation
 import Citadel
 import Crypto
 import NIOSSH
+import os
 
 /// Manages SSH connection lifecycle: connect through jump host, create transport.
 actor SSHConnectionManager {
@@ -35,10 +36,12 @@ actor SSHConnectionManager {
                 )
                 jumpSettings.algorithms = .all
 
-                print("[SSH] Connecting to jump host \(jumpHost)...")
+                Log.ssh.info("Connecting to jump host \(jumpHost)...")
+                Log.toFile("[SSH] Connecting to jump host \(jumpHost)...")
                 let jump = try await SSHClient.connect(to: jumpSettings)
                 self.jumpClient = jump
-                print("[SSH] Connected to jump host")
+                Log.ssh.info("Connected to jump host")
+                Log.toFile("[SSH] Connected to jump host")
 
                 let targetUser = config.username
                 var targetSettings = SSHClientSettings(
@@ -49,10 +52,12 @@ actor SSHConnectionManager {
                 )
                 targetSettings.algorithms = .all
 
-                print("[SSH] Jumping to target \(config.host)...")
+                Log.ssh.info("Jumping to target \(config.host)...")
+                Log.toFile("[SSH] Jumping to target \(config.host)...")
                 let target = try await jump.jump(to: targetSettings)
                 self.targetClient = target
-                print("[SSH] Connected to target")
+                Log.ssh.info("Connected to target")
+                Log.toFile("[SSH] Connected to target")
             } else {
                 let user = config.username
                 var settings = SSHClientSettings(

@@ -10,8 +10,8 @@ struct ToolCallView: View {
                 withAnimation { isExpanded.toggle() }
             } label: {
                 HStack {
-                    Image(systemName: toolCall.isComplete ? "checkmark.circle.fill" : "gear")
-                        .foregroundStyle(toolCall.isComplete ? .green : .orange)
+                    Image(systemName: statusIcon)
+                        .foregroundStyle(statusColor)
                     Text(toolCall.name)
                         .font(.system(.caption, design: .monospaced))
                         .fontWeight(.medium)
@@ -28,19 +28,34 @@ struct ToolCallView: View {
                     Text(formatJSON(input))
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.secondary)
-                        .lineLimit(10)
+                        .lineLimit(15)
+                        .textSelection(.enabled)
                 }
-                if let output = toolCall.output {
+                if let output = toolCall.output, !output.isEmpty {
+                    Divider()
                     Text(output)
                         .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(20)
+                        .foregroundStyle(toolCall.isFailed ? .red : .secondary)
+                        .lineLimit(30)
+                        .textSelection(.enabled)
                 }
             }
         }
         .padding(10)
         .background(Theme.toolCallBg)
         .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var statusIcon: String {
+        if toolCall.isFailed { return "xmark.circle.fill" }
+        if toolCall.isComplete { return "checkmark.circle.fill" }
+        return "gear"
+    }
+
+    private var statusColor: Color {
+        if toolCall.isFailed { return .red }
+        if toolCall.isComplete { return .green }
+        return .orange
     }
 
     private func formatJSON(_ value: JSONValue) -> String {

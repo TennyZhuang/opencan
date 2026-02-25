@@ -7,17 +7,19 @@ struct SessionInfo: Codable, Identifiable {
 
 struct ToolCallInfo: Identifiable, Codable {
     let id: String
-    let name: String
+    var name: String
     var input: JSONValue?
     var output: String?
     var isComplete: Bool
+    var isFailed: Bool
 
-    init(id: String, name: String, input: JSONValue? = nil, output: String? = nil, isComplete: Bool = false) {
+    init(id: String, name: String, input: JSONValue? = nil, output: String? = nil, isComplete: Bool = false, isFailed: Bool = false) {
         self.id = id
         self.name = name
         self.input = input
         self.output = output
         self.isComplete = isComplete
+        self.isFailed = isFailed
     }
 }
 
@@ -38,8 +40,8 @@ enum SessionEvent {
     case agentMessage(text: String)
     case agentMessageDelta(text: String)
     case toolCall(id: String, name: String, input: JSONValue?)
-    case toolCallUpdate(id: String, output: String)
-    case toolCallComplete(id: String)
+    case toolCallUpdate(id: String, title: String?, input: JSONValue?, output: String?)
+    case toolCallComplete(id: String, title: String?, input: JSONValue?, output: String?, failed: Bool)
     case thought(text: String)
     case promptComplete(stopReason: StopReason)
 }

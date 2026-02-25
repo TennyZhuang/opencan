@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// JSON-RPC client with request/response correlation and notification dispatch.
 actor ACPClient {
@@ -8,6 +9,8 @@ actor ACPClient {
     private let notificationContinuation: AsyncStream<JSONRPCMessage>.Continuation
     let notifications: AsyncStream<JSONRPCMessage>
     private var readTask: Task<Void, Never>?
+    /// Track IDs of requests we sent, so we can ignore PTY echoes.
+    private var sentRequestIds: Set<JSONRPCMessage.JSONRPCID> = []
 
     init(transport: any ACPTransport) {
         self.transport = transport
@@ -37,6 +40,7 @@ actor ACPClient {
     func sendRequest(method: String, params: JSONValue?) async throws -> JSONValue {
         let id = JSONRPCMessage.JSONRPCID.int(nextId)
         nextId += 1
+        sentRequestIds.insert(id)
         let message = JSONRPCMessage.request(id: id, method: method, params: params)
         try await transport.send(message)
         return try await withCheckedThrowingContinuation { cont in
@@ -62,8 +66,49 @@ actor ACPClient {
             }
         case .notification(_, _):
             notificationContinuation.yield(message)
-        case .request(_, let method, _):
-            print("[ACPClient] Server request: \(method)")
+        case .request(let id, let method, let params):
+            // PTY echoes our own requests back — ignore them
+            if sentRequestIds.contains(id) {
+                Log.acp.debug("Ignoring PTY echo of our request: \(method) id=\(String(describing: id))")
+                Log.toFile("[ACPClient] Ignoring PTY echo: \(method)")
+                return
+            }
+            Log.acp.info("Server request: \(method) id=\(String(describing: id))")
+            Log.toFile("[ACPClient] Server request: \(method)")
+            Task { await self.handleServerRequest(id: id, method: method, params: params) }
+        }
+    }
+
+    private func handleServerRequest(id: JSONRPCMessage.JSONRPCID, method: String, params: JSONValue?) async {
+        switch method {
+        case "session/request_permission":
+            // Find the first "allow" option (allow_once or allow_always)
+            var selectedOptionId = "allow"
+            if let options = params?["options"]?.arrayValue {
+                for opt in options {
+                    if let kind = opt["kind"]?.stringValue,
+                       (kind == "allow_once" || kind == "allow_always"),
+                       let optId = opt["optionId"]?.stringValue {
+                        selectedOptionId = optId
+                        break
+                    }
+                }
+            }
+            let result: JSONValue = .object([
+                "outcome": .object([
+                    "outcome": .string("selected"),
+                    "optionId": .string(selectedOptionId)
+                ])
+            ])
+            let reply = JSONRPCMessage.response(id: id, result: result)
+            try? await transport.send(reply)
+            Log.toFile("[ACPClient] Auto-approved permission: \(selectedOptionId)")
+        default:
+            let errMsg = JSONRPCMessage.error(
+                id: id, code: -32601,
+                message: "Method not found: \(method)", data: nil
+            )
+            try? await transport.send(errMsg)
         }
     }
 

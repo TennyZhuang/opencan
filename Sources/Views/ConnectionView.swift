@@ -56,6 +56,12 @@ struct ConnectionView: View {
                 .disabled(appState.connectionStatus == .connecting)
             }
             .padding()
+            .onAppear {
+                // Auto-connect for faster iteration
+                if appState.connectionStatus == .disconnected {
+                    appState.connect()
+                }
+            }
         }
     }
 
