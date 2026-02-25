@@ -10,9 +10,9 @@ packages:
   Citadel:
     url: https://github.com/orlandos-nl/Citadel
     from: "0.7.0"
-  MarkdownUI:
-    url: https://github.com/gonzalezreal/swift-markdown-ui
-    from: "2.4.0"
+  MarkdownView:
+    url: https://github.com/Lakr233/MarkdownView
+    from: "3.4.0"
 
 targets:
   OpenCAN:
@@ -24,7 +24,7 @@ targets:
         buildPhase: resources
     dependencies:
       - package: Citadel
-      - package: MarkdownUI
+      - package: MarkdownView
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES

@@ -6,14 +6,14 @@ let package = Package(
     platforms: [.iOS(.v17), .macOS(.v14)],
     dependencies: [
         .package(url: "https://github.com/orlandos-nl/Citadel", from: "0.7.0"),
-        .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", from: "2.4.0"),
+        .package(url: "https://github.com/Lakr233/MarkdownView", from: "3.4.0"),
     ],
     targets: [
         .executableTarget(
             name: "OpenCAN",
             dependencies: [
                 "Citadel",
-                .product(name: "MarkdownUI", package: "swift-markdown-ui"),
+                .product(name: "MarkdownView", package: "MarkdownView"),
             ],
             path: "Sources",
             resources: [

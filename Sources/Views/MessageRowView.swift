@@ -1,5 +1,5 @@
 import SwiftUI
-import MarkdownUI
+import MarkdownView
 
 struct MessageRowView: View {
     let message: ChatMessage
@@ -11,22 +11,26 @@ struct MessageRowView: View {
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
                 if !message.content.isEmpty {
                     if message.role == .assistant {
-                        Markdown(message.content)
+                        MarkdownView(message.content)
                             .padding(Theme.bubblePadding)
                             .background(Theme.assistantBubble)
                             .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
+                            .contextMenu { copyButton }
                     } else if message.role == .user {
                         Text(message.content)
                             .padding(Theme.bubblePadding)
                             .background(Theme.userBubble)
                             .foregroundStyle(.white)
                             .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
+                            .textSelection(.enabled)
+                            .contextMenu { copyButton }
                     } else {
-                        // System message
                         Text(message.content)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity)
+                            .textSelection(.enabled)
+                            .contextMenu { copyButton }
                     }
                 }
 
@@ -46,6 +50,14 @@ struct MessageRowView: View {
             }
 
             if message.role != .user { Spacer(minLength: 60) }
+        }
+    }
+
+    private var copyButton: some View {
+        Button {
+            UIPasteboard.general.string = message.content
+        } label: {
+            Label("Copy", systemImage: "doc.on.doc")
         }
     }
 }
