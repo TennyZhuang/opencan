@@ -4,7 +4,7 @@ import os
 /// JSON-RPC client with request/response correlation and notification dispatch.
 actor ACPClient {
     private let transport: any ACPTransport
-    private var nextId = 1
+    private var nextId = 1000  // Start high to avoid collision with server-initiated request IDs
     private var pendingRequests: [JSONRPCMessage.JSONRPCID: CheckedContinuation<JSONValue, Error>] = [:]
     private let notificationContinuation: AsyncStream<JSONRPCMessage>.Continuation
     let notifications: AsyncStream<JSONRPCMessage>

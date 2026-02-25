@@ -15,6 +15,7 @@ final class AppState {
     var currentSessionId: String?
     var sessions: [SessionInfo] = []
     var isPrompting = false
+    var scrollTrigger = 0
 
     // Internal
     private let sshManager = SSHConnectionManager()
@@ -128,6 +129,7 @@ final class AppState {
         let assistantMsg = ChatMessage(role: .assistant, isStreaming: true)
         messages.append(assistantMsg)
         isPrompting = true
+        scrollTrigger += 1
 
         Task {
             do {
@@ -218,6 +220,7 @@ final class AppState {
             }
             isPrompting = false
         }
+        scrollTrigger += 1
     }
 
     /// Get or create the current assistant message for appending content.

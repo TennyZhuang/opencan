@@ -3,9 +3,13 @@ import SwiftUI
 struct ToolCallView: View {
     let toolCall: ToolCallInfo
     @State private var isExpanded = false
+    @State private var showFullOutput = false
+
+    private let previewLineLimit = 3
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // Header
             Button {
                 withAnimation { isExpanded.toggle() }
             } label: {
@@ -15,6 +19,7 @@ struct ToolCallView: View {
                     Text(toolCall.name)
                         .font(.system(.caption, design: .monospaced))
                         .fontWeight(.medium)
+                        .lineLimit(1)
                     Spacer()
                     Image(systemName: "chevron.right")
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
@@ -24,20 +29,33 @@ struct ToolCallView: View {
             }
 
             if isExpanded {
+                // Input
                 if let input = toolCall.input {
                     Text(formatJSON(input))
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.secondary)
-                        .lineLimit(15)
+                        .lineLimit(showFullOutput ? nil : previewLineLimit)
                         .textSelection(.enabled)
                 }
+
+                // Output
                 if let output = toolCall.output, !output.isEmpty {
                     Divider()
                     Text(output)
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(toolCall.isFailed ? .red : .secondary)
-                        .lineLimit(30)
+                        .lineLimit(showFullOutput ? nil : previewLineLimit)
                         .textSelection(.enabled)
+
+                    if outputIsLong(output) || inputIsLong {
+                        Button {
+                            withAnimation { showFullOutput.toggle() }
+                        } label: {
+                            Text(showFullOutput ? "Show less" : "Show more...")
+                                .font(.caption2)
+                                .foregroundStyle(.blue)
+                        }
+                    }
                 }
             }
         }
@@ -56,6 +74,15 @@ struct ToolCallView: View {
         if toolCall.isFailed { return .red }
         if toolCall.isComplete { return .green }
         return .orange
+    }
+
+    private var inputIsLong: Bool {
+        guard let input = toolCall.input else { return false }
+        return formatJSON(input).components(separatedBy: "\n").count > previewLineLimit
+    }
+
+    private func outputIsLong(_ text: String) -> Bool {
+        text.components(separatedBy: "\n").count > previewLineLimit
     }
 
     private func formatJSON(_ value: JSONValue) -> String {

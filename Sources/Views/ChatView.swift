@@ -3,6 +3,7 @@ import SwiftUI
 struct ChatView: View {
     @Environment(AppState.self) private var appState
     @State private var showSessions = false
+    @State private var isNearBottom = true
 
     var body: some View {
         NavigationStack {
@@ -14,13 +15,19 @@ struct ChatView: View {
                                 MessageRowView(message: message)
                                     .id(message.id)
                             }
+                            // Invisible anchor at the bottom
+                            Color.clear
+                                .frame(height: 1)
+                                .id("bottom")
+                                .onAppear { isNearBottom = true }
+                                .onDisappear { isNearBottom = false }
                         }
                         .padding()
                     }
-                    .onChange(of: appState.messages.count) {
-                        if let last = appState.messages.last {
-                            withAnimation {
-                                proxy.scrollTo(last.id, anchor: .bottom)
+                    .onChange(of: appState.scrollTrigger) {
+                        if isNearBottom {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo("bottom")
                             }
                         }
                     }
