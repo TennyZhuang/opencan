@@ -7,7 +7,7 @@ actor ACPClient {
     private var nextId = 1000  // Start high to avoid collision with server-initiated request IDs
     private var pendingRequests: [JSONRPCMessage.JSONRPCID: CheckedContinuation<JSONValue, Error>] = [:]
     private let notificationContinuation: AsyncStream<JSONRPCMessage>.Continuation
-    let notifications: AsyncStream<JSONRPCMessage>
+    nonisolated let notifications: AsyncStream<JSONRPCMessage>
     private var readTask: Task<Void, Never>?
     /// Track IDs of requests we sent, so we can ignore PTY echoes.
     private var sentRequestIds: Set<JSONRPCMessage.JSONRPCID> = []
@@ -118,14 +118,24 @@ actor ACPClient {
                 ])
             ])
             let reply = JSONRPCMessage.response(id: id, result: result)
-            try? await transport.send(reply)
+            do {
+                try await transport.send(reply)
+            } catch {
+                Log.acp.error("Failed to send permission reply: \(error)")
+                Log.toFile("[ACPClient] Failed to send permission reply: \(error)")
+            }
             Log.toFile("[ACPClient] Auto-approved permission: \(selectedOptionId)")
         default:
             let errMsg = JSONRPCMessage.error(
                 id: id, code: -32601,
                 message: "Method not found: \(method)", data: nil
             )
-            try? await transport.send(errMsg)
+            do {
+                try await transport.send(errMsg)
+            } catch {
+                Log.acp.error("Failed to send error reply: \(error)")
+                Log.toFile("[ACPClient] Failed to send error reply: \(error)")
+            }
         }
     }
 

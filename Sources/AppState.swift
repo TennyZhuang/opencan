@@ -3,7 +3,7 @@ import SwiftUI
 import os
 
 /// Root state coordinator connecting SSH, ACP, and UI.
-@Observable
+@MainActor @Observable
 final class AppState {
     // Connection
     var serverConfig = ServerConfig.demo
@@ -35,7 +35,7 @@ final class AppState {
     // MARK: - Connection
 
     func connect() {
-        guard connectionStatus != .connecting else { return }
+        guard connectionStatus != .connecting && connectionStatus != .connected else { return }
         connectionStatus = .connecting
         connectionError = nil
 
@@ -44,7 +44,7 @@ final class AppState {
                 let t = try await sshManager.connect(config: serverConfig)
                 self.transport = t
 
-                ptyTask = Task {
+                ptyTask = Task.detached { [sshManager, serverConfig] in
                     do {
                         if #available(macOS 15.0, iOS 18.0, *) {
                             try await sshManager.startPTY(
@@ -85,35 +85,34 @@ final class AppState {
 
                 startNotificationListener()
 
-                await MainActor.run {
-                    self.connectionStatus = .connected
-                    self.addSystemMessage("Connected to \(self.serverConfig.name)")
-                }
+                self.connectionStatus = .connected
+                self.addSystemMessage("Connected to \(self.serverConfig.name)")
             } catch {
                 Log.app.error("Connection error: \(error)")
                 Log.toFile("[AppState] Connection error: \(error)")
-                await MainActor.run {
-                    self.connectionError = error.localizedDescription
-                    self.connectionStatus = .failed
-                }
+                self.connectionError = error.localizedDescription
+                self.connectionStatus = .failed
             }
         }
     }
 
     func disconnect() {
+        // Capture references before clearing, so the cleanup Task can use them
+        let client = acpClient
+        let t = transport
         notificationTask?.cancel()
         ptyTask?.cancel()
-        Task {
-            if let client = acpClient { await client.stop() }
-            if let t = transport { await t.close() }
-            await sshManager.disconnect()
-        }
         acpClient = nil
         acpService = nil
         transport = nil
         connectionStatus = .disconnected
         currentSessionId = nil
         messages = []
+        Task.detached { [sshManager] in
+            if let client { await client.stop() }
+            if let t { await t.close() }
+            await sshManager.disconnect()
+        }
     }
 
     // MARK: - Chat
@@ -134,20 +133,16 @@ final class AppState {
         Task {
             do {
                 let _ = try await service.sendPrompt(sessionId: sessionId, text: text)
-                await MainActor.run {
-                    for msg in self.messages where msg.role == .assistant && msg.isStreaming {
-                        msg.isStreaming = false
-                    }
-                    self.isPrompting = false
+                for msg in self.messages where msg.role == .assistant && msg.isStreaming {
+                    msg.isStreaming = false
                 }
+                self.isPrompting = false
             } catch {
-                await MainActor.run {
-                    self.lastAssistantMessage().content += "\n[Error: \(error.localizedDescription)]"
-                    for msg in self.messages where msg.role == .assistant && msg.isStreaming {
-                        msg.isStreaming = false
-                    }
-                    self.isPrompting = false
+                self.lastAssistantMessage().content += "\n[Error: \(error.localizedDescription)]"
+                for msg in self.messages where msg.role == .assistant && msg.isStreaming {
+                    msg.isStreaming = false
                 }
+                self.isPrompting = false
             }
         }
     }
@@ -157,9 +152,9 @@ final class AppState {
     private func startNotificationListener() {
         guard let client = acpClient else { return }
         notificationTask = Task {
-            for await notification in await client.notifications {
+            for await notification in client.notifications {
                 guard let event = SessionUpdateParser.parse(notification) else { continue }
-                await MainActor.run { self.handleSessionEvent(event) }
+                self.handleSessionEvent(event)
             }
         }
     }
@@ -213,7 +208,7 @@ final class AppState {
         case .thought(let text):
             lastAssistantMessage().content += "\n> \(text)"
 
-        case .promptComplete:
+        case .promptComplete(_):
             // Stop streaming on ALL assistant messages from this turn
             for msg in messages where msg.role == .assistant && msg.isStreaming {
                 msg.isStreaming = false

@@ -17,6 +17,16 @@ enum SessionUpdateParser {
                 return .agentMessageDelta(text: text)
             }
 
+        case "agent_message":
+            if let text = update?["content"]?["text"]?.stringValue {
+                return .agentMessage(text: text)
+            }
+
+        case "thought":
+            if let text = update?["content"]?["text"]?.stringValue {
+                return .thought(text: text)
+            }
+
         case "tool_call":
             if let id = update?["toolCallId"]?.stringValue {
                 let name = update?["title"]?.stringValue ?? "tool"
@@ -61,6 +71,11 @@ enum SessionUpdateParser {
                     )
                 }
             }
+
+        case "prompt_complete":
+            let rawReason = update?["stopReason"]?.stringValue ?? "end_turn"
+            let reason = StopReason(rawValue: rawReason) ?? .unknown
+            return .promptComplete(stopReason: reason)
 
         case "plan", "user_message_chunk", "available_commands_update", "mode_update":
             return nil

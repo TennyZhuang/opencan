@@ -14,18 +14,21 @@ enum Log {
         return docs.appendingPathComponent("opencan.log")
     }()
 
+    private static let fileQueue = DispatchQueue(label: "com.tianyizhuang.OpenCAN.log")
+    private static var fileHandle: FileHandle?
+
     static func toFile(_ message: String) {
         let line = "\(Date()): \(message)\n"
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: logFileURL.path) {
-                if let handle = try? FileHandle(forWritingTo: logFileURL) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
+        guard let data = line.data(using: .utf8) else { return }
+        fileQueue.async {
+            if fileHandle == nil {
+                if !FileManager.default.fileExists(atPath: logFileURL.path) {
+                    FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
                 }
-            } else {
-                try? data.write(to: logFileURL)
+                fileHandle = try? FileHandle(forWritingTo: logFileURL)
+                fileHandle?.seekToEndOfFile()
             }
+            fileHandle?.write(data)
         }
     }
 }

@@ -21,6 +21,7 @@ actor SSHConnectionManager {
 
     func connect(config: ServerConfig) async throws -> SSHStdioTransport {
         state = .connecting
+        Log.ssh.warning("Host key verification is disabled — connections are vulnerable to MITM")
 
         do {
             let privateKey = try loadPrivateKey(named: config.privateKeyName)
