@@ -1,6 +1,6 @@
 import Foundation
 
-@Observable
+@MainActor @Observable
 final class ChatMessage: Identifiable {
     let id: UUID
     let role: Role

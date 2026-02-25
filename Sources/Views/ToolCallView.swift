@@ -7,7 +7,13 @@ struct ToolCallView: View {
 
     private let previewLineLimit = 3
 
+    private var formattedInput: String? {
+        toolCall.input.map { Self.formatJSON($0) }
+    }
+
     var body: some View {
+        let cachedInput = formattedInput
+
         VStack(alignment: .leading, spacing: 6) {
             // Header
             Button {
@@ -30,8 +36,8 @@ struct ToolCallView: View {
 
             if isExpanded {
                 // Input
-                if let input = toolCall.input {
-                    Text(formatJSON(input))
+                if let input = cachedInput {
+                    Text(input)
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(showFullOutput ? nil : previewLineLimit)
@@ -47,6 +53,7 @@ struct ToolCallView: View {
                         .lineLimit(showFullOutput ? nil : previewLineLimit)
                         .textSelection(.enabled)
 
+                    let inputIsLong = (cachedInput?.components(separatedBy: "\n").count ?? 0) > previewLineLimit
                     if outputIsLong(output) || inputIsLong {
                         Button {
                             withAnimation { showFullOutput.toggle() }
@@ -76,16 +83,11 @@ struct ToolCallView: View {
         return .orange
     }
 
-    private var inputIsLong: Bool {
-        guard let input = toolCall.input else { return false }
-        return formatJSON(input).components(separatedBy: "\n").count > previewLineLimit
-    }
-
     private func outputIsLong(_ text: String) -> Bool {
         text.components(separatedBy: "\n").count > previewLineLimit
     }
 
-    private func formatJSON(_ value: JSONValue) -> String {
+    static func formatJSON(_ value: JSONValue) -> String {
         guard let data = try? JSONEncoder().encode(value),
               let obj = try? JSONSerialization.jsonObject(with: data),
               let pretty = try? JSONSerialization.data(withJSONObject: obj, options: .prettyPrinted),

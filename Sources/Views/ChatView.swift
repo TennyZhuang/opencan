@@ -20,13 +20,11 @@ struct ChatView: View {
                         }
                         .padding()
                     }
+                    .defaultScrollAnchor(.bottom)
                     .scrollDismissesKeyboard(.interactively)
                     .onChange(of: appState.scrollTrigger) {
-                        // Small delay so SwiftUI finishes layout before scrolling
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                proxy.scrollTo("bottom")
-                            }
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo("bottom")
                         }
                     }
                 }

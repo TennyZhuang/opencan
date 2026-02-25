@@ -1,6 +1,5 @@
 import Foundation
 import SwiftUI
-import os
 
 /// Root state coordinator connecting SSH, ACP, and UI.
 @MainActor @Observable

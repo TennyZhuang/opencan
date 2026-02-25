@@ -29,6 +29,7 @@ enum Log {
                 fileHandle?.seekToEndOfFile()
             }
             fileHandle?.write(data)
+            try? fileHandle?.synchronize()
         }
     }
 }

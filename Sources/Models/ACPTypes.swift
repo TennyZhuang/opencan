@@ -1,11 +1,11 @@
 import Foundation
 
-struct SessionInfo: Codable, Identifiable {
+struct SessionInfo: Identifiable {
     let sessionId: String
     var id: String { sessionId }
 }
 
-struct ToolCallInfo: Identifiable, Codable {
+struct ToolCallInfo: Identifiable {
     let id: String
     var name: String
     var input: JSONValue?
@@ -23,16 +23,11 @@ struct ToolCallInfo: Identifiable, Codable {
     }
 }
 
-enum StopReason: String, Codable {
+enum StopReason: String {
     case endTurn = "end_turn"
     case maxTokens = "max_tokens"
     case toolUse = "tool_use"
     case unknown
-
-    init(from decoder: Decoder) throws {
-        let value = try decoder.singleValueContainer().decode(String.self)
-        self = StopReason(rawValue: value) ?? .unknown
-    }
 }
 
 /// Events parsed from session/update notifications
