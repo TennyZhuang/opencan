@@ -31,13 +31,13 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 
 **Layer stack (bottom → top):**
 
-1. **SSH** — `SSHConnectionManager` uses Citadel for RSA key auth, optional jump host, then opens a PTY on the target. `SSHStdioTransport` wraps the PTY as an `ACPTransport` (protocol with `send()` and `messages` stream).
+1. **SSH** — `SSHConnectionManager` uses Citadel for RSA key auth, optional jump host, then opens a PTY on the target. `SSHStdioTransport` (actor) wraps the PTY as an `ACPTransport` (protocol with `send()` and `messages` stream).
 
 2. **JSON-RPC** — `JSONRPCFramer` (actor) buffers PTY bytes, skips non-JSON noise, extracts newline-delimited messages. `JSONRPCMessage` is the envelope enum (request/response/notification/error). `JSONValue` is a generic JSON type with subscript access.
 
 3. **ACP** — `ACPClient` (actor) correlates request IDs to continuations, dispatches notifications, filters PTY echoes via `sentRequestIds`, and auto-approves `session/request_permission`. `ACPService` provides typed methods: `initialize`, `createSession`, `sendPrompt`. `SessionUpdateParser` maps `session/update` notifications to `SessionEvent` cases.
 
-4. **AppState** — `@Observable` coordinator. Owns the connection lifecycle, chat messages, and notification listener. `handleSessionEvent()` routes events to the message model. Creates new `ChatMessage` bubbles when text arrives after tool calls.
+4. **AppState** — `@MainActor @Observable` coordinator. Owns the connection lifecycle, chat messages, and notification listener. `handleSessionEvent()` routes events to the message model. Creates new `ChatMessage` bubbles when text arrives after tool calls.
 
 5. **SwiftUI** — `ContentView` switches between `ConnectionView` and `ChatView`. Messages render with MarkdownUI. Tool calls are expandable cards with truncated output.
 
@@ -49,15 +49,15 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 
 **State flow for streaming:**
 - `sendMessage()` creates a `ChatMessage(isStreaming: true)` and calls `session/prompt`.
-- `session/update` notifications arrive as `agent_message_chunk`, `tool_call`, `tool_call_update`.
+- `session/update` notifications arrive as `agent_message_chunk`, `agent_message`, `tool_call`, `tool_call_update`, `thought`, `prompt_complete`.
 - When a `tool_call` starts, the current message's `isStreaming` is set to false.
 - When text arrives after tool calls, a new `ChatMessage` is created so text renders below tool cards.
 - `promptComplete` sets all streaming messages to `isStreaming = false`.
 
 ## Conventions
 
-- **Actors** for thread-safe protocol state (`ACPClient`, `JSONRPCFramer`).
-- **`@Observable`** for UI state (`AppState`, `ChatMessage`).
+- **Actors** for thread-safe protocol state (`ACPClient`, `JSONRPCFramer`, `SSHStdioTransport`).
+- **`@MainActor @Observable`** for UI state (`AppState`, `ChatMessage`).
 - **`AsyncStream`** for message/notification pipelines.
 - **`Log.toFile()`** for debugging on simulator (os_log doesn't reliably surface `print()` output).
 - **XcodeGen** (`project.yml`) generates the `.xcodeproj`. Run `xcodegen generate` after adding files.
