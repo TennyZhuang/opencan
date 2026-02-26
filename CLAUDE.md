@@ -66,13 +66,13 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 
 3. **Daemon** — `opencan-daemon` is a Go binary running on the remote server. It manages ACP process lifecycles independently of SSH connections. The `attach` subcommand bridges stdin/stdout to a Unix socket (`~/.opencan/daemon.sock`). `daemon/` prefixed methods are handled by the daemon; all other methods are transparently forwarded to the appropriate ACP process based on `params.sessionId`. See `docs/daemon-architecture.md` for full protocol specification.
 
-4. **ACP** — `ACPClient` (actor) correlates request IDs to continuations, dispatches notifications, filters PTY echoes via `sentRequestIds`, and auto-approves `session/request_permission`. `DaemonClient` (actor) wraps `ACPClient` for `daemon/` prefixed methods: `hello`, `session.create`, `session.attach`, `session.detach`, `session.list`, `session.kill`. `ACPService` provides typed methods for ACP passthrough: `sendPrompt`. `SessionUpdateParser` maps `session/update` notifications to `SessionEvent` cases.
+4. **ACP** — `ACPClient` (actor) correlates request IDs to continuations, dispatches notifications, filters PTY echoes via `sentRequestIds`, and auto-approves `session/request_permission`. `DaemonClient` (actor) wraps `ACPClient` for `daemon/` prefixed methods: `hello`, `session.create`, `session.attach`, `session.detach`, `session.list`, `session.kill`. `ACPService` provides typed methods for ACP passthrough: `sendPrompt`, `loadSession`. `SessionUpdateParser` maps `session/update` notifications to `SessionEvent` cases (including `user_message_chunk` for history replay).
 
 5. **Persistence** — SwiftData models: `Node` (SSH host config + optional jump server), `Workspace` (remote cwd on a node), `Session` (ACP session tied to a workspace), `SSHKeyPair` (RSA key data). Cascade delete: Node → Workspaces → Sessions. Demo data seeded on first launch via `seedDemoDataIfNeeded()`.
 
-6. **AppState** — `@MainActor @Observable` coordinator. `connect(workspace:)` establishes SSH + daemon with 30s timeout via `daemon/hello`. `createNewSession()` uses `daemon/session.create` (daemon spawns ACP process internally). `resumeSession()` uses `daemon/session.attach` with event replay from buffered events. `handleSessionEvent()` routes notifications to the message model. Creates new `ChatMessage` bubbles when text arrives after tool calls. `sendMessage()` provides user feedback on failure. `lastEventSeq` tracks per-session event sequence numbers for daemon replay.
+6. **AppState** — `@MainActor @Observable` coordinator. `connect(workspace:)` establishes SSH + daemon with 30s timeout via `daemon/hello`. `createNewSession()` uses `daemon/session.create` (daemon spawns ACP process internally). `resumeSession()` picks a strategy based on session state: buffer replay for running sessions, `session/load` for completed/idle sessions, and history recovery (create new session + `session/load` old history with `__routeToSession` routing override) for sessions the daemon no longer knows about. `isLoadingHistory` suppresses streaming UI during history replay. `handleSessionEvent()` routes notifications to the message model. Creates new `ChatMessage` bubbles when text arrives after tool calls. `sendMessage()` sets session title from first user message and provides user feedback on failure. `lastEventSeq` tracks per-session event sequence numbers for daemon replay.
 
-7. **SwiftUI** — `ContentView` hosts a `NavigationStack` rooted at `NodeListView`. Drill-down: `NodeListView → WorkspaceListView → SessionPickerView → ChatView`. `SessionPickerView` shows daemon session states with colored badges (idle/prompting/draining/completed/dead). Messages render with MarkdownView. Tool calls are expandable cards with truncated output.
+7. **SwiftUI** — `ContentView` hosts a `NavigationStack` rooted at `NodeListView`. Drill-down: `NodeListView → WorkspaceListView → SessionPickerView → ChatView`. `SessionPickerView` merges daemon sessions and local SwiftData sessions into a single unified list via `UnifiedSession`, with colored state badges (idle/prompting/draining/completed/history/dead). Messages render with MarkdownView. Tool calls are expandable cards with truncated output.
 
 **Key protocol details:**
 - iOS connects via `opencan-daemon attach` (not directly to `claude-agent-acp`). The daemon handles `initialize` + `session/new` internally during `daemon/session.create`.
@@ -80,10 +80,12 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 - PTY echoes every stdin write back on stdout. The framer parses these as messages; `ACPClient` filters them by checking `sentRequestIds`.
 - `session/request_permission` is auto-approved by the daemon when no client is attached (draining state).
 - Daemon forwards `session/update` notifications with `__seq` metadata for event sequence tracking.
+- `session/load` supports `__routeToSession` param: the daemon routes the request to this session's ACP proxy instead of the `sessionId` in params. Used for loading old session history into a newly created ACP process.
+- Server-initiated requests (e.g., `session/request_permission`) have their IDs rewritten by the client handler to prevent collisions when multiple ACP proxies are attached.
 
 **State flow for streaming:**
 - `sendMessage()` creates a `ChatMessage(isStreaming: true)` and calls `session/prompt`.
-- `session/update` notifications arrive as `agent_message_chunk`, `agent_message`, `tool_call`, `tool_call_update`, `thought`, `agent_thought_chunk`, `prompt_complete`.
+- `session/update` notifications arrive as `agent_message_chunk`, `agent_message`, `tool_call`, `tool_call_update`, `thought`, `agent_thought_chunk`, `user_message_chunk`, `prompt_complete`.
 - When a `tool_call` starts, the current message's `isStreaming` is set to false.
 - When text arrives after tool calls, a new `ChatMessage` is created so text renders below tool cards.
 - `promptComplete` sets all streaming messages to `isStreaming = false`.
@@ -106,12 +108,13 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 - **`AsyncStream`** for message/notification pipelines.
 - **`Log.toFile()`** for debugging on simulator (os_log doesn't reliably surface `print()` output). Use `xcrun devicectl device copy from` to pull logs from real devices.
 - **XcodeGen** (`project.yml`) generates the `.xcodeproj`. Run `xcodegen generate` after adding files.
+- **Unit Tests** (`AppStateTests`) verify session creation, message sending, streaming content, send-while-prompting blocking, and all three resume strategies (completed, draining, history) using `MockACPTransport` with configurable attach state/buffered events/load steps.
 - **UI Tests** (`OpenCANUITests`) verify navigation, session creation (system message appears), message sending (user message + assistant response), session resume, and loading state. E2E tests require the real cp32 server and use `XCTSkip` when unreachable.
 
 **Daemon architecture:**
 - `opencan-daemon/` contains the Go daemon source. See `docs/daemon-architecture.md` for full design.
 - **Auto-deploy:** On first connect, `SSHConnectionManager.ensureDaemonInstalled()` checks for `~/.opencan/bin/opencan-daemon` on the server. If missing, uploads the linux-amd64 binary from the iOS app bundle via SFTP. Rebuild with `cd opencan-daemon && make install-ios` after daemon changes.
 - ACPProxy state machine: Starting → Idle → Prompting → Draining → Completed → Dead.
-- EventBuffer: ring buffer (max 10000) with sequence numbers for reconnect replay.
+- EventBuffer: ring buffer (max 100000) with sequence numbers for reconnect replay. Eviction copies to a new slice to avoid retaining the old backing array.
 - `daemon/session.attach` returns buffered events since `lastEventSeq`; iOS replays them through `SessionUpdateParser`.
 - `Node.command` field stores the ACP binary name (default: "claude-agent-acp"); SSH command is always `opencan-daemon attach`.
