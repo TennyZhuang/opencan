@@ -7,6 +7,7 @@ struct SessionPickerView: View {
     let workspace: Workspace
     @State private var hasConnected = false
     @State private var navigateToChat = false
+    @State private var loadingSessionId: String?
 
     var body: some View {
         Group {
@@ -75,7 +76,13 @@ struct SessionPickerView: View {
                 Button {
                     Task { await createNew() }
                 } label: {
-                    Label("New Session", systemImage: "plus.circle")
+                    HStack {
+                        Label("New Session", systemImage: "plus.circle")
+                        if appState.isCreatingSession, loadingSessionId == nil {
+                            Spacer()
+                            ProgressView()
+                        }
+                    }
                 }
                 .disabled(appState.isCreatingSession)
             }
@@ -86,17 +93,24 @@ struct SessionPickerView: View {
                         Button {
                             Task { await resume(sessionId: session.sessionId) }
                         } label: {
-                            VStack(alignment: .leading, spacing: 4) {
-                                if let title = session.title {
-                                    Text(title)
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    if let title = session.title {
+                                        Text(title)
+                                            .lineLimit(1)
+                                    }
+                                    Text(session.sessionId)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(.secondary)
                                         .lineLimit(1)
                                 }
-                                Text(session.sessionId)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                                if loadingSessionId == session.sessionId {
+                                    Spacer()
+                                    ProgressView()
+                                }
                             }
                         }
+                        .disabled(appState.isCreatingSession)
                     }
                 }
             }
@@ -109,15 +123,22 @@ struct SessionPickerView: View {
                         Button {
                             Task { await resume(sessionId: session.sessionId) }
                         } label: {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(session.title ?? session.sessionId)
-                                    .font(.system(.body, design: .monospaced))
-                                    .lineLimit(1)
-                                Text(session.lastUsedAt.formatted(.relative(presentation: .named)))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(session.title ?? session.sessionId)
+                                        .font(.system(.body, design: .monospaced))
+                                        .lineLimit(1)
+                                    Text(session.lastUsedAt.formatted(.relative(presentation: .named)))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if loadingSessionId == session.sessionId {
+                                    Spacer()
+                                    ProgressView()
+                                }
                             }
                         }
+                        .disabled(appState.isCreatingSession)
                     }
                 }
             }
@@ -125,6 +146,8 @@ struct SessionPickerView: View {
     }
 
     private func createNew() async {
+        appState.isCreatingSession = true
+        defer { appState.isCreatingSession = false }
         do {
             try await appState.createNewSession(modelContext: modelContext)
             navigateToChat = true
@@ -134,6 +157,12 @@ struct SessionPickerView: View {
     }
 
     private func resume(sessionId: String) async {
+        appState.isCreatingSession = true
+        loadingSessionId = sessionId
+        defer {
+            appState.isCreatingSession = false
+            loadingSessionId = nil
+        }
         do {
             try await appState.resumeSession(sessionId: sessionId, modelContext: modelContext)
             navigateToChat = true

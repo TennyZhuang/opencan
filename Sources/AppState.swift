@@ -151,9 +151,6 @@ final class AppState {
             throw AppStateError.notConnected
         }
 
-        isCreatingSession = true
-        defer { isCreatingSession = false }
-
         messages = []
 
         Log.toFile("[AppState] Creating session...")
