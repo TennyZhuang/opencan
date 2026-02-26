@@ -2,6 +2,9 @@ import SwiftUI
 
 struct ChatView: View {
     @Environment(AppState.self) private var appState
+    /// Tracks whether the bottom anchor is visible.
+    /// Used to decide auto-scroll when NOT actively streaming.
+    @State private var isNearBottom = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -12,18 +15,38 @@ struct ChatView: View {
                             MessageRowView(message: message)
                                 .id(message.id)
                         }
+                        // Invisible anchor for scrollTo target.
+                        // onAppear/onDisappear approximate whether user
+                        // is scrolled near the bottom.
                         Color.clear
                             .frame(height: 1)
                             .id("bottom")
+                            .onAppear { isNearBottom = true }
+                            .onDisappear { isNearBottom = false }
                     }
                     .padding()
                 }
-                .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
-                .onChange(of: appState.scrollTrigger) {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo("bottom")
+                // Streaming content changed (debounced).
+                // During active prompting, always follow content.
+                // When idle, only scroll if user is near bottom.
+                .onChange(of: appState.contentVersion) {
+                    if appState.isPrompting || isNearBottom {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo("bottom", anchor: .bottom)
+                        }
                     }
+                }
+                // User sent a message — always scroll to bottom.
+                .onChange(of: appState.forceScrollToBottom) {
+                    guard appState.forceScrollToBottom else { return }
+                    appState.forceScrollToBottom = false
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    }
+                }
+                .onAppear {
+                    proxy.scrollTo("bottom", anchor: .bottom)
                 }
             }
 

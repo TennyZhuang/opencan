@@ -23,7 +23,12 @@ final class AppState {
     var currentSessionId: String?
     var isPrompting = false
     var isCreatingSession = false
-    var scrollTrigger = 0
+    /// Incremented (debounced) when chat content changes. The view
+    /// auto-scrolls only if the user is already near the bottom.
+    var contentVersion = 0
+    /// Set to true when the user sends a message — forces scroll
+    /// to bottom regardless of current scroll position.
+    var forceScrollToBottom = false
 
     // Internal
     private let sshManager = SSHConnectionManager()
@@ -96,6 +101,9 @@ final class AppState {
                             )
                         }
                     } catch {
+                        // PTY died — close the transport so the ACP client's
+                        // message stream ends and pending requests are cancelled.
+                        await t.close()
                         await MainActor.run {
                             self.connectionError = "PTY closed: \(error.localizedDescription)"
                             self.connectionStatus = .disconnected
@@ -239,9 +247,16 @@ final class AppState {
     // MARK: - Chat
 
     func sendMessage(_ text: String) {
-        guard !text.isEmpty, !isPrompting,
-              let service = acpService,
-              let sessionId = currentSessionId else { return }
+        guard !text.isEmpty else { return }
+        guard !isPrompting else {
+            addSystemMessage("Still waiting for response...")
+            return
+        }
+        guard let service = acpService,
+              let sessionId = currentSessionId else {
+            addSystemMessage("Not connected — please reconnect")
+            return
+        }
 
         let userMsg = ChatMessage(role: .user, content: text)
         messages.append(userMsg)
@@ -249,7 +264,7 @@ final class AppState {
         let assistantMsg = ChatMessage(role: .assistant, isStreaming: true)
         messages.append(assistantMsg)
         isPrompting = true
-        scrollTrigger += 1
+        forceScrollToBottom = true
 
         Task {
             do {
@@ -349,7 +364,23 @@ final class AppState {
             }
             isPrompting = false
         }
-        scrollTrigger += 1
+        contentDidChange()
+    }
+
+    /// Notify the view that chat content changed.
+    /// Debounces with a short delay so MarkdownView and other
+    /// async-layout views can settle before we trigger a scroll.
+    private var contentChangeTask: Task<Void, Never>?
+
+    private func contentDidChange() {
+        // Cancel the previous pending scroll — restart the timer
+        // so we always wait for a quiet period after the last event.
+        contentChangeTask?.cancel()
+        contentChangeTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            self.contentVersion += 1
+            self.contentChangeTask = nil
+        }
     }
 
     /// Get or create the current assistant message for appending content.

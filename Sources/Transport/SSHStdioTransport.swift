@@ -104,7 +104,9 @@ actor SSHStdioTransport: ACPTransport {
             cmdBuf.writeString(command + "\n")
             try await outbound.write(cmdBuf)
 
-            // Read PTY output and parse JSON-RPC messages
+            // Read PTY output and parse JSON-RPC messages.
+            // Ensure the message stream is finished even if the loop throws.
+            defer { self.messageContinuation.finish() }
             for try await event in inbound {
                 switch event {
                 case .stdout(let buffer):
@@ -114,8 +116,6 @@ actor SSHStdioTransport: ACPTransport {
                     Log.toFile("[stderr] \(String(buffer: buffer))")
                 }
             }
-
-            self.messageContinuation.finish()
         }
     }
 }
