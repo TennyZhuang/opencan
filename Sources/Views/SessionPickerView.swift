@@ -24,14 +24,18 @@ struct SessionPickerView: View {
             ChatView()
         }
         .onAppear {
-            if appState.connectionStatus == .connected {
+            let isSameWorkspace = appState.activeWorkspace?.persistentModelID == workspace.persistentModelID
+            if appState.connectionStatus == .connected, isSameWorkspace {
                 hasConnected = true
-            } else if appState.connectionStatus != .connecting {
+            } else if appState.connectionStatus == .connecting, isSameWorkspace {
+                // Already connecting to this workspace, wait for it
+            } else {
                 appState.connect(workspace: workspace)
             }
         }
         .onChange(of: appState.connectionStatus) {
-            if appState.connectionStatus == .connected {
+            if appState.connectionStatus == .connected,
+               appState.activeWorkspace?.persistentModelID == workspace.persistentModelID {
                 hasConnected = true
             }
         }
