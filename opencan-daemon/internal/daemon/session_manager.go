@@ -49,9 +49,23 @@ func (sm *SessionManager) CreateSession(cwd, command string) (*proxy.ACPProxy, e
 // GetSession returns the proxy for the given session ID.
 func (sm *SessionManager) GetSession(sessionID string) (*proxy.ACPProxy, bool) {
 	sm.mu.RLock()
-	defer sm.mu.RUnlock()
 	p, ok := sm.sessions[sessionID]
-	return p, ok
+	sm.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	if p.State() != proxy.StateDead {
+		return p, true
+	}
+
+	// Opportunistically prune dead sessions on lookup so callers don't attach
+	// to stale entries that can no longer service requests.
+	sm.mu.Lock()
+	if current, ok := sm.sessions[sessionID]; ok && current.State() == proxy.StateDead {
+		delete(sm.sessions, sessionID)
+	}
+	sm.mu.Unlock()
+	return nil, false
 }
 
 // ListSessions returns info about all sessions.

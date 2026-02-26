@@ -25,6 +25,7 @@ type ClientConn interface {
 type PendingRequest struct {
 	OriginalID *protocol.JSONRPCID
 	Client     ClientConn
+	Method     string
 }
 
 // ACPProxy manages a single claude-agent-acp child process and its event buffer.
@@ -47,8 +48,8 @@ type ACPProxy struct {
 	pendingRequests map[int64]PendingRequest
 	nextInternalID  atomic.Int64
 
-	doneCh chan struct{}
-	logger *slog.Logger
+	doneCh  chan struct{}
+	logger  *slog.Logger
 	writeMu sync.Mutex
 }
 
@@ -275,6 +276,10 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 	if pr.Client != nil {
 		pr.Client.Send(fwd)
 	}
+
+	if pr.Method == protocol.MethodSessionPrompt && msg.IsError() {
+		p.handlePromptTerminalError()
+	}
 }
 
 func (p *ACPProxy) handleServerRequest(msg *protocol.Message) {
@@ -326,10 +331,25 @@ func (p *ACPProxy) buildAutoApproveResponse(msg *protocol.Message) *protocol.Mes
 
 func (p *ACPProxy) handlePromptComplete() {
 	switch p.State() {
-	case StatePrompting:
-		p.setState(StateIdle)
-	case StateDraining:
-		p.setState(StateCompleted)
+	case StatePrompting, StateDraining:
+		if p.GetClient() != nil {
+			p.setState(StateIdle)
+		} else {
+			p.setState(StateCompleted)
+		}
+	}
+}
+
+// handlePromptTerminalError clears stale running states if a prompt request
+// fails before emitting prompt_complete.
+func (p *ACPProxy) handlePromptTerminalError() {
+	switch p.State() {
+	case StatePrompting, StateDraining:
+		if p.GetClient() != nil {
+			p.setState(StateIdle)
+		} else {
+			p.setState(StateCompleted)
+		}
 	}
 }
 
@@ -355,6 +375,13 @@ func (p *ACPProxy) State() SessionState {
 func (p *ACPProxy) setState(s SessionState) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.state == StateDead && s != StateDead {
+		p.logger.Warn("ignoring transition from dead state", "from", p.state, "to", s, "session", p.SessionID)
+		return
+	}
+	if p.state == s {
+		return
+	}
 	p.logger.Info("state transition", "from", p.state, "to", s, "session", p.SessionID)
 	p.state = s
 }
@@ -369,9 +396,13 @@ func (p *ACPProxy) EventBuf() *EventBuffer { return p.eventBuffer }
 func (p *ACPProxy) AttachClient(c ClientConn) SessionState {
 	p.client.Store(&clientWrapper{conn: c})
 	state := p.State()
-	if state == StateCompleted {
+	switch state {
+	case StateCompleted:
 		p.setState(StateIdle)
 		return StateIdle
+	case StateDraining:
+		p.setState(StatePrompting)
+		return StatePrompting
 	}
 	return state
 }
@@ -399,21 +430,31 @@ func (p *ACPProxy) GetClient() ClientConn {
 // ForwardFromClient forwards a request to the ACP process with ID rewriting.
 func (p *ACPProxy) ForwardFromClient(msg *protocol.Message, client ClientConn) error {
 	if msg.IsRequest() {
-		if msg.Method == protocol.MethodSessionPrompt {
-			p.setState(StatePrompting)
+		if msg.Method == protocol.MethodSessionPrompt && p.State() == StateDead {
+			return fmt.Errorf("session is dead")
 		}
 		internalID := p.nextInternalID.Add(1)
 		p.pendingMu.Lock()
 		p.pendingRequests[internalID] = PendingRequest{
 			OriginalID: msg.ID,
 			Client:     client,
+			Method:     msg.Method,
 		}
 		p.pendingMu.Unlock()
 
 		fwd := msg.Clone()
 		newID := protocol.IntID(internalID)
 		fwd.ID = &newID
-		return p.writeMessage(fwd)
+		if err := p.writeMessage(fwd); err != nil {
+			p.pendingMu.Lock()
+			delete(p.pendingRequests, internalID)
+			p.pendingMu.Unlock()
+			return err
+		}
+		if msg.Method == protocol.MethodSessionPrompt {
+			p.setState(StatePrompting)
+		}
+		return nil
 	}
 	// Direct forward (e.g., permission response from client)
 	return p.writeMessage(msg)
