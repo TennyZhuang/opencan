@@ -28,6 +28,7 @@ struct SessionPickerView: View {
             let isSameWorkspace = appState.activeWorkspace?.persistentModelID == workspace.persistentModelID
             if appState.connectionStatus == .connected, isSameWorkspace {
                 hasConnected = true
+                Task { await appState.refreshDaemonSessions() }
             } else if appState.connectionStatus == .connecting, isSameWorkspace {
                 // Already connecting to this workspace, wait for it
             } else if OpenCANApp.isUITesting {
@@ -174,6 +175,9 @@ struct SessionPickerView: View {
                     }
                 }
             }
+        }
+        .refreshable {
+            await appState.refreshDaemonSessions()
         }
     }
 

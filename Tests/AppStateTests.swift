@@ -469,6 +469,31 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testRefreshDaemonSessionsUpdatesSnapshot() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string("daemon-s-1"),
+                "cwd": .string("/test/path"),
+                "state": .string("prompting"),
+                "lastEventSeq": .int(42),
+            ]
+        ])
+
+        await appState.refreshDaemonSessions()
+
+        XCTAssertEqual(appState.daemonSessions.count, 1)
+        XCTAssertEqual(appState.daemonSessions.first?.sessionId, "daemon-s-1")
+        XCTAssertEqual(appState.daemonSessions.first?.state, "prompting")
+        XCTAssertEqual(appState.daemonSessions.first?.lastEventSeq, 42)
+    }
+
     // MARK: - UnifiedSession Tests
 
     func testUnifiedSessionMerge() {

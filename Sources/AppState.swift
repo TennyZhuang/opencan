@@ -217,6 +217,14 @@ final class AppState {
         }
     }
 
+    /// Refresh daemon session snapshot used by SessionPicker state badges.
+    func refreshDaemonSessions() async {
+        guard let daemon = daemonClient else { return }
+        if let updated = try? await daemon.listSessions() {
+            self.daemonSessions = updated
+        }
+    }
+
     /// Create a new ACP session via the daemon.
     func createNewSession(modelContext: ModelContext) async throws {
         guard let daemon = daemonClient,
@@ -248,9 +256,7 @@ final class AppState {
         self.activeSession = session
 
         // Refresh daemon session list so SessionPickerView shows the new session
-        if let updated = try? await daemon.listSessions() {
-            self.daemonSessions = updated
-        }
+        await refreshDaemonSessions()
 
         addSystemMessage("New session on \(workspace.name)")
     }
@@ -420,6 +426,8 @@ final class AppState {
         }
         addSystemMessage(statusMsg)
 
+        await refreshDaemonSessions()
+
         if !result.bufferedEvents.isEmpty && isRunning {
             Log.toFile("[AppState] Replayed \(result.bufferedEvents.count) buffered events")
         }
@@ -498,9 +506,7 @@ final class AppState {
         try? modelContext.save()
 
         // Refresh daemon session list
-        if let updated = try? await daemon.listSessions() {
-            self.daemonSessions = updated
-        }
+        await refreshDaemonSessions()
 
         if historyLoadFailed {
             addSystemMessage("Session recovered (conversation history unavailable)")
@@ -585,6 +591,7 @@ final class AppState {
                     msg.isStreaming = false
                 }
                 self.isPrompting = false
+                await self.refreshDaemonSessions()
             } catch {
                 Log.toFile("[AppState] sendPrompt error: \(error)")
                 self.lastAssistantMessage().content += "\n[Error: \(error.localizedDescription)]"
@@ -592,6 +599,7 @@ final class AppState {
                     msg.isStreaming = false
                 }
                 self.isPrompting = false
+                await self.refreshDaemonSessions()
             }
         }
     }
@@ -690,6 +698,7 @@ final class AppState {
                 msg.isStreaming = false
             }
             isPrompting = false
+            Task { await self.refreshDaemonSessions() }
             // Force scroll regardless of isNearBottom — the final content
             // must be visible even if the anchor drifted off-screen.
             forceScrollToBottom = true
