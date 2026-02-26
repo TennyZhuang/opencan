@@ -393,15 +393,13 @@ final class AppState {
                 msg.toolCalls[i].isFailed = failed
             }
 
-        case .thought(let text):
-            lastAssistantMessage().content += "\n> \(text)"
+        case .thought:
+            // Suppressed — streaming thoughts into MarkdownView causes
+            // heavy re-renders (blockquote re-layout) that trigger screen flicker.
+            break
 
-        case .thoughtDelta(let text):
-            if !isStreamingThought {
-                lastAssistantMessage().content += "\n> "
-                isStreamingThought = true
-            }
-            lastAssistantMessage().content += text
+        case .thoughtDelta:
+            break
 
         case .promptComplete(_):
             // Stop streaming on ALL assistant messages from this turn.
@@ -409,21 +407,30 @@ final class AppState {
                 msg.isStreaming = false
             }
             isPrompting = false
+            // Force scroll regardless of isNearBottom — the final content
+            // must be visible even if the anchor drifted off-screen.
+            forceScrollToBottom = true
         }
         contentDidChange()
     }
 
     /// Notify the view that chat content changed.
-    /// Debounces with a short delay so MarkdownView and other
-    /// async-layout views can settle before we trigger a scroll.
+    /// Uses throttle-with-trailing: fires at most every 300ms during
+    /// continuous streaming, plus a trailing 150ms debounce after events stop.
     private var contentChangeTask: Task<Void, Never>?
+    private var lastScrollTime = ContinuousClock.now
 
     private func contentDidChange() {
-        // Cancel the previous pending scroll — restart the timer
-        // so we always wait for a quiet period after the last event.
         contentChangeTask?.cancel()
         contentChangeTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(150))
+            let sinceLast = ContinuousClock.now - self.lastScrollTime
+            if sinceLast < .milliseconds(300) {
+                // Within max interval — debounce until quiet
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+            }
+            // Past max interval or debounce completed — scroll now
+            self.lastScrollTime = ContinuousClock.now
             self.contentVersion += 1
             self.contentChangeTask = nil
         }

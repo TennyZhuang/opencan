@@ -5,6 +5,9 @@ struct ChatView: View {
     /// Tracks whether the bottom anchor is visible.
     /// Used to decide auto-scroll when NOT actively streaming.
     @State private var isNearBottom = true
+    /// Follow-up scroll to correct for MarkdownView async layout
+    /// and LazyVStack height estimation drift.
+    @State private var followUpTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,23 +30,20 @@ struct ChatView: View {
                     .padding()
                 }
                 .scrollDismissesKeyboard(.interactively)
-                // Streaming content changed (debounced).
+                // Streaming content changed (throttled).
                 // During active prompting, always follow content.
                 // When idle, only scroll if user is near bottom.
                 .onChange(of: appState.contentVersion) {
                     if appState.isPrompting || isNearBottom {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo("bottom", anchor: .bottom)
-                        }
+                        scrollToBottom(proxy: proxy, animated: !appState.isPrompting)
                     }
                 }
-                // User sent a message — always scroll to bottom.
+                // User sent a message or prompt completed —
+                // always scroll to bottom.
                 .onChange(of: appState.forceScrollToBottom) {
                     guard appState.forceScrollToBottom else { return }
                     appState.forceScrollToBottom = false
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                    }
+                    scrollToBottom(proxy: proxy, animated: true)
                 }
                 .onAppear {
                     proxy.scrollTo("bottom", anchor: .bottom)
@@ -63,6 +63,29 @@ struct ChatView: View {
                     appState.disconnect()
                 }
             }
+        }
+    }
+
+    /// Scroll to bottom with an optional follow-up to catch layout drift.
+    /// MarkdownView (UIKit-backed) lays out asynchronously — a second
+    /// scroll 250ms later corrects for height changes that occur after
+    /// the first scrollTo.
+    private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+        if animated {
+            withAnimation(.easeOut(duration: 0.15)) {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+        } else {
+            proxy.scrollTo("bottom", anchor: .bottom)
+        }
+
+        // Schedule follow-up scroll. Cancelled if another scroll starts
+        // before it fires (prevents pile-up during rapid streaming).
+        followUpTask?.cancel()
+        followUpTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            proxy.scrollTo("bottom", anchor: .bottom)
         }
     }
 }
