@@ -38,6 +38,21 @@ targets:
         INFOPLIST_KEY_LSRequiresIPhoneOS: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
 
+  OpenCANTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+    dependencies:
+      - target: OpenCAN
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.10"
+        PRODUCT_BUNDLE_IDENTIFIER: com.tianyizhuang.OpenCAN.Tests
+        DEVELOPMENT_TEAM: K9329AKMW8
+        CODE_SIGN_STYLE: Automatic
+
   OpenCANUITests:
     type: bundle.ui-testing
     platform: iOS

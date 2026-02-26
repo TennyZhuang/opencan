@@ -82,8 +82,13 @@ enum SessionUpdateParser {
             let reason = StopReason(rawValue: rawReason) ?? .unknown
             return .promptComplete(stopReason: reason)
 
-        case "plan", "user_message_chunk", "available_commands_update", "mode_update":
+        case "plan", "available_commands_update", "mode_update":
             return nil
+
+        case "user_message_chunk":
+            if let text = update?["content"]?["text"]?.stringValue {
+                return .userMessage(text: text)
+            }
 
         default:
             Log.toFile("[SessionUpdateParser] Unknown: \(updateType ?? "nil")")

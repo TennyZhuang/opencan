@@ -29,6 +29,7 @@ enum StopReason: String {
 enum SessionEvent {
     case agentMessage(text: String)
     case agentMessageDelta(text: String)
+    case userMessage(text: String)
     case toolCall(id: String, name: String, input: JSONValue?)
     case toolCallUpdate(id: String, title: String?, input: JSONValue?, output: String?)
     case toolCallComplete(id: String, title: String?, input: JSONValue?, output: String?, failed: Bool)

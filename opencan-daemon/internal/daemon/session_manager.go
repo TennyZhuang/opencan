@@ -1,0 +1,126 @@
+package daemon
+
+import (
+	"fmt"
+	"log/slog"
+	"sync"
+
+	"github.com/anthropics/opencan-daemon/internal/proxy"
+)
+
+// SessionInfo is a snapshot of a session's state for listing.
+type SessionInfo struct {
+	SessionID    string             `json:"sessionId"`
+	CWD          string             `json:"cwd"`
+	State        proxy.SessionState `json:"state"`
+	LastEventSeq uint64             `json:"lastEventSeq"`
+}
+
+// SessionManager manages all ACPProxy instances.
+type SessionManager struct {
+	mu       sync.RWMutex
+	sessions map[string]*proxy.ACPProxy
+	logger   *slog.Logger
+}
+
+// NewSessionManager creates a new SessionManager.
+func NewSessionManager(logger *slog.Logger) *SessionManager {
+	return &SessionManager{
+		sessions: make(map[string]*proxy.ACPProxy),
+		logger:   logger.With("component", "session_manager"),
+	}
+}
+
+// CreateSession spawns a new ACP process and registers the proxy.
+func (sm *SessionManager) CreateSession(cwd, command string) (*proxy.ACPProxy, error) {
+	p, err := proxy.NewACPProxy(cwd, command, sm.logger)
+	if err != nil {
+		return nil, fmt.Errorf("create ACP proxy: %w", err)
+	}
+
+	sm.mu.Lock()
+	sm.sessions[p.SessionID] = p
+	sm.mu.Unlock()
+
+	sm.logger.Info("session created", "sessionId", p.SessionID, "cwd", cwd)
+	return p, nil
+}
+
+// GetSession returns the proxy for the given session ID.
+func (sm *SessionManager) GetSession(sessionID string) (*proxy.ACPProxy, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	p, ok := sm.sessions[sessionID]
+	return p, ok
+}
+
+// ListSessions returns info about all sessions.
+func (sm *SessionManager) ListSessions() []SessionInfo {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	infos := make([]SessionInfo, 0, len(sm.sessions))
+	for _, p := range sm.sessions {
+		infos = append(infos, SessionInfo{
+			SessionID:    p.SessionID,
+			CWD:          p.CWD,
+			State:        p.State(),
+			LastEventSeq: p.EventBuf().LastSeq(),
+		})
+	}
+	return infos
+}
+
+// KillSession terminates the ACP process for the given session.
+func (sm *SessionManager) KillSession(sessionID string) error {
+	sm.mu.Lock()
+	p, ok := sm.sessions[sessionID]
+	if ok {
+		delete(sm.sessions, sessionID)
+	}
+	sm.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	p.Kill()
+	sm.logger.Info("session killed", "sessionId", sessionID)
+	return nil
+}
+
+// RemoveDead removes sessions in Dead state from the map.
+func (sm *SessionManager) RemoveDead() int {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	removed := 0
+	for id, p := range sm.sessions {
+		if p.State() == proxy.StateDead {
+			delete(sm.sessions, id)
+			removed++
+		}
+	}
+	return removed
+}
+
+// Count returns the number of active sessions.
+func (sm *SessionManager) Count() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.sessions)
+}
+
+// IsIdle returns true if there are no sessions or all are Dead/Completed.
+func (sm *SessionManager) IsIdle() bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, p := range sm.sessions {
+		s := p.State()
+		if s != proxy.StateDead && s != proxy.StateCompleted {
+			return false
+		}
+	}
+	return true
+}

@@ -83,15 +83,24 @@ struct ACPService {
     }
 
     /// Load an existing session by ID.
-    func loadSession(sessionId: String, cwd: String) async throws {
-        let params: JSONValue = .object([
+    /// - Parameters:
+    ///   - sessionId: The session to load from disk (ACP reads this session's history).
+    ///   - routeToSessionId: If provided, the daemon routes the request to this session's
+    ///     ACP process instead of the one matching `sessionId`. Used when loading old
+    ///     session history into a newly created ACP process.
+    ///   - cwd: Working directory for the session.
+    func loadSession(sessionId: String, cwd: String, routeToSessionId: String? = nil) async throws {
+        var paramsDict: [String: JSONValue] = [
             "sessionId": .string(sessionId),
             "cwd": .string(cwd),
             "mcpServers": .array([])
-        ])
+        ]
+        if let routeToSessionId {
+            paramsDict["__routeToSession"] = .string(routeToSessionId)
+        }
         let result = try await client.sendRequest(
             method: ACPMethods.sessionLoad,
-            params: params
+            params: .object(paramsDict)
         )
         Log.toFile("[ACPService] session/load result: \(result)")
     }

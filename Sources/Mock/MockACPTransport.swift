@@ -3,11 +3,32 @@ import Foundation
 /// Mock ACP transport for offline UI testing.
 /// Receives JSON-RPC requests via `send()`, parses the method, and yields
 /// appropriate responses + `session/update` notifications to its `messages` stream.
+/// Supports both daemon protocol methods and ACP passthrough.
 actor MockACPTransport: ACPTransport {
     private let messageContinuation: AsyncStream<JSONRPCMessage>.Continuation
     nonisolated let messages: AsyncStream<JSONRPCMessage>
     private var scenario: MockScenario
     private var isClosed = false
+    private var mockSessionId: String?
+
+    /// Configurable attach result for testing different resume strategies.
+    var mockAttachState: String = "idle"
+    var mockAttachBufferedEvents: [[String: JSONValue]] = []
+
+    /// Configurable session list for testing daemon state re-check.
+    var mockSessionList: [[String: JSONValue]] = []
+
+    /// If true, sessionAttach returns an error (simulates unknown session).
+    var mockAttachShouldFail = false
+
+    /// Steps to stream during session/load (simulates history replay).
+    var mockLoadSteps: [MockStep] = []
+
+    /// Track last received method for test assertions.
+    var lastReceivedMethod: String?
+
+    /// Track all received methods in order.
+    var receivedMethods: [String] = []
 
     init(scenario: MockScenario = .simple) {
         self.scenario = scenario
@@ -21,9 +42,10 @@ actor MockACPTransport: ACPTransport {
 
         switch message {
         case .request(let id, let method, let params):
+            lastReceivedMethod = method
+            receivedMethods.append(method)
             await handleRequest(id: id, method: method, params: params)
         case .response, .notification, .error:
-            // Responses from ACPClient (e.g. permission replies) — no action needed
             break
         }
     }
@@ -41,45 +63,57 @@ actor MockACPTransport: ACPTransport {
         params: JSONValue?
     ) async {
         switch method {
-        case ACPMethods.initialize:
+        // Daemon protocol methods
+        case DaemonMethods.hello:
             let result: JSONValue = .object([
-                "protocolVersion": .int(1),
-                "agentCapabilities": .object([
-                    "loadSession": .bool(true)
-                ]),
-                "agentInfo": .object([
-                    "name": .string("mock-agent"),
-                    "version": .string("1.0.0")
-                ])
+                "daemonVersion": .string("mock-0.1.0"),
+                "sessions": .array(mockSessionList.map { .object($0) })
             ])
             messageContinuation.yield(.response(id: id, result: result))
 
-        case ACPMethods.sessionNew:
+        case DaemonMethods.sessionCreate:
             let sessionId = "mock-sess-\(UUID().uuidString.prefix(8))"
+            self.mockSessionId = sessionId
             let result: JSONValue = .object([
                 "sessionId": .string(sessionId)
             ])
             messageContinuation.yield(.response(id: id, result: result))
 
-        case ACPMethods.sessionList:
+        case DaemonMethods.sessionAttach:
+            if mockAttachShouldFail {
+                messageContinuation.yield(
+                    .error(id: id, code: -32000, message: "Session not found", data: nil)
+                )
+                // Reset after first failure so subsequent attaches succeed
+                mockAttachShouldFail = false
+                return
+            }
+            let bufferedArr: [JSONValue] = mockAttachBufferedEvents.map { .object($0) }
             let result: JSONValue = .object([
-                "sessions": .array([
-                    .object([
-                        "sessionId": .string("mock-prev-session"),
-                        "cwd": .string(params?["cwd"]?.stringValue ?? "/tmp"),
-                        "title": .string("Previous mock session")
-                    ])
-                ])
+                "state": .string(mockAttachState),
+                "bufferedEvents": .array(bufferedArr)
             ])
             messageContinuation.yield(.response(id: id, result: result))
 
-        case ACPMethods.sessionLoad:
+        case DaemonMethods.sessionDetach:
             messageContinuation.yield(.response(id: id, result: .object([:])))
 
+        case DaemonMethods.sessionList:
+            messageContinuation.yield(.response(id: id, result: .object([
+                "sessions": .array(mockSessionList.map { .object($0) })
+            ])))
+
+        case DaemonMethods.sessionKill:
+            messageContinuation.yield(.response(id: id, result: .object([:])))
+
+        // ACP passthrough (daemon forwards transparently)
         case ACPMethods.sessionPrompt:
-            let sessionId = params?["sessionId"]?.stringValue ?? "unknown"
-            // Stream scenario notifications, then respond
+            let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
             await streamScenario(requestId: id, sessionId: sessionId)
+
+        case ACPMethods.sessionLoad:
+            let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
+            await streamLoadHistory(requestId: id, sessionId: sessionId)
 
         default:
             messageContinuation.yield(
@@ -96,71 +130,98 @@ actor MockACPTransport: ACPTransport {
     ) async {
         for step in scenario.steps {
             guard !isClosed else { return }
-
-            switch step {
-            case .delay(let ms):
-                try? await Task.sleep(for: .milliseconds(ms))
-
-            case .textDelta(let text):
-                yieldSessionUpdate(sessionId: sessionId, update: .object([
-                    "sessionUpdate": .string("agent_message_chunk"),
-                    "content": .object([
-                        "type": .string("text"),
-                        "text": .string(text)
-                    ])
-                ]))
-
-            case .thoughtDelta(let text):
-                yieldSessionUpdate(sessionId: sessionId, update: .object([
-                    "sessionUpdate": .string("agent_thought_chunk"),
-                    "content": .object([
-                        "type": .string("text"),
-                        "text": .string(text)
-                    ])
-                ]))
-
-            case .toolCallStart(let id, let name):
-                yieldSessionUpdate(sessionId: sessionId, update: .object([
-                    "sessionUpdate": .string("tool_call"),
-                    "toolCallId": .string(id),
-                    "title": .string(name),
-                    "kind": .string("tool_use"),
-                    "status": .string("running"),
-                    "rawInput": .null
-                ]))
-
-            case .toolCallUpdate(let id, let output):
-                var updateObj: [String: JSONValue] = [
-                    "sessionUpdate": .string("tool_call_update"),
-                    "toolCallId": .string(id),
-                    "status": .string("running"),
-                ]
-                if let output {
-                    updateObj["rawOutput"] = .string(output)
-                }
-                yieldSessionUpdate(sessionId: sessionId, update: .object(updateObj))
-
-            case .toolCallComplete(let id, let output, let failed):
-                yieldSessionUpdate(sessionId: sessionId, update: .object([
-                    "sessionUpdate": .string("tool_call_update"),
-                    "toolCallId": .string(id),
-                    "status": .string(failed ? "failed" : "completed"),
-                    "rawOutput": .string(output)
-                ]))
-
-            case .promptComplete(let reason):
-                yieldSessionUpdate(sessionId: sessionId, update: .object([
-                    "sessionUpdate": .string("prompt_complete"),
-                    "stopReason": .string(reason.rawValue)
-                ]))
-            }
+            await executeStep(step, sessionId: sessionId)
         }
 
-        // Finally, yield the response to resolve the sendPrompt() call
         let result: JSONValue = .object([
             "stopReason": .string("end_turn")
         ])
         messageContinuation.yield(.response(id: requestId, result: result))
+    }
+
+    /// Stream history events during session/load, then return response.
+    private func streamLoadHistory(
+        requestId: JSONRPCMessage.JSONRPCID,
+        sessionId: String
+    ) async {
+        for step in mockLoadSteps {
+            guard !isClosed else { return }
+            await executeStep(step, sessionId: sessionId)
+        }
+
+        let result: JSONValue = .object([
+            "sessionId": .string(sessionId)
+        ])
+        messageContinuation.yield(.response(id: requestId, result: result))
+    }
+
+    private func executeStep(_ step: MockStep, sessionId: String) async {
+        switch step {
+        case .delay(let ms):
+            try? await Task.sleep(for: .milliseconds(ms))
+
+        case .textDelta(let text):
+            yieldSessionUpdate(sessionId: sessionId, update: .object([
+                "sessionUpdate": .string("agent_message_chunk"),
+                "content": .object([
+                    "type": .string("text"),
+                    "text": .string(text)
+                ])
+            ]))
+
+        case .userMessageChunk(let text):
+            yieldSessionUpdate(sessionId: sessionId, update: .object([
+                "sessionUpdate": .string("user_message_chunk"),
+                "content": .object([
+                    "type": .string("text"),
+                    "text": .string(text)
+                ])
+            ]))
+
+        case .thoughtDelta(let text):
+            yieldSessionUpdate(sessionId: sessionId, update: .object([
+                "sessionUpdate": .string("agent_thought_chunk"),
+                "content": .object([
+                    "type": .string("text"),
+                    "text": .string(text)
+                ])
+            ]))
+
+        case .toolCallStart(let id, let name):
+            yieldSessionUpdate(sessionId: sessionId, update: .object([
+                "sessionUpdate": .string("tool_call"),
+                "toolCallId": .string(id),
+                "title": .string(name),
+                "kind": .string("tool_use"),
+                "status": .string("running"),
+                "rawInput": .null
+            ]))
+
+        case .toolCallUpdate(let id, let output):
+            var updateObj: [String: JSONValue] = [
+                "sessionUpdate": .string("tool_call_update"),
+                "toolCallId": .string(id),
+                "status": .string("running"),
+            ]
+            if let output {
+                updateObj["rawOutput"] = .string(output)
+            }
+            yieldSessionUpdate(sessionId: sessionId, update: .object(updateObj))
+
+        case .toolCallComplete(let id, let output, let failed):
+            yieldSessionUpdate(sessionId: sessionId, update: .object([
+                "sessionUpdate": .string("tool_call_update"),
+                "toolCallId": .string(id),
+                "status": .string(failed ? "failed" : "completed"),
+                "rawOutput": .string(output)
+            ]))
+
+        case .promptComplete(let reason):
+            yieldSessionUpdate(sessionId: sessionId, update: .object([
+                "sessionUpdate": .string("prompt_complete"),
+                "stopReason": .string(reason.rawValue)
+            ]))
+        }
     }
 
     private func yieldSessionUpdate(sessionId: String, update: JSONValue) {

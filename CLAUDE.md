@@ -31,29 +31,55 @@ xcrun devicectl device copy from --device $DEVICE \
 
 No linter is configured. A UI test target (`OpenCANUITests`) exists in `project.yml`.
 
+## Daemon Build & Test
+
+```bash
+cd opencan-daemon
+
+# Build daemon binary + mock ACP server
+make build mock-acp
+
+# Run unit tests
+make test
+
+# Run integration tests (requires mock-acp-server binary)
+go test -v -race -timeout 60s ./test/
+
+# Cross-compile daemon and copy to iOS app bundle (required before deploying to a new server)
+cd opencan-daemon && make install-ios
+
+# Manual testing: start daemon in foreground, connect via socat
+bin/opencan-daemon start --foreground --verbose
+# In another terminal:
+socat - UNIX-CONNECT:~/.opencan/daemon.sock
+```
+
 ## Architecture
 
-OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-agent-acp` over SSH. The protocol is JSON-RPC 2.0 over newline-delimited stdio, per the spec at agentclientprotocol.com.
+OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-agent-acp` via a persistent daemon over SSH. The protocol is JSON-RPC 2.0 over newline-delimited stdio, per the spec at agentclientprotocol.com.
 
 **Layer stack (bottom → top):**
 
-1. **SSH** — `SSHConnectionManager` uses Citadel for RSA key auth, optional jump host, then opens a PTY on the target. `SSHStdioTransport` (actor) wraps the PTY as an `ACPTransport` (protocol with `send()` and `messages` stream). The PTY read loop uses `defer { messageContinuation.finish() }` to ensure the message stream ends even if the loop throws. When the PTY dies, `transport.close()` is called so pending ACP requests are cancelled rather than hanging forever.
+1. **SSH** — `SSHConnectionManager` uses Citadel for RSA key auth, optional jump host, then opens a PTY on the target running `opencan-daemon attach`. `SSHStdioTransport` (actor) wraps the PTY as an `ACPTransport` (protocol with `send()` and `messages` stream). The PTY read loop uses `defer { messageContinuation.finish() }` to ensure the message stream ends even if the loop throws. When the PTY dies, `transport.close()` is called so pending ACP requests are cancelled rather than hanging forever.
 
 2. **JSON-RPC** — `JSONRPCFramer` (actor) buffers PTY bytes, skips non-JSON noise, extracts newline-delimited messages. `JSONRPCMessage` is the envelope enum (request/response/notification/error). `JSONValue` is a generic JSON type with subscript access.
 
-3. **ACP** — `ACPClient` (actor) correlates request IDs to continuations, dispatches notifications, filters PTY echoes via `sentRequestIds`, and auto-approves `session/request_permission`. `ACPService` provides typed methods: `initialize`, `createSession`, `sendPrompt`, `listSessions`, `loadSession`. `SessionUpdateParser` maps `session/update` notifications to `SessionEvent` cases (including `agent_thought_chunk` → `thoughtDelta`).
+3. **Daemon** — `opencan-daemon` is a Go binary running on the remote server. It manages ACP process lifecycles independently of SSH connections. The `attach` subcommand bridges stdin/stdout to a Unix socket (`~/.opencan/daemon.sock`). `daemon/` prefixed methods are handled by the daemon; all other methods are transparently forwarded to the appropriate ACP process based on `params.sessionId`. See `docs/daemon-architecture.md` for full protocol specification.
 
-4. **Persistence** — SwiftData models: `Node` (SSH host config + optional jump server), `Workspace` (remote cwd on a node), `Session` (ACP session tied to a workspace), `SSHKeyPair` (RSA key data). Cascade delete: Node → Workspaces → Sessions. Demo data seeded on first launch via `seedDemoDataIfNeeded()`.
+4. **ACP** — `ACPClient` (actor) correlates request IDs to continuations, dispatches notifications, filters PTY echoes via `sentRequestIds`, and auto-approves `session/request_permission`. `DaemonClient` (actor) wraps `ACPClient` for `daemon/` prefixed methods: `hello`, `session.create`, `session.attach`, `session.detach`, `session.list`, `session.kill`. `ACPService` provides typed methods for ACP passthrough: `sendPrompt`. `SessionUpdateParser` maps `session/update` notifications to `SessionEvent` cases.
 
-5. **AppState** — `@MainActor @Observable` coordinator. `connect(workspace:)` establishes SSH + ACP with 30s timeout. `createNewSession()` / `resumeSession()` manage ACP sessions with SwiftData persistence. `handleSessionEvent()` routes notifications to the message model. Creates new `ChatMessage` bubbles when text arrives after tool calls. `sendMessage()` provides user feedback on failure (prompting in progress, not connected) instead of silently dropping messages. Loading state (`isCreatingSession`) is managed by the view layer to prevent double-taps.
+5. **Persistence** — SwiftData models: `Node` (SSH host config + optional jump server), `Workspace` (remote cwd on a node), `Session` (ACP session tied to a workspace), `SSHKeyPair` (RSA key data). Cascade delete: Node → Workspaces → Sessions. Demo data seeded on first launch via `seedDemoDataIfNeeded()`.
 
-6. **SwiftUI** — `ContentView` hosts a `NavigationStack` rooted at `NodeListView`. Drill-down: `NodeListView → WorkspaceListView → SessionPickerView → ChatView`. Messages render with MarkdownView. Tool calls are expandable cards with truncated output.
+6. **AppState** — `@MainActor @Observable` coordinator. `connect(workspace:)` establishes SSH + daemon with 30s timeout via `daemon/hello`. `createNewSession()` uses `daemon/session.create` (daemon spawns ACP process internally). `resumeSession()` uses `daemon/session.attach` with event replay from buffered events. `handleSessionEvent()` routes notifications to the message model. Creates new `ChatMessage` bubbles when text arrives after tool calls. `sendMessage()` provides user feedback on failure. `lastEventSeq` tracks per-session event sequence numbers for daemon replay.
+
+7. **SwiftUI** — `ContentView` hosts a `NavigationStack` rooted at `NodeListView`. Drill-down: `NodeListView → WorkspaceListView → SessionPickerView → ChatView`. `SessionPickerView` shows daemon session states with colored badges (idle/prompting/draining/completed/dead). Messages render with MarkdownView. Tool calls are expandable cards with truncated output.
 
 **Key protocol details:**
-- Client initiates `initialize` (not the server). Client IDs start at 1000 to avoid collision with server-initiated request IDs (0, 1, 2...).
+- iOS connects via `opencan-daemon attach` (not directly to `claude-agent-acp`). The daemon handles `initialize` + `session/new` internally during `daemon/session.create`.
+- Client IDs start at 1000 to avoid collision with server-initiated request IDs. The daemon rewrites IDs when forwarding to ACP processes.
 - PTY echoes every stdin write back on stdout. The framer parses these as messages; `ACPClient` filters them by checking `sentRequestIds`.
-- `session/request_permission` must respond with `{ outcome: { outcome: "selected", optionId: "..." } }`, not `{ approved: true }`.
-- `session/new` requires an existing directory as `cwd` on the remote server.
+- `session/request_permission` is auto-approved by the daemon when no client is attached (draining state).
+- Daemon forwards `session/update` notifications with `__seq` metadata for event sequence tracking.
 
 **State flow for streaming:**
 - `sendMessage()` creates a `ChatMessage(isStreaming: true)` and calls `session/prompt`.
@@ -81,3 +107,11 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 - **`Log.toFile()`** for debugging on simulator (os_log doesn't reliably surface `print()` output). Use `xcrun devicectl device copy from` to pull logs from real devices.
 - **XcodeGen** (`project.yml`) generates the `.xcodeproj`. Run `xcodegen generate` after adding files.
 - **UI Tests** (`OpenCANUITests`) verify navigation, session creation (system message appears), message sending (user message + assistant response), session resume, and loading state. E2E tests require the real cp32 server and use `XCTSkip` when unreachable.
+
+**Daemon architecture:**
+- `opencan-daemon/` contains the Go daemon source. See `docs/daemon-architecture.md` for full design.
+- **Auto-deploy:** On first connect, `SSHConnectionManager.ensureDaemonInstalled()` checks for `~/.opencan/bin/opencan-daemon` on the server. If missing, uploads the linux-amd64 binary from the iOS app bundle via SFTP. Rebuild with `cd opencan-daemon && make install-ios` after daemon changes.
+- ACPProxy state machine: Starting → Idle → Prompting → Draining → Completed → Dead.
+- EventBuffer: ring buffer (max 10000) with sequence numbers for reconnect replay.
+- `daemon/session.attach` returns buffered events since `lastEventSeq`; iOS replays them through `SessionUpdateParser`.
+- `Node.command` field stores the ACP binary name (default: "claude-agent-acp"); SSH command is always `opencan-daemon attach`.

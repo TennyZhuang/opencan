@@ -95,6 +95,8 @@ enum MockScenario {
 enum MockStep {
     /// Yields an `agent_message_chunk` notification.
     case textDelta(String)
+    /// Yields a `user_message_chunk` notification (for history replay).
+    case userMessageChunk(String)
     /// Yields an `agent_thought_chunk` notification.
     case thoughtDelta(String)
     /// Yields a `tool_call` notification to start a tool call.

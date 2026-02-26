@@ -47,9 +47,22 @@ struct SessionPickerView: View {
     private var connectingView: some View {
         VStack(spacing: 16) {
             if appState.connectionStatus == .connecting {
-                ProgressView()
-                Text("Connecting to \(workspace.node?.name ?? "node")...")
-                    .foregroundStyle(.secondary)
+                if let progress = appState.daemonUploadProgress {
+                    ProgressView(value: progress) {
+                        Text("Installing daemon...")
+                            .foregroundStyle(.secondary)
+                    } currentValueLabel: {
+                        Text("\(Int(progress * 100))%")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .progressViewStyle(.linear)
+                    .padding(.horizontal, 40)
+                } else {
+                    ProgressView()
+                    Text("Connecting to \(workspace.node?.name ?? "node")...")
+                        .foregroundStyle(.secondary)
+                }
             } else if let error = appState.connectionError {
                 Image(systemName: "xmark.circle")
                     .font(.largeTitle)
@@ -64,11 +77,53 @@ struct SessionPickerView: View {
         .padding()
     }
 
-    private var filteredRemoteSessions: [(sessionId: String, cwd: String?, title: String?)] {
+    /// Merge daemon sessions and local SwiftData sessions into a single list.
+    private var unifiedSessions: [UnifiedSession] {
         let normalizedPath = workspace.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        return appState.remoteSessions.filter {
-            guard let cwd = $0.cwd else { return false }
-            return cwd.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == normalizedPath
+
+        // Index daemon sessions (filtered by workspace cwd) by sessionId
+        var daemonByID: [String: DaemonSessionInfo] = [:]
+        for ds in appState.daemonSessions {
+            if ds.cwd.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == normalizedPath {
+                daemonByID[ds.sessionId] = ds
+            }
+        }
+
+        // Index local sessions by sessionId
+        var localByID: [String: Session] = [:]
+        for ls in workspace.sessions ?? [] {
+            localByID[ls.sessionId] = ls
+        }
+
+        // Union all sessionIds
+        let allIds = Set(daemonByID.keys).union(localByID.keys)
+
+        let unified = allIds.map { sid -> UnifiedSession in
+            let daemon = daemonByID[sid]
+            let local = localByID[sid]
+            return UnifiedSession(
+                sessionId: sid,
+                daemonState: daemon?.state,
+                cwd: daemon?.cwd ?? workspace.path,
+                lastEventSeq: daemon?.lastEventSeq,
+                title: local?.title,
+                lastUsedAt: local?.lastUsedAt
+            )
+        }
+
+        // Sort: active (prompting/draining) first → daemon-known → by lastUsedAt desc
+        return unified.sorted { a, b in
+            let aActive = a.daemonState == "prompting" || a.daemonState == "draining"
+            let bActive = b.daemonState == "prompting" || b.daemonState == "draining"
+            if aActive != bActive { return aActive }
+
+            let aDaemon = a.daemonState != nil
+            let bDaemon = b.daemonState != nil
+            if aDaemon != bDaemon { return aDaemon }
+
+            let aDate = a.lastUsedAt ?? .distantPast
+            let bDate = b.lastUsedAt ?? .distantPast
+            return aDate > bDate
         }
     }
 
@@ -89,58 +144,33 @@ struct SessionPickerView: View {
                 .disabled(appState.isCreatingSession)
             }
 
-            if !filteredRemoteSessions.isEmpty {
-                Section("Remote Sessions") {
-                    ForEach(filteredRemoteSessions, id: \.sessionId) { session in
+            let sessions = unifiedSessions
+            if !sessions.isEmpty {
+                Section("Sessions") {
+                    ForEach(sessions) { session in
                         Button {
                             Task { await resume(sessionId: session.sessionId) }
                         } label: {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
-                                    if let title = session.title {
-                                        Text(title)
-                                            .lineLimit(1)
-                                    }
-                                    Text(session.sessionId)
-                                        .font(.system(.caption, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                                if loadingSessionId == session.sessionId {
-                                    Spacer()
-                                    ProgressView()
-                                }
-                            }
-                        }
-                        .disabled(appState.isCreatingSession)
-                    }
-                }
-            }
-
-            let localSessions = (workspace.sessions ?? [])
-                .sorted { $0.lastUsedAt > $1.lastUsedAt }
-            if !localSessions.isEmpty {
-                Section("Recent Sessions") {
-                    ForEach(localSessions) { session in
-                        Button {
-                            Task { await resume(sessionId: session.sessionId) }
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(session.title ?? session.sessionId)
+                                    Text(session.displayTitle)
                                         .font(.system(.body, design: .monospaced))
+                                        .foregroundStyle(.primary)
                                         .lineLimit(1)
-                                    Text(session.lastUsedAt.formatted(.relative(presentation: .named)))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    if let date = session.lastUsedAt {
+                                        Text(date.formatted(.relative(presentation: .named)))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
+                                Spacer()
+                                SessionStateBadge(state: session.displayState)
                                 if loadingSessionId == session.sessionId {
-                                    Spacer()
                                     ProgressView()
                                 }
                             }
                         }
-                        .disabled(appState.isCreatingSession)
+                        .disabled(appState.isCreatingSession || !session.isResumable)
                     }
                 }
             }
@@ -170,6 +200,48 @@ struct SessionPickerView: View {
             navigateToChat = true
         } catch {
             appState.connectionError = error.localizedDescription
+        }
+    }
+}
+
+/// Colored badge showing the daemon session state.
+struct SessionStateBadge: View {
+    let state: String
+
+    var body: some View {
+        Text(displayText)
+            .font(.caption2)
+            .fontWeight(.medium)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(backgroundColor.opacity(0.15))
+            .foregroundStyle(backgroundColor)
+            .clipShape(Capsule())
+    }
+
+    private var displayText: String {
+        switch state {
+        case "idle": "Idle"
+        case "prompting": "Running"
+        case "draining": "Running"
+        case "completed": "Done"
+        case "dead": "Dead"
+        case "starting": "Starting"
+        case "history": "History"
+        default: state.capitalized
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch state {
+        case "idle": .gray
+        case "prompting": .blue
+        case "draining": .orange
+        case "completed": .green
+        case "dead": .red
+        case "starting": .yellow
+        case "history": .secondary
+        default: .gray
         }
     }
 }

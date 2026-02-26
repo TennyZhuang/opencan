@@ -15,14 +15,16 @@ final class AppState {
     // Navigation
     var shouldPopToRoot = false
 
-    // All remote sessions discovered via session/list
-    var remoteSessions: [(sessionId: String, cwd: String?, title: String?)] = []
+    // Daemon sessions (replaces remoteSessions)
+    var daemonSessions: [DaemonSessionInfo] = []
 
     // Chat
     var messages: [ChatMessage] = []
     var currentSessionId: String?
     var isPrompting = false
     var isCreatingSession = false
+    /// True while replaying history via session/load — suppresses streaming UI.
+    var isLoadingHistory = false
     /// Incremented (debounced) when chat content changes. The view
     /// auto-scrolls only if the user is already near the bottom.
     var contentVersion = 0
@@ -30,15 +32,21 @@ final class AppState {
     /// to bottom regardless of current scroll position.
     var forceScrollToBottom = false
 
+    // Daemon upload progress (nil = not uploading, 0..1 = uploading)
+    var daemonUploadProgress: Double?
+
     // Internal
     private let sshManager = SSHConnectionManager()
     private var acpClient: ACPClient?
     private var acpService: ACPService?
+    private var daemonClient: DaemonClient?
     private var transport: SSHStdioTransport?
-    private var mockTransport: MockACPTransport?
+    private(set) var mockTransport: MockACPTransport?
     private var notificationTask: Task<Void, Never>?
     private var ptyTask: Task<Void, Never>?
     private var isStreamingThought = false
+    /// Per-session event sequence tracking for daemon replay.
+    private var lastEventSeq: [String: UInt64] = [:]
 
     enum ConnectionStatus: Equatable {
         case disconnected
@@ -49,7 +57,7 @@ final class AppState {
 
     // MARK: - Connection
 
-    /// Connect to a workspace's node via SSH and initialize ACP.
+    /// Connect to a workspace's node via SSH and the daemon.
     /// After this, call createNewSession() or resumeSession() to start chatting.
     /// If already connected, tears down the old connection first.
     func connect(workspace: Workspace) {
@@ -78,7 +86,7 @@ final class AppState {
             port: node.port,
             username: node.username,
             privateKeyPEM: key.privateKeyPEM,
-            command: node.command,
+            command: "~/.opencan/bin/opencan-daemon attach",  // Always use daemon
             jumpHost: jumpHost,
             jumpPort: jumpPort,
             jumpUsername: jumpUsername,
@@ -92,6 +100,14 @@ final class AppState {
             do {
                 let t = try await sshManager.connect(params: params)
                 self.transport = t
+
+                // Ensure daemon binary is installed on the server
+                try await sshManager.ensureDaemonInstalled { [weak self] fraction in
+                    Task { @MainActor in
+                        self?.daemonUploadProgress = fraction
+                    }
+                }
+                self.daemonUploadProgress = nil
 
                 ptyTask = Task.detached { [sshManager] in
                     do {
@@ -112,34 +128,40 @@ final class AppState {
                     }
                 }
 
-                // Wait for PTY to be ready before sending ACP messages
+                // Wait for PTY to be ready before sending messages
                 await t.waitUntilReady()
+                Log.toFile("[AppState] PTY ready, waiting for daemon/attached signal...")
 
                 let client = ACPClient(transport: t)
                 await client.start()
                 self.acpClient = client
+
+                // Wait for the first JSON-RPC message from the transport.
+                // opencan-daemon attach prints {"jsonrpc":"2.0","method":"daemon/attached",...}
+                // when it has connected to the daemon socket and is ready to bridge.
+                // This prevents sending daemon/hello before the bridge is set up.
+                try await withThrowingTimeout(seconds: 30) {
+                    await t.waitForFirstJSON()
+                }
+                Log.toFile("[AppState] Daemon attached, sending hello...")
+
+                // ACPService is kept for sendPrompt (daemon forwards transparently)
                 let service = ACPService(client: client)
                 self.acpService = service
 
-                // Initialize with timeout — if the ACP server doesn't respond,
-                // fail instead of hanging forever.
-                let initResult = try await withThrowingTimeout(seconds: 30) {
-                    try await service.initialize()
+                // Initialize daemon connection with timeout
+                let daemon = DaemonClient(client: client)
+                let info = try await withThrowingTimeout(seconds: 30) {
+                    try await daemon.hello()
                 }
-                Log.app.info("ACP initialized: \(String(describing: initResult))")
-                Log.toFile("[AppState] ACP initialized")
+                self.daemonClient = daemon
+                self.daemonSessions = info.sessions
+                Log.app.info("Daemon connected: v\(info.daemonVersion), \(info.sessions.count) sessions")
+                Log.toFile("[AppState] Daemon connected: v\(info.daemonVersion)")
 
-                // Small delay to let the agent fully initialize
-                try await Task.sleep(for: .seconds(1))
-
-                // List all remote sessions
-                do {
-                    self.remoteSessions = try await service.listSessions()
-                    Log.toFile("[AppState] Found \(self.remoteSessions.count) remote sessions")
-                } catch {
-                    Log.toFile("[AppState] session/list failed: \(error), will create new")
-                    self.remoteSessions = []
-                }
+                // Start notification listener once for the entire connection.
+                // Do NOT restart it per-session — AsyncStream only supports one consumer.
+                startNotificationListener()
 
                 self.connectionStatus = .connected
             } catch {
@@ -147,7 +169,6 @@ final class AppState {
                 Log.toFile("[AppState] Connection error: \(error)")
                 self.connectionError = error.localizedDescription
                 self.connectionStatus = .failed
-                // Clean up partially-established connection resources
                 self.cleanupConnection()
             }
         }
@@ -172,18 +193,19 @@ final class AppState {
             let client = ACPClient(transport: transport)
             await client.start()
             self.acpClient = client
+
             let service = ACPService(client: client)
             self.acpService = service
 
-            do {
-                let _ = try await service.initialize()
-                Log.toFile("[AppState] Mock ACP initialized")
+            let daemon = DaemonClient(client: client)
 
-                do {
-                    self.remoteSessions = try await service.listSessions()
-                } catch {
-                    self.remoteSessions = []
-                }
+            do {
+                let info = try await daemon.hello()
+                self.daemonClient = daemon
+                self.daemonSessions = info.sessions
+                Log.toFile("[AppState] Mock daemon connected")
+
+                startNotificationListener()
 
                 self.connectionStatus = .connected
             } catch {
@@ -195,49 +217,124 @@ final class AppState {
         }
     }
 
-    /// Create a new ACP session on the active workspace.
+    /// Create a new ACP session via the daemon.
     func createNewSession(modelContext: ModelContext) async throws {
-        guard let service = acpService,
-              let workspace = activeWorkspace else {
+        guard let daemon = daemonClient,
+              let workspace = activeWorkspace,
+              let node = activeNode else {
             throw AppStateError.notConnected
         }
 
         messages = []
 
-        Log.toFile("[AppState] Creating session...")
-        let sessionId = try await service.createSession(cwd: workspace.path)
+        Log.toFile("[AppState] Creating session via daemon...")
+        let sessionId = try await daemon.createSession(
+            cwd: workspace.path,
+            command: node.command  // "claude-agent-acp" passed to daemon
+        )
         self.currentSessionId = sessionId
+        self.lastEventSeq[sessionId] = 0
+
+        // Auto-attach to the new session
+        let _ = try await daemon.attachSession(sessionId: sessionId, lastEventSeq: 0)
 
         let session = Session(sessionId: sessionId, workspace: workspace)
         modelContext.insert(session)
         try? modelContext.save()
         self.activeSession = session
 
-        startNotificationListener()
+        // Refresh daemon session list so SessionPickerView shows the new session
+        if let updated = try? await daemon.listSessions() {
+            self.daemonSessions = updated
+        }
+
         addSystemMessage("New session on \(workspace.name)")
     }
 
-    /// Resume an existing ACP session by loading it.
-    /// If loading fails, falls back to creating a new session and notifies the user.
+    /// Resume an existing session via daemon attach with event replay.
+    /// Strategy depends on session state:
+    /// - Running (prompting/draining): buffer replay + live streaming
+    /// - Completed/idle: daemon attach + session/load for full history
+    /// - History (not in daemon): create new session + session/load old history
     func resumeSession(sessionId: String, modelContext: ModelContext) async throws {
-        guard let service = acpService,
-              let workspace = activeWorkspace else {
+        guard let daemon = daemonClient,
+              let workspace = activeWorkspace,
+              let node = activeNode else {
             throw AppStateError.notConnected
         }
 
         messages = []
 
-        Log.toFile("[AppState] Loading session \(sessionId)...")
+        Log.toFile("[AppState] Attaching to session \(sessionId)...")
+        let lastSeq = lastEventSeq[sessionId] ?? 0
+        let result: DaemonAttachResult
         do {
-            try await service.loadSession(sessionId: sessionId, cwd: workspace.path)
+            result = try await daemon.attachSession(
+                sessionId: sessionId,
+                lastEventSeq: lastSeq
+            )
         } catch {
-            Log.toFile("[AppState] Load failed, creating new session: \(error)")
-            addSystemMessage("Could not resume session, starting new")
-            try await createNewSession(modelContext: modelContext)
+            // Daemon doesn't know this session — recover via session/load
+            Log.toFile("[AppState] Attach failed, recovering history session: \(error)")
+            try await resumeHistorySession(
+                oldSessionId: sessionId,
+                workspace: workspace,
+                node: node,
+                daemon: daemon,
+                modelContext: modelContext
+            )
             return
         }
 
         self.currentSessionId = sessionId
+
+        let isRunning = result.state == "prompting" || result.state == "draining"
+
+        if isRunning {
+            // Replay buffered events. Set isPrompting before replay so that
+            // a prompt_complete in the buffer can clear it.
+            isPrompting = true
+            for buffered in result.bufferedEvents {
+                if let event = SessionUpdateParser.parse(buffered.event) {
+                    handleSessionEvent(event)
+                }
+                lastEventSeq[sessionId] = buffered.seq
+            }
+            // After replay, always clear isPrompting for draining sessions.
+            // The user reconnected to interact — they shouldn't be locked out
+            // if the ACP is stuck or dead. If the old prompt is genuinely
+            // still running, prompt_complete will arrive via the notification
+            // listener in the background. If the user sends while the ACP is
+            // busy, the ACP will reject it and the error will be shown.
+            if isPrompting {
+                isPrompting = false
+                for msg in messages where msg.isStreaming {
+                    msg.isStreaming = false
+                }
+                Log.toFile("[AppState] Cleared isPrompting after draining/running session replay")
+            }
+        } else {
+            // Completed/idle session: use session/load for full history
+            isLoadingHistory = true
+            Log.toFile("[AppState] Loading full history via session/load for \(sessionId)...")
+            do {
+                try await acpService?.loadSession(sessionId: sessionId, cwd: workspace.path)
+            } catch {
+                Log.toFile("[AppState] session/load failed, falling back to buffer replay: \(error)")
+                // Fallback to buffer replay
+                for buffered in result.bufferedEvents {
+                    if let event = SessionUpdateParser.parse(buffered.event) {
+                        handleSessionEvent(event)
+                    }
+                    lastEventSeq[sessionId] = buffered.seq
+                }
+            }
+            isLoadingHistory = false
+            // Ensure no stale streaming indicators
+            for msg in messages where msg.isStreaming {
+                msg.isStreaming = false
+            }
+        }
 
         // Find or create local Session record
         let descriptor = FetchDescriptor<Session>(
@@ -253,8 +350,89 @@ final class AppState {
         }
         try? modelContext.save()
 
-        startNotificationListener()
-        addSystemMessage("Loaded session")
+        let statusMsg: String
+        if isRunning {
+            statusMsg = "Session resumed (still running)"
+        } else if result.state == "completed" {
+            statusMsg = "Session resumed (completed)"
+        } else {
+            statusMsg = "Session resumed"
+        }
+        addSystemMessage(statusMsg)
+
+        if !result.bufferedEvents.isEmpty && isRunning {
+            Log.toFile("[AppState] Replayed \(result.bufferedEvents.count) buffered events")
+        }
+    }
+
+    /// Resume a "history" session whose daemon has forgotten it.
+    /// Creates a fresh ACP process and loads the old session's conversation into it.
+    private func resumeHistorySession(
+        oldSessionId: String,
+        workspace: Workspace,
+        node: Node,
+        daemon: DaemonClient,
+        modelContext: ModelContext
+    ) async throws {
+        Log.toFile("[AppState] Creating new session to recover history of \(oldSessionId)...")
+
+        // Create a fresh ACP process
+        let newSessionId = try await daemon.createSession(
+            cwd: workspace.path,
+            command: node.command
+        )
+
+        // Attach to the new session
+        let _ = try await daemon.attachSession(sessionId: newSessionId, lastEventSeq: 0)
+        self.currentSessionId = newSessionId
+        self.lastEventSeq[newSessionId] = 0
+
+        // Load old session's history into the new ACP process.
+        // __routeToSession tells the daemon to forward this to the new session's ACP process,
+        // while sessionId tells the ACP which conversation to load from disk.
+        isLoadingHistory = true
+        var historyLoadFailed = false
+        Log.toFile("[AppState] Loading history of \(oldSessionId) into new session \(newSessionId)...")
+        do {
+            try await acpService?.loadSession(
+                sessionId: oldSessionId,
+                cwd: workspace.path,
+                routeToSessionId: newSessionId
+            )
+        } catch {
+            Log.toFile("[AppState] session/load for history failed: \(error)")
+            historyLoadFailed = true
+        }
+        isLoadingHistory = false
+        for msg in messages where msg.isStreaming {
+            msg.isStreaming = false
+        }
+
+        // Update local Session record: point old sessionId to new daemon session
+        let descriptor = FetchDescriptor<Session>(
+            predicate: #Predicate { $0.sessionId == oldSessionId }
+        )
+        if let existing = try? modelContext.fetch(descriptor).first {
+            existing.sessionId = newSessionId
+            existing.lastUsedAt = Date()
+            self.activeSession = existing
+        } else {
+            let session = Session(sessionId: newSessionId, workspace: workspace)
+            modelContext.insert(session)
+            self.activeSession = session
+        }
+        try? modelContext.save()
+
+        // Refresh daemon session list
+        if let updated = try? await daemon.listSessions() {
+            self.daemonSessions = updated
+        }
+
+        if historyLoadFailed {
+            addSystemMessage("Session recovered (conversation history unavailable)")
+        } else {
+            addSystemMessage("Session recovered from history")
+        }
     }
 
     func disconnect() {
@@ -273,6 +451,7 @@ final class AppState {
         ptyTask?.cancel()
         acpClient = nil
         acpService = nil
+        daemonClient = nil
         transport = nil
         mockTransport = nil
         connectionStatus = .disconnected
@@ -280,8 +459,11 @@ final class AppState {
         activeSession = nil
         activeNode = nil
         activeWorkspace = nil
-        remoteSessions = []
+        daemonSessions = []
+        daemonUploadProgress = nil
         messages = []
+        isLoadingHistory = false
+        // lastEventSeq intentionally kept — needed for reconnect replay
         // Stop ACP client and close transport asynchronously
         Task.detached {
             if let client { await client.stop() }
@@ -295,6 +477,7 @@ final class AppState {
     func sendMessage(_ text: String) {
         guard !text.isEmpty else { return }
         guard !isPrompting else {
+            Log.toFile("[AppState] sendMessage blocked — isPrompting=true, currentSessionId=\(currentSessionId ?? "nil")")
             addSystemMessage("Still waiting for response...")
             return
         }
@@ -307,19 +490,29 @@ final class AppState {
         let userMsg = ChatMessage(role: .user, content: text)
         messages.append(userMsg)
 
+        // Set session title from first user message
+        if let session = activeSession, session.title == nil {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let firstLine = trimmed.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? trimmed
+            session.title = String(firstLine.prefix(50))
+        }
+
         let assistantMsg = ChatMessage(role: .assistant, isStreaming: true)
         messages.append(assistantMsg)
         isPrompting = true
         forceScrollToBottom = true
+        Log.toFile("[AppState] sendMessage: isPrompting=true, sending prompt to \(sessionId)")
 
         Task {
             do {
                 let _ = try await service.sendPrompt(sessionId: sessionId, text: text)
+                Log.toFile("[AppState] sendPrompt returned successfully")
                 for msg in self.messages where msg.role == .assistant && msg.isStreaming {
                     msg.isStreaming = false
                 }
                 self.isPrompting = false
             } catch {
+                Log.toFile("[AppState] sendPrompt error: \(error)")
                 self.lastAssistantMessage().content += "\n[Error: \(error.localizedDescription)]"
                 for msg in self.messages where msg.role == .assistant && msg.isStreaming {
                     msg.isStreaming = false
@@ -334,11 +527,20 @@ final class AppState {
     private func startNotificationListener() {
         notificationTask?.cancel()
         guard let client = acpClient else { return }
+        Log.toFile("[AppState] Starting notification listener")
         notificationTask = Task {
             for await notification in client.notifications {
+                // Track __seq from daemon-forwarded notifications
+                if case .notification(_, let params) = notification,
+                   let seq = params?["__seq"]?.intValue,
+                   let sid = self.currentSessionId {
+                    self.lastEventSeq[sid] = UInt64(seq)
+                }
                 guard let event = SessionUpdateParser.parse(notification) else { continue }
+                Log.toFile("[AppState] Session event: \(event)")
                 self.handleSessionEvent(event)
             }
+            Log.toFile("[AppState] Notification listener ended")
         }
     }
 
@@ -358,11 +560,18 @@ final class AppState {
             let msg = lastAssistantMessage()
             if !msg.toolCalls.isEmpty {
                 msg.isStreaming = false
-                let newMsg = ChatMessage(role: .assistant, isStreaming: isPrompting)
+                let newMsg = ChatMessage(role: .assistant, isStreaming: isPrompting && !isLoadingHistory)
                 newMsg.content = text
                 messages.append(newMsg)
             } else {
                 msg.content += text
+            }
+
+        case .userMessage(let text):
+            if let last = messages.last, last.role == .user {
+                last.content += text
+            } else {
+                messages.append(ChatMessage(role: .user, content: text))
             }
 
         case .toolCall(let id, let name, let input):
@@ -441,7 +650,7 @@ final class AppState {
         if let last = messages.last, last.role == .assistant {
             return last
         }
-        let msg = ChatMessage(role: .assistant, isStreaming: isPrompting)
+        let msg = ChatMessage(role: .assistant, isStreaming: isPrompting && !isLoadingHistory)
         messages.append(msg)
         return msg
     }

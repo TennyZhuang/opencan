@@ -186,11 +186,11 @@ final class OpenCANUITests: XCTestCase {
             "Should return to session picker"
         )
 
-        // The session we just created should appear in "Recent Sessions"
-        let recentSection = app.staticTexts["Recent Sessions"]
+        // The session we just created should appear in "Sessions"
+        let sessionsSection = app.staticTexts["Sessions"]
         XCTAssertTrue(
-            recentSection.waitForExistence(timeout: 5),
-            "Recent Sessions section should appear after creating a session"
+            sessionsSection.waitForExistence(timeout: 5),
+            "Sessions section should appear after creating a session"
         )
 
         // Find the session cell by matching text that starts with "mock-sess-"
@@ -203,11 +203,14 @@ final class OpenCANUITests: XCTestCase {
         )
         mockSessionText.firstMatch.tap()
 
-        // Verify "Loaded session" system message appears in ChatView
-        let loadedMessage = app.staticTexts["Loaded session"]
+        // Verify session resume system message appears in ChatView
+        // The mock's session/load succeeds, so we get "Session resumed"
+        let resumedMessage = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH 'Session re'")
+        )
         XCTAssertTrue(
-            loadedMessage.waitForExistence(timeout: 10),
-            "System message 'Loaded session' should appear — resume may have failed"
+            resumedMessage.firstMatch.waitForExistence(timeout: 10),
+            "Session resume message should appear — resume may have failed"
         )
 
         // Verify we're in chat view

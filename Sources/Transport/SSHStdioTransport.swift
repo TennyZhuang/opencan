@@ -14,6 +14,8 @@ actor SSHStdioTransport: ACPTransport {
     private var isClosed = false
     private var readyStream: AsyncStream<Void>?
     private var readySignal: AsyncStream<Void>.Continuation?
+    private var jsonReadyStream: AsyncStream<Void>?
+    private var jsonReadySignal: AsyncStream<Void>.Continuation?
 
     init() {
         let (msgStream, msgCont) = AsyncStream<JSONRPCMessage>.makeStream()
@@ -22,6 +24,9 @@ actor SSHStdioTransport: ACPTransport {
         let (rStream, rCont) = AsyncStream<Void>.makeStream()
         self.readyStream = rStream
         self.readySignal = rCont
+        let (jStream, jCont) = AsyncStream<Void>.makeStream()
+        self.jsonReadyStream = jStream
+        self.jsonReadySignal = jCont
     }
 
     /// Wait until the PTY is connected and ready to send.
@@ -31,6 +36,14 @@ actor SSHStdioTransport: ACPTransport {
         // Consume the first (and only) element — blocks until signalled
         for await _ in stream { break }
         readyStream = nil
+    }
+
+    /// Wait until the first JSON-RPC message has been received from the PTY.
+    /// Used to ensure the daemon attach bridge is operational before sending requests.
+    func waitForFirstJSON() async {
+        guard let stream = jsonReadyStream else { return }
+        for await _ in stream { break }
+        jsonReadyStream = nil
     }
 
     func send(_ message: JSONRPCMessage) async throws {
@@ -51,6 +64,10 @@ actor SSHStdioTransport: ACPTransport {
         readySignal?.finish()
         readySignal = nil
         readyStream = nil
+        // Unblock any waitForFirstJSON() callers
+        jsonReadySignal?.finish()
+        jsonReadySignal = nil
+        jsonReadyStream = nil
     }
 
     // MARK: - Internal helpers called from the withPTY closure
@@ -70,6 +87,10 @@ actor SSHStdioTransport: ACPTransport {
         for msg in parsed {
             Log.toFile("[Transport] Parsed JSON-RPC message")
             messageContinuation.yield(msg)
+            // Signal that the first JSON message has arrived (daemon bridge is ready)
+            jsonReadySignal?.yield()
+            jsonReadySignal?.finish()
+            jsonReadySignal = nil
         }
     }
 
