@@ -22,6 +22,7 @@ final class AppState {
     var messages: [ChatMessage] = []
     var currentSessionId: String?
     var isPrompting = false
+    var isCreatingSession = false
     var scrollTrigger = 0
 
     // Internal
@@ -144,10 +145,14 @@ final class AppState {
 
     /// Create a new ACP session on the active workspace.
     func createNewSession(modelContext: ModelContext) async throws {
+        guard !isCreatingSession else { return }
         guard let service = acpService,
               let workspace = activeWorkspace else {
             throw AppStateError.notConnected
         }
+
+        isCreatingSession = true
+        defer { isCreatingSession = false }
 
         messages = []
 
@@ -269,6 +274,7 @@ final class AppState {
     // MARK: - Notifications
 
     private func startNotificationListener() {
+        notificationTask?.cancel()
         guard let client = acpClient else { return }
         notificationTask = Task {
             for await notification in client.notifications {

@@ -77,6 +77,7 @@ struct SessionPickerView: View {
                 } label: {
                     Label("New Session", systemImage: "plus.circle")
                 }
+                .disabled(appState.isCreatingSession)
             }
 
             if !filteredRemoteSessions.isEmpty {

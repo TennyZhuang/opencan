@@ -11,6 +11,8 @@ struct MessageRowView: View {
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
                 if !message.content.isEmpty {
                     if message.role == .assistant {
+                        // LTXLabel supports double-tap word selection, but SwiftUI's
+                        // ScrollView intercepts touches. Use contextMenu for copy.
                         MarkdownView(message.content)
                             .padding(Theme.bubblePadding)
                             .background(Theme.assistantBubble)
