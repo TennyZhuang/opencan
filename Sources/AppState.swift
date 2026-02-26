@@ -32,6 +32,7 @@ final class AppState {
     private var transport: SSHStdioTransport?
     private var notificationTask: Task<Void, Never>?
     private var ptyTask: Task<Void, Never>?
+    private var isStreamingThought = false
 
     enum ConnectionStatus: Equatable {
         case disconnected
@@ -145,7 +146,6 @@ final class AppState {
 
     /// Create a new ACP session on the active workspace.
     func createNewSession(modelContext: ModelContext) async throws {
-        guard !isCreatingSession else { return }
         guard let service = acpService,
               let workspace = activeWorkspace else {
             throw AppStateError.notConnected
@@ -282,6 +282,11 @@ final class AppState {
     }
 
     private func handleSessionEvent(_ event: SessionEvent) {
+        // Reset thought-streaming flag when a different event type arrives
+        if case .thoughtDelta = event {} else {
+            isStreamingThought = false
+        }
+
         switch event {
         case .agentMessage(let text):
             lastAssistantMessage().content = text
@@ -329,6 +334,13 @@ final class AppState {
 
         case .thought(let text):
             lastAssistantMessage().content += "\n> \(text)"
+
+        case .thoughtDelta(let text):
+            if !isStreamingThought {
+                lastAssistantMessage().content += "\n> "
+                isStreamingThought = true
+            }
+            lastAssistantMessage().content += text
 
         case .promptComplete(_):
             // Stop streaming on ALL assistant messages from this turn.

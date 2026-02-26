@@ -27,6 +27,11 @@ enum SessionUpdateParser {
                 return .thought(text: text)
             }
 
+        case "agent_thought_chunk":
+            if let text = update?["content"]?["text"]?.stringValue {
+                return .thoughtDelta(text: text)
+            }
+
         case "tool_call":
             if let id = update?["toolCallId"]?.stringValue {
                 let name = update?["title"]?.stringValue ?? "tool"

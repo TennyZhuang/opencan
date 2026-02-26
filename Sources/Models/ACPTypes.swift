@@ -33,5 +33,6 @@ enum SessionEvent {
     case toolCallUpdate(id: String, title: String?, input: JSONValue?, output: String?)
     case toolCallComplete(id: String, title: String?, input: JSONValue?, output: String?, failed: Bool)
     case thought(text: String)
+    case thoughtDelta(text: String)
     case promptComplete(stopReason: StopReason)
 }
