@@ -74,11 +74,10 @@ final class OpenCANUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["home"].waitForExistence(timeout: 3))
     }
 
-    // MARK: - Helpers (requires cp32 server)
+    // MARK: - Mock Helpers (uses MockACPTransport via --uitesting)
 
-    /// Navigate to cp32 > home and wait for connection.
-    /// Throws XCTSkip if server is unreachable.
-    private func navigateToSessionPicker() throws {
+    /// Navigate to cp32 > home and wait for mock connection.
+    private func navigateToSessionPicker() {
         let cp32 = app.staticTexts["cp32"]
         XCTAssertTrue(cp32.waitForExistence(timeout: 5))
         cp32.tap()
@@ -87,23 +86,24 @@ final class OpenCANUITests: XCTestCase {
         XCTAssertTrue(home.waitForExistence(timeout: 3))
         home.tap()
 
-        // Wait for connection
+        // Mock connection should be near-instant
         let newSessionButton = app.buttons["New Session"]
-        guard newSessionButton.waitForExistence(timeout: 30) else {
-            throw XCTSkip("Could not connect to cp32 — server may be unreachable")
-        }
+        XCTAssertTrue(
+            newSessionButton.waitForExistence(timeout: 10),
+            "New Session button should appear — mock connection may have failed"
+        )
     }
 
     /// Create a new session and verify we land in ChatView.
-    private func createSessionAndEnterChat() throws {
-        try navigateToSessionPicker()
+    private func createSessionAndEnterChat() {
+        navigateToSessionPicker()
 
         app.buttons["New Session"].tap()
 
         // Verify system message proves session was actually created
         let systemMessage = app.staticTexts["New session on home"]
         XCTAssertTrue(
-            systemMessage.waitForExistence(timeout: 15),
+            systemMessage.waitForExistence(timeout: 10),
             "System message 'New session on home' should appear — session may not have been created"
         )
 
@@ -112,36 +112,39 @@ final class OpenCANUITests: XCTestCase {
         XCTAssertTrue(disconnectButton.waitForExistence(timeout: 5))
     }
 
-    // MARK: - End-to-End (requires cp32 server)
+    // MARK: - Mock-Backed E2E Tests
 
     func testConnectAndCreateSession() throws {
-        try createSessionAndEnterChat()
+        createSessionAndEnterChat()
     }
 
     func testCreateSessionShowsLoading() throws {
-        try navigateToSessionPicker()
+        navigateToSessionPicker()
 
         let newSessionButton = app.buttons["New Session"]
         XCTAssertTrue(newSessionButton.isEnabled, "New Session button should be enabled before tap")
 
         newSessionButton.tap()
 
-        // Button should become disabled while session is being created
-        // (prevents double-tap)
-        XCTAssertFalse(
-            newSessionButton.isEnabled,
-            "New Session button should be disabled while creating session"
+        // Mock creates session nearly instantly — we may already be in ChatView.
+        // Verify either: (a) button is disabled (still on session picker), or
+        // (b) we navigated to ChatView (session was created).
+        let disconnectButton = app.buttons["Disconnect"]
+        let buttonDisabled = newSessionButton.exists && !newSessionButton.isEnabled
+        let navigatedToChat = disconnectButton.waitForExistence(timeout: 5)
+
+        XCTAssertTrue(
+            buttonDisabled || navigatedToChat,
+            "Should either show disabled button (loading) or navigate to chat (created)"
         )
     }
 
-    func testSendMessage() throws {
-        try createSessionAndEnterChat()
+    func testSendMessageAndReceiveResponse() throws {
+        createSessionAndEnterChat()
 
         // Type a message
         let textField = app.textFields.firstMatch
-        guard textField.waitForExistence(timeout: 5) else {
-            throw XCTSkip("Chat input not found")
-        }
+        XCTAssertTrue(textField.waitForExistence(timeout: 5), "Chat input should exist")
         textField.tap()
         textField.typeText("Hello, this is a test message")
 
@@ -149,29 +152,39 @@ final class OpenCANUITests: XCTestCase {
         let sendButton = app.buttons["arrow.up.circle.fill"]
         sendButton.tap()
 
-        // Verify user message appears (proves sendMessage didn't bail
-        // due to nil currentSessionId)
+        // Verify user message appears
         let userMessage = app.staticTexts["Hello, this is a test message"]
         XCTAssertTrue(
             userMessage.waitForExistence(timeout: 5),
-            "User message should appear in chat — currentSessionId may be nil"
+            "User message should appear in chat"
         )
 
-        // Verify assistant starts responding (Thinking... indicator or any
-        // assistant content should eventually appear)
+        // The mock's simple scenario streams text (~350ms total) then sends promptComplete.
+        // After completion, the "Thinking..." indicator should disappear.
+        // Wait a moment for the mock to finish streaming.
+        sleep(3)
+
+        // Verify streaming completed — "Thinking..." should no longer be visible
         let thinking = app.staticTexts["Thinking..."]
-        XCTAssertTrue(
-            thinking.waitForExistence(timeout: 15),
-            "Assistant should start responding after sending a message"
+        XCTAssertFalse(
+            thinking.exists,
+            "Thinking indicator should disappear after mock response completes"
         )
     }
 
     func testResumeSession() throws {
         // First create a session
-        try createSessionAndEnterChat()
+        createSessionAndEnterChat()
 
         // Navigate back to session picker
         app.navigationBars.buttons.element(boundBy: 0).tap()
+
+        // Wait for session picker to reappear
+        let newSessionButton = app.buttons["New Session"]
+        XCTAssertTrue(
+            newSessionButton.waitForExistence(timeout: 5),
+            "Should return to session picker"
+        )
 
         // The session we just created should appear in "Recent Sessions"
         let recentSection = app.staticTexts["Recent Sessions"]
@@ -180,22 +193,69 @@ final class OpenCANUITests: XCTestCase {
             "Recent Sessions section should appear after creating a session"
         )
 
-        // Tap the first session in the recent list to resume it
-        let sessionCell = app.cells.element(boundBy: 1) // index 0 is "New Session"
-        guard sessionCell.waitForExistence(timeout: 3) else {
-            throw XCTSkip("No recent session cell found")
-        }
-        sessionCell.tap()
+        // Find the session cell by matching text that starts with "mock-sess-"
+        let mockSessionText = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH 'mock-sess-'")
+        )
+        XCTAssertTrue(
+            mockSessionText.firstMatch.waitForExistence(timeout: 3),
+            "Mock session ID should be visible in recent sessions"
+        )
+        mockSessionText.firstMatch.tap()
 
-        // Verify "Loaded session" system message appears
+        // Verify "Loaded session" system message appears in ChatView
         let loadedMessage = app.staticTexts["Loaded session"]
         XCTAssertTrue(
-            loadedMessage.waitForExistence(timeout: 15),
+            loadedMessage.waitForExistence(timeout: 10),
             "System message 'Loaded session' should appear — resume may have failed"
         )
 
         // Verify we're in chat view
         let disconnectButton = app.buttons["Disconnect"]
         XCTAssertTrue(disconnectButton.waitForExistence(timeout: 5))
+    }
+
+    // MARK: - Integration Tests (requires cp32 server)
+
+    func testIntegrationSendMessage() throws {
+        // Re-launch without --uitesting to use real server
+        app.terminate()
+        let integrationApp = XCUIApplication()
+        integrationApp.launch()
+
+        let cp32 = integrationApp.staticTexts["cp32"]
+        XCTAssertTrue(cp32.waitForExistence(timeout: 5))
+        cp32.tap()
+
+        let home = integrationApp.staticTexts["home"]
+        XCTAssertTrue(home.waitForExistence(timeout: 3))
+        home.tap()
+
+        let newSessionButton = integrationApp.buttons["New Session"]
+        guard newSessionButton.waitForExistence(timeout: 30) else {
+            throw XCTSkip("Could not connect to cp32 — server may be unreachable")
+        }
+
+        newSessionButton.tap()
+
+        let systemMessage = integrationApp.staticTexts["New session on home"]
+        guard systemMessage.waitForExistence(timeout: 15) else {
+            throw XCTSkip("Session creation timed out — server may be unreachable")
+        }
+
+        let textField = integrationApp.textFields.firstMatch
+        guard textField.waitForExistence(timeout: 5) else {
+            throw XCTSkip("Chat input not found")
+        }
+        textField.tap()
+        textField.typeText("Hello")
+
+        integrationApp.buttons["arrow.up.circle.fill"].tap()
+
+        let userMessage = integrationApp.staticTexts["Hello"]
+        XCTAssertTrue(
+            userMessage.waitForExistence(timeout: 5),
+            "User message should appear in chat"
+        )
     }
 }

@@ -3,6 +3,8 @@ import SwiftData
 
 @main
 struct OpenCANApp: App {
+    static let isUITesting = CommandLine.arguments.contains("--uitesting")
+
     @State private var appState = AppState()
     let modelContainer: ModelContainer
 

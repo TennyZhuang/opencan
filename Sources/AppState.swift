@@ -35,6 +35,7 @@ final class AppState {
     private var acpClient: ACPClient?
     private var acpService: ACPService?
     private var transport: SSHStdioTransport?
+    private var mockTransport: MockACPTransport?
     private var notificationTask: Task<Void, Never>?
     private var ptyTask: Task<Void, Never>?
     private var isStreamingThought = false
@@ -152,6 +153,48 @@ final class AppState {
         }
     }
 
+    /// Connect using a mock transport for offline UI testing.
+    /// Skips SSH entirely — plugs MockACPTransport directly into ACPClient.
+    func connectMock(workspace: Workspace, scenario: MockScenario = .simple) {
+        if connectionStatus == .connected || connectionStatus == .connecting {
+            cleanupConnection()
+        }
+
+        connectionStatus = .connecting
+        connectionError = nil
+        activeWorkspace = workspace
+        activeNode = workspace.node
+
+        Task {
+            let transport = MockACPTransport(scenario: scenario)
+            self.mockTransport = transport
+
+            let client = ACPClient(transport: transport)
+            await client.start()
+            self.acpClient = client
+            let service = ACPService(client: client)
+            self.acpService = service
+
+            do {
+                let _ = try await service.initialize()
+                Log.toFile("[AppState] Mock ACP initialized")
+
+                do {
+                    self.remoteSessions = try await service.listSessions()
+                } catch {
+                    self.remoteSessions = []
+                }
+
+                self.connectionStatus = .connected
+            } catch {
+                Log.toFile("[AppState] Mock connection error: \(error)")
+                self.connectionError = error.localizedDescription
+                self.connectionStatus = .failed
+                self.cleanupConnection()
+            }
+        }
+    }
+
     /// Create a new ACP session on the active workspace.
     func createNewSession(modelContext: ModelContext) async throws {
         guard let service = acpService,
@@ -225,11 +268,13 @@ final class AppState {
     private func cleanupConnection() {
         let client = acpClient
         let t = transport
+        let mt = mockTransport
         notificationTask?.cancel()
         ptyTask?.cancel()
         acpClient = nil
         acpService = nil
         transport = nil
+        mockTransport = nil
         connectionStatus = .disconnected
         currentSessionId = nil
         activeSession = nil
@@ -241,6 +286,7 @@ final class AppState {
         Task.detached {
             if let client { await client.stop() }
             if let t { await t.close() }
+            if let mt { await mt.close() }
         }
     }
 

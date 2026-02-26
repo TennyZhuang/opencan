@@ -30,6 +30,8 @@ struct SessionPickerView: View {
                 hasConnected = true
             } else if appState.connectionStatus == .connecting, isSameWorkspace {
                 // Already connecting to this workspace, wait for it
+            } else if OpenCANApp.isUITesting {
+                appState.connectMock(workspace: workspace)
             } else {
                 appState.connect(workspace: workspace)
             }
