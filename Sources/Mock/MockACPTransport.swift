@@ -23,6 +23,15 @@ actor MockACPTransport: ACPTransport {
 
     /// Steps to stream during session/load (simulates history replay).
     var mockLoadSteps: [MockStep] = []
+    /// Session IDs that should fail on session/load (simulates load errors).
+    var mockLoadFailSessionIDs: Set<String> = []
+    /// Specific (sessionId, cwd) pairs that should fail on session/load.
+    /// Format: "\(sessionId)|\(cwd)".
+    var mockLoadFailSessionCwdPairs: Set<String> = []
+    /// Tracks the most recent session/load params for assertions.
+    var lastLoadSessionId: String?
+    var lastLoadRouteToSessionId: String?
+    var lastLoadCwd: String?
 
     /// Track last received method for test assertions.
     var lastReceivedMethod: String?
@@ -113,6 +122,20 @@ actor MockACPTransport: ACPTransport {
 
         case ACPMethods.sessionLoad:
             let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
+            let routeToSessionId = params?["__routeToSession"]?.stringValue
+            let cwd = params?["cwd"]?.stringValue ?? ""
+            lastLoadSessionId = sessionId
+            lastLoadRouteToSessionId = routeToSessionId
+            lastLoadCwd = cwd
+            let failKey = "\(sessionId)|\(cwd)"
+            if mockLoadFailSessionIDs.contains(sessionId) || mockLoadFailSessionCwdPairs.contains(failKey) {
+                messageContinuation.yield(
+                    .error(id: id, code: -32603, message: "Internal error", data: .object([
+                        "details": .string("Session not found")
+                    ]))
+                )
+                return
+            }
             await streamLoadHistory(requestId: id, sessionId: sessionId)
 
         default:

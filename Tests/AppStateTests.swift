@@ -333,6 +333,14 @@ final class AppStateTests: XCTestCase {
             "New session should be a mock session, got: \(appState.currentSessionId ?? "nil")"
         )
 
+        // Local session should keep the original history source for future recovery.
+        let recoveredSessionId = try XCTUnwrap(appState.currentSessionId)
+        let descriptor = FetchDescriptor<Session>(
+            predicate: #Predicate { $0.sessionId == recoveredSessionId }
+        )
+        let recovered = try XCTUnwrap(modelContext.fetch(descriptor).first)
+        XCTAssertEqual(recovered.historySessionId, oldSessionId)
+
         // Should have system message about recovery
         let recoveryMessages = appState.messages.filter {
             $0.role == .system && $0.content.contains("recovered")
@@ -343,6 +351,122 @@ final class AppStateTests: XCTestCase {
         appState.sendMessage("New question")
         XCTAssertTrue(appState.isPrompting)
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
+    }
+
+    func testResumeRecoveredSessionUsesOriginalHistorySource() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        let oldSessionId = "old-session-anchor"
+        let session = Session(sessionId: oldSessionId, workspace: workspace)
+        modelContext.insert(session)
+        try modelContext.save()
+
+        // First recovery.
+        await transport.setMockAttachShouldFail(true)
+        await transport.setMockLoadSteps([
+            .userMessageChunk("Old question"),
+            .textDelta("Old answer."),
+            .promptComplete(.endTurn),
+        ])
+        try await appState.resumeSession(sessionId: oldSessionId, modelContext: modelContext)
+        let recoveredSessionId = try XCTUnwrap(appState.currentSessionId)
+
+        // Second recovery should still load from the original anchor.
+        await transport.setMockAttachShouldFail(true)
+        await transport.setMockLoadSteps([
+            .userMessageChunk("Old question"),
+            .textDelta("Recovered from original history."),
+            .promptComplete(.endTurn),
+        ])
+        try await appState.resumeSession(sessionId: recoveredSessionId, modelContext: modelContext)
+
+        let lastLoadSessionId = await transport.getLastLoadSessionId()
+        XCTAssertEqual(lastLoadSessionId, oldSessionId, "Should load from original history session")
+    }
+
+    func testResumeCompletedSessionFallsBackToHistorySource() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAttachState("idle")
+        await transport.setMockLoadFailSessionIDs(["recovered-session"])
+        await transport.setMockLoadSteps([
+            .userMessageChunk("Original question"),
+            .textDelta("Original history answer."),
+            .promptComplete(.endTurn),
+        ])
+
+        let session = Session(
+            sessionId: "recovered-session",
+            historySessionId: "original-session",
+            workspace: workspace
+        )
+        modelContext.insert(session)
+        try modelContext.save()
+
+        try await appState.resumeSession(sessionId: "recovered-session", modelContext: modelContext)
+
+        let lastLoadSessionId = await transport.getLastLoadSessionId()
+        let lastLoadRoute = await transport.getLastLoadRouteToSessionId()
+        XCTAssertEqual(lastLoadSessionId, "original-session")
+        XCTAssertEqual(lastLoadRoute, "recovered-session")
+
+        let assistantMessages = appState.messages.filter { $0.role == .assistant }
+        let fullText = assistantMessages.map { $0.content }.joined()
+        XCTAssertTrue(fullText.contains("Original history answer"))
+    }
+
+    func testResumeHistorySessionFallsBackToAlternateCwd() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        let legacyWorkspace = Workspace(name: "legacy", path: "/legacy/path")
+        legacyWorkspace.node = node
+        modelContext.insert(legacyWorkspace)
+        try modelContext.save()
+
+        await transport.setMockAttachShouldFail(true)
+        await transport.setMockLoadFailSessionCwdPairs([
+            "legacy-history-id|/wrong/path",
+            "legacy-history-id|/test/path",
+        ])
+        await transport.setMockLoadSteps([
+            .userMessageChunk("Old question"),
+            .textDelta("Loaded from legacy cwd."),
+            .promptComplete(.endTurn),
+        ])
+
+        let session = Session(
+            sessionId: "legacy-history-id",
+            sessionCwd: "/wrong/path",
+            workspace: workspace
+        )
+        modelContext.insert(session)
+        try modelContext.save()
+
+        try await appState.resumeSession(sessionId: "legacy-history-id", modelContext: modelContext)
+
+        let lastLoadCwd = await transport.getLastLoadCwd()
+        XCTAssertEqual(lastLoadCwd, "/legacy/path")
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content == "Session recovered from history"
+            },
+            "Should recover from history via alternate cwd"
+        )
     }
 
     // MARK: - UnifiedSession Tests
@@ -463,5 +587,25 @@ extension MockACPTransport {
 
     func setMockLoadSteps(_ steps: [MockStep]) {
         self.mockLoadSteps = steps
+    }
+
+    func setMockLoadFailSessionIDs(_ ids: Set<String>) {
+        self.mockLoadFailSessionIDs = ids
+    }
+
+    func setMockLoadFailSessionCwdPairs(_ pairs: Set<String>) {
+        self.mockLoadFailSessionCwdPairs = pairs
+    }
+
+    func getLastLoadSessionId() -> String? {
+        lastLoadSessionId
+    }
+
+    func getLastLoadRouteToSessionId() -> String? {
+        lastLoadRouteToSessionId
+    }
+
+    func getLastLoadCwd() -> String? {
+        lastLoadCwd
     }
 }

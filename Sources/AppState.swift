@@ -238,7 +238,11 @@ final class AppState {
         // Auto-attach to the new session
         let _ = try await daemon.attachSession(sessionId: sessionId, lastEventSeq: 0)
 
-        let session = Session(sessionId: sessionId, workspace: workspace)
+        let session = Session(
+            sessionId: sessionId,
+            sessionCwd: workspace.path,
+            workspace: workspace
+        )
         modelContext.insert(session)
         try? modelContext.save()
         self.activeSession = session
@@ -263,6 +267,19 @@ final class AppState {
             throw AppStateError.notConnected
         }
 
+        let sessionDescriptor = FetchDescriptor<Session>(
+            predicate: #Predicate { $0.sessionId == sessionId }
+        )
+        let existingSession = try? modelContext.fetch(sessionDescriptor).first
+        let daemonKnownCwd = daemonSessions.first(where: { $0.sessionId == sessionId })?.cwd
+        let historySessionId = existingSession?.historySessionId
+        let sourceSessionId = historySessionId ?? sessionId
+        let sourceSessionCwd: String? = if historySessionId != nil {
+            existingSession?.historySessionCwd ?? existingSession?.sessionCwd ?? daemonKnownCwd
+        } else {
+            existingSession?.sessionCwd ?? daemonKnownCwd
+        }
+
         messages = []
 
         Log.toFile("[AppState] Attaching to session \(sessionId)...")
@@ -278,6 +295,8 @@ final class AppState {
             Log.toFile("[AppState] Attach failed, recovering history session: \(error)")
             try await resumeHistorySession(
                 oldSessionId: sessionId,
+                sourceSessionId: sourceSessionId,
+                sourceSessionCwd: sourceSessionCwd,
                 workspace: workspace,
                 node: node,
                 daemon: daemon,
@@ -289,6 +308,7 @@ final class AppState {
         self.currentSessionId = sessionId
 
         let isRunning = result.state == "prompting" || result.state == "draining"
+        var resolvedSessionCwd = daemonKnownCwd ?? existingSession?.sessionCwd ?? workspace.path
 
         if isRunning {
             // Replay buffered events. Set isPrompting before replay so that
@@ -317,16 +337,48 @@ final class AppState {
             // Completed/idle session: use session/load for full history
             isLoadingHistory = true
             Log.toFile("[AppState] Loading full history via session/load for \(sessionId)...")
-            do {
-                try await acpService?.loadSession(sessionId: sessionId, cwd: workspace.path)
-            } catch {
-                Log.toFile("[AppState] session/load failed, falling back to buffer replay: \(error)")
-                // Fallback to buffer replay
-                for buffered in result.bufferedEvents {
-                    if let event = SessionUpdateParser.parse(buffered.event) {
-                        handleSessionEvent(event)
+            let primaryCwds = loadCwdCandidates(
+                preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
+                workspace: workspace
+            )
+            let loadedPrimaryCwd = await loadSessionFromCandidates(
+                sessionId: sessionId,
+                candidateCwds: primaryCwds
+            )
+
+            if let loadedPrimaryCwd {
+                resolvedSessionCwd = loadedPrimaryCwd
+            } else {
+                var loadedHistory = false
+                if let historySessionId, historySessionId != sessionId {
+                    let historyCwds = loadCwdCandidates(
+                        preferred: [
+                            existingSession?.historySessionCwd,
+                            existingSession?.sessionCwd,
+                            daemonKnownCwd,
+                            workspace.path
+                        ],
+                        workspace: workspace
+                    )
+                    if let loadedHistoryCwd = await loadSessionFromCandidates(
+                        sessionId: historySessionId,
+                        routeToSessionId: sessionId,
+                        candidateCwds: historyCwds
+                    ) {
+                        loadedHistory = true
+                        existingSession?.historySessionCwd = loadedHistoryCwd
                     }
-                    lastEventSeq[sessionId] = buffered.seq
+                }
+
+                if !loadedHistory {
+                    Log.toFile("[AppState] session/load failed, falling back to buffer replay for \(sessionId)")
+                    // Fallback to buffer replay
+                    for buffered in result.bufferedEvents {
+                        if let event = SessionUpdateParser.parse(buffered.event) {
+                            handleSessionEvent(event)
+                        }
+                        lastEventSeq[sessionId] = buffered.seq
+                    }
                 }
             }
             isLoadingHistory = false
@@ -337,14 +389,22 @@ final class AppState {
         }
 
         // Find or create local Session record
-        let descriptor = FetchDescriptor<Session>(
-            predicate: #Predicate { $0.sessionId == sessionId }
-        )
-        if let existing = try? modelContext.fetch(descriptor).first {
+        if let existing = existingSession {
             existing.lastUsedAt = Date()
+            existing.sessionCwd = resolvedSessionCwd
+            if existing.historySessionId == sessionId {
+                existing.historySessionId = nil
+                existing.historySessionCwd = nil
+            }
             self.activeSession = existing
         } else {
-            let session = Session(sessionId: sessionId, workspace: workspace)
+            let session = Session(
+                sessionId: sessionId,
+                sessionCwd: resolvedSessionCwd,
+                historySessionId: historySessionId == sessionId ? nil : historySessionId,
+                historySessionCwd: historySessionId == sessionId ? nil : sourceSessionCwd,
+                workspace: workspace
+            )
             modelContext.insert(session)
             self.activeSession = session
         }
@@ -369,12 +429,14 @@ final class AppState {
     /// Creates a fresh ACP process and loads the old session's conversation into it.
     private func resumeHistorySession(
         oldSessionId: String,
+        sourceSessionId: String,
+        sourceSessionCwd: String?,
         workspace: Workspace,
         node: Node,
         daemon: DaemonClient,
         modelContext: ModelContext
     ) async throws {
-        Log.toFile("[AppState] Creating new session to recover history of \(oldSessionId)...")
+        Log.toFile("[AppState] Creating new session to recover history of \(sourceSessionId)...")
 
         // Create a fresh ACP process
         let newSessionId = try await daemon.createSession(
@@ -391,18 +453,17 @@ final class AppState {
         // __routeToSession tells the daemon to forward this to the new session's ACP process,
         // while sessionId tells the ACP which conversation to load from disk.
         isLoadingHistory = true
-        var historyLoadFailed = false
-        Log.toFile("[AppState] Loading history of \(oldSessionId) into new session \(newSessionId)...")
-        do {
-            try await acpService?.loadSession(
-                sessionId: oldSessionId,
-                cwd: workspace.path,
-                routeToSessionId: newSessionId
-            )
-        } catch {
-            Log.toFile("[AppState] session/load for history failed: \(error)")
-            historyLoadFailed = true
-        }
+        Log.toFile("[AppState] Loading history of \(sourceSessionId) into new session \(newSessionId)...")
+        let sourceLoadCwds = loadCwdCandidates(
+            preferred: [sourceSessionCwd, workspace.path],
+            workspace: workspace
+        )
+        let loadedSourceCwd = await loadSessionFromCandidates(
+            sessionId: sourceSessionId,
+            routeToSessionId: newSessionId,
+            candidateCwds: sourceLoadCwds
+        )
+        let historyLoadFailed = loadedSourceCwd == nil
         isLoadingHistory = false
         for msg in messages where msg.isStreaming {
             msg.isStreaming = false
@@ -414,10 +475,23 @@ final class AppState {
         )
         if let existing = try? modelContext.fetch(descriptor).first {
             existing.sessionId = newSessionId
+            existing.sessionCwd = workspace.path
+            existing.historySessionId = sourceSessionId == newSessionId ? nil : sourceSessionId
+            existing.historySessionCwd = sourceSessionId == newSessionId
+                ? nil
+                : (loadedSourceCwd ?? sourceSessionCwd)
             existing.lastUsedAt = Date()
             self.activeSession = existing
         } else {
-            let session = Session(sessionId: newSessionId, workspace: workspace)
+            let session = Session(
+                sessionId: newSessionId,
+                sessionCwd: workspace.path,
+                historySessionId: sourceSessionId == newSessionId ? nil : sourceSessionId,
+                historySessionCwd: sourceSessionId == newSessionId
+                    ? nil
+                    : (loadedSourceCwd ?? sourceSessionCwd),
+                workspace: workspace
+            )
             modelContext.insert(session)
             self.activeSession = session
         }
@@ -653,6 +727,54 @@ final class AppState {
         let msg = ChatMessage(role: .assistant, isStreaming: isPrompting && !isLoadingHistory)
         messages.append(msg)
         return msg
+    }
+
+    /// Build a deduplicated list of cwd candidates for session/load.
+    private func loadCwdCandidates(preferred: [String?], workspace: Workspace) -> [String] {
+        var candidates: [String] = []
+        var seen: Set<String> = []
+
+        func append(_ raw: String?) {
+            guard let path = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else {
+                return
+            }
+            guard seen.insert(path).inserted else { return }
+            candidates.append(path)
+        }
+
+        for path in preferred {
+            append(path)
+        }
+        append(workspace.path)
+        for ws in workspace.node?.workspaces ?? [] {
+            append(ws.path)
+        }
+
+        return candidates
+    }
+
+    /// Attempt session/load using candidate cwd paths until one succeeds.
+    private func loadSessionFromCandidates(
+        sessionId: String,
+        routeToSessionId: String? = nil,
+        candidateCwds: [String]
+    ) async -> String? {
+        guard let service = acpService else { return nil }
+        for cwd in candidateCwds {
+            do {
+                try await service.loadSession(
+                    sessionId: sessionId,
+                    cwd: cwd,
+                    routeToSessionId: routeToSessionId
+                )
+                return cwd
+            } catch {
+                Log.toFile(
+                    "[AppState] session/load failed for \(sessionId) (route: \(routeToSessionId ?? "none"), cwd: \(cwd)): \(error)"
+                )
+            }
+        }
+        return nil
     }
 
     private func addSystemMessage(_ text: String) {
