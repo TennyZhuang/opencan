@@ -43,13 +43,14 @@ final class AppState {
 
     /// Connect to a workspace's node via SSH and initialize ACP.
     /// After this, call createNewSession() or resumeSession() to start chatting.
-    /// If already connected, disconnects first.
+    /// If already connected, tears down the old connection first.
     func connect(workspace: Workspace) {
         if connectionStatus == .connected || connectionStatus == .connecting {
-            disconnect()
+            cleanupConnection()
         }
         guard let node = workspace.node, let key = node.sshKey else {
             connectionError = "Node or SSH key not configured"
+            connectionStatus = .failed
             return
         }
 
@@ -77,6 +78,9 @@ final class AppState {
         )
 
         Task {
+            // Await full teardown of previous SSH connection before starting new one
+            await sshManager.disconnect()
+
             do {
                 let t = try await sshManager.connect(params: params)
                 self.transport = t
@@ -106,7 +110,11 @@ final class AppState {
                 let service = ACPService(client: client)
                 self.acpService = service
 
-                let initResult = try await service.initialize()
+                // Initialize with timeout — if the ACP server doesn't respond,
+                // fail instead of hanging forever.
+                let initResult = try await withThrowingTimeout(seconds: 30) {
+                    try await service.initialize()
+                }
                 Log.app.info("ACP initialized: \(String(describing: initResult))")
                 Log.toFile("[AppState] ACP initialized")
 
@@ -128,6 +136,8 @@ final class AppState {
                 Log.toFile("[AppState] Connection error: \(error)")
                 self.connectionError = error.localizedDescription
                 self.connectionStatus = .failed
+                // Clean up partially-established connection resources
+                self.cleanupConnection()
             }
         }
     }
@@ -195,6 +205,14 @@ final class AppState {
     }
 
     func disconnect() {
+        cleanupConnection()
+        shouldPopToRoot = true
+        Task { await sshManager.disconnect() }
+    }
+
+    /// Tear down the current connection state without triggering navigation.
+    /// Does not close the SSH session — caller is responsible for that.
+    private func cleanupConnection() {
         let client = acpClient
         let t = transport
         notificationTask?.cancel()
@@ -209,11 +227,10 @@ final class AppState {
         activeWorkspace = nil
         remoteSessions = []
         messages = []
-        shouldPopToRoot = true
-        Task.detached { [sshManager] in
+        // Stop ACP client and close transport asynchronously
+        Task.detached {
             if let client { await client.stop() }
             if let t { await t.close() }
-            await sshManager.disconnect()
         }
     }
 
@@ -337,10 +354,29 @@ final class AppState {
 
 enum AppStateError: Error, LocalizedError {
     case notConnected
+    case timeout
 
     var errorDescription: String? {
         switch self {
         case .notConnected: "Not connected to a workspace"
+        case .timeout: "Connection timed out — server did not respond"
         }
+    }
+}
+
+/// Run an async operation with a timeout.
+func withThrowingTimeout<T: Sendable>(
+    seconds: TimeInterval,
+    operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(for: .seconds(seconds))
+            throw AppStateError.timeout
+        }
+        let result = try await group.next()!
+        group.cancelAll()
+        return result
     }
 }
