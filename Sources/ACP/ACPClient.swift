@@ -26,6 +26,7 @@ actor ACPClient {
                 await self.handleMessage(message)
             }
             await self.cancelAll()
+            await self.finishNotifications()
         }
     }
 
@@ -43,22 +44,38 @@ actor ACPClient {
         sentRequestIds.insert(id)
         let message = JSONRPCMessage.request(id: id, method: method, params: params)
         // Store continuation BEFORE sending so the response can't arrive first
-        return try await withCheckedThrowingContinuation { cont in
-            pendingRequests[id] = cont
-            Task { [weak self] in
-                do {
-                    try await self?.transport.send(message)
-                } catch {
-                    if let self, let c = await self.removePending(id) {
-                        c.resume(throwing: error)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                pendingRequests[id] = cont
+                Task { [weak self] in
+                    guard let self else { return }
+                    do {
+                        try await self.transport.send(message)
+                    } catch {
+                        if let c = await self.removePending(id) {
+                            c.resume(throwing: error)
+                        }
+                        await self.removeSentRequestId(id)
                     }
                 }
+            }
+        } onCancel: {
+            Task { [weak self] in
+                guard let self else { return }
+                if let c = await self.removePending(id) {
+                    c.resume(throwing: CancellationError())
+                }
+                await self.removeSentRequestId(id)
             }
         }
     }
 
     private func removePending(_ id: JSONRPCMessage.JSONRPCID) -> CheckedContinuation<JSONValue, Error>? {
         pendingRequests.removeValue(forKey: id)
+    }
+
+    private func removeSentRequestId(_ id: JSONRPCMessage.JSONRPCID) {
+        sentRequestIds.remove(id)
     }
 
     /// Send a notification (no response expected).
@@ -144,6 +161,10 @@ actor ACPClient {
             c.resume(throwing: CancellationError())
         }
         pendingRequests.removeAll()
+    }
+
+    private func finishNotifications() {
+        notificationContinuation.finish()
     }
 }
 

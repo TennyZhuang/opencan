@@ -38,10 +38,45 @@ enum JSONRPCMessage: Codable, Sendable {
         var result: JSONValue?
         var error: ErrorObject?
 
+        enum CodingKeys: String, CodingKey {
+            case jsonrpc, id, method, params, result, error
+        }
+
         struct ErrorObject: Codable {
             let code: Int
             let message: String
             var data: JSONValue?
+        }
+
+        init(
+            jsonrpc: String = "2.0",
+            id: JSONRPCID? = nil,
+            method: String? = nil,
+            params: JSONValue? = nil,
+            result: JSONValue? = nil,
+            error: ErrorObject? = nil
+        ) {
+            self.jsonrpc = jsonrpc
+            self.id = id
+            self.method = method
+            self.params = params
+            self.result = result
+            self.error = error
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            jsonrpc = try c.decode(String.self, forKey: .jsonrpc)
+            id = try c.decodeIfPresent(JSONRPCID.self, forKey: .id)
+            method = try c.decodeIfPresent(String.self, forKey: .method)
+            params = try c.decodeIfPresent(JSONValue.self, forKey: .params)
+            error = try c.decodeIfPresent(ErrorObject.self, forKey: .error)
+            // Preserve explicit `result: null` as `.null` instead of dropping it.
+            if c.contains(.result) {
+                result = try c.decode(JSONValue.self, forKey: .result)
+            } else {
+                result = nil
+            }
         }
     }
 
