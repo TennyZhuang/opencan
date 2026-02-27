@@ -167,6 +167,15 @@ func (d *Daemon) resetIdleTimer() {
 		if clientCount == 0 && d.sessions.IsIdle() {
 			d.logger.Info("idle timeout reached, shutting down")
 			d.Stop()
+			return
+		}
+
+		// Timer is one-shot; keep polling until the daemon actually becomes idle.
+		select {
+		case <-d.stopCh:
+			return
+		default:
+			d.resetIdleTimer()
 		}
 	})
 }

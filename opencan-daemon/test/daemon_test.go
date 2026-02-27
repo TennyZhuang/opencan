@@ -17,6 +17,10 @@ import (
 // testDaemon starts a daemon in a temp directory for testing.
 // Uses /tmp directly to keep Unix socket paths short (macOS 104-char limit).
 func testDaemon(t *testing.T) (*daemon.Daemon, string) {
+	return testDaemonWithTimeout(t, 10*time.Minute)
+}
+
+func testDaemonWithTimeout(t *testing.T, idleTimeout time.Duration) (*daemon.Daemon, string) {
 	t.Helper()
 	tmpDir, err := os.MkdirTemp("/tmp", "ocd-*")
 	if err != nil {
@@ -31,7 +35,7 @@ func testDaemon(t *testing.T) (*daemon.Daemon, string) {
 	cfg := daemon.Config{
 		SocketPath:  sockPath,
 		PIDFile:     pidFile,
-		IdleTimeout: 10 * time.Minute,
+		IdleTimeout: idleTimeout,
 		Logger:      logger,
 	}
 
@@ -50,7 +54,6 @@ func testDaemon(t *testing.T) (*daemon.Daemon, string) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-
 	return d, sockPath
 }
 
@@ -483,6 +486,69 @@ func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
 	if resp["error"] != nil {
 		t.Fatalf("client2 attach after detach should succeed: %v", resp["error"])
 	}
+}
+
+func TestDaemon_IdleTimeoutRearmsWhileSessionBusy(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemonWithTimeout(t, 200*time.Millisecond)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Create and attach session.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.create",
+		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
+	})
+	resp := readJSONWithScanner(t, scanner)
+	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.attach",
+		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
+	})
+	readJSONWithScanner(t, scanner) // attach response
+
+	// Start a long-enough prompt (mock streams ~400ms total by default).
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1001,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": sessionID,
+			"prompt":    []map[string]interface{}{{"type": "text", "text": "hello"}},
+		},
+	})
+
+	// Wait for first streamed notification, then disconnect mid-prompt.
+	for {
+		msg := readJSONWithScanner(t, scanner)
+		if msg["method"] != nil {
+			break
+		}
+	}
+	conn.Close()
+
+	// Daemon should eventually stop once prompt completes and idleness is re-checked.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(sockPath); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("daemon did not stop after idle timeout while no clients were connected")
 }
 
 func TestDaemon_SessionLoadRouteToSession(t *testing.T) {
