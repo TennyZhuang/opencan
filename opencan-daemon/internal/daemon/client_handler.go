@@ -33,8 +33,8 @@ type ClientHandler struct {
 	// When multiple proxies are attached, ACP processes may use overlapping request IDs.
 	// We rewrite IDs when forwarding to the client and restore them when routing back.
 	serverReqMu       sync.Mutex
-	pendingServerReqs  map[int64]serverRequestMapping
-	nextServerReqID    int64
+	pendingServerReqs map[int64]serverRequestMapping
+	nextServerReqID   int64
 }
 
 // NewClientHandler creates a handler for a client connection.
@@ -92,8 +92,10 @@ func (h *ClientHandler) cleanup() {
 		h.logger.Info("detached from session", "sessionId", sid)
 	}
 	h.attachedProxies = nil
-	h.conn.Close()
+	h.writeMu.Lock()
 	h.closed = true
+	h.writeMu.Unlock()
+	h.conn.Close()
 	h.daemon.clientDisconnected(h)
 }
 
@@ -114,6 +116,13 @@ func (h *ClientHandler) Send(msg *protocol.Message) error {
 
 // handleDaemonMethod dispatches daemon/ prefixed methods.
 func (h *ClientHandler) handleDaemonMethod(msg *protocol.Message) {
+	if msg.ID == nil {
+		// JSON-RPC notifications do not expect a response.
+		// Ignore daemon notifications to avoid nil-id panics in handlers.
+		h.logger.Warn("ignoring daemon notification", "method", msg.Method)
+		return
+	}
+
 	switch msg.Method {
 	case protocol.MethodDaemonHello:
 		h.handleHello(msg)

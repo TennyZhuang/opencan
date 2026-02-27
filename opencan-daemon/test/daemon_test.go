@@ -124,6 +124,38 @@ func TestDaemon_Hello(t *testing.T) {
 	}
 }
 
+func TestDaemon_DaemonNotificationWithoutIDDoesNotCrash(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	// Send daemon/hello as a notification (no id). Daemon should ignore it
+	// instead of panicking due to nil request id.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "daemon/hello",
+		"params":  map[string]interface{}{"clientVersion": "0.1.0"},
+	})
+
+	// Verify the same connection is still alive with a regular request.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.list",
+		"params":  map[string]interface{}{},
+	})
+
+	resp := readJSON(t, conn)
+	if resp["id"].(float64) != 2 {
+		t.Fatalf("expected id 2, got %v", resp["id"])
+	}
+	if resp["error"] != nil {
+		t.Fatalf("unexpected error response: %v", resp["error"])
+	}
+}
+
 func TestDaemon_SessionList_Empty(t *testing.T) {
 	d, sockPath := testDaemon(t)
 	defer d.Stop()
