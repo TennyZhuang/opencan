@@ -173,6 +173,23 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(userMessages.count, 1, "Only first message should go through")
     }
 
+    func testDisconnectWhilePromptingResetsPromptingState() async throws {
+        try await connectMock(scenario: .complex)
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.sendMessage("First")
+        XCTAssertTrue(appState.isPrompting, "Should enter prompting before disconnect")
+
+        appState.disconnect()
+        XCTAssertFalse(appState.isPrompting, "disconnect should clear stale prompting state")
+
+        // After reconnect, send should not be blocked by stale isPrompting.
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        appState.sendMessage("After reconnect")
+        XCTAssertTrue(appState.isPrompting, "Should be able to send after reconnect")
+    }
+
     // MARK: - Resume Tests: Completed/Idle Session
 
     func testResumeCompletedSession() async throws {

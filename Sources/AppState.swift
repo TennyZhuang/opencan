@@ -542,6 +542,8 @@ final class AppState {
         daemonSessions = []
         daemonUploadProgress = nil
         messages = []
+        isPrompting = false
+        isCreatingSession = false
         isLoadingHistory = false
         // lastEventSeq intentionally kept — needed for reconnect replay
         // Stop ACP client and close transport asynchronously
