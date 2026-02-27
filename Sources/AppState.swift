@@ -49,6 +49,8 @@ final class AppState {
     private var lastEventSeq: [String: UInt64] = [:]
     /// Session IDs that are allowed to emit events during session/load history replay.
     private var historyLoadSessionIds: Set<String> = []
+    private var historyLoadCleanupTask: Task<Void, Never>?
+    private var historyLoadGeneration: UInt64 = 0
 
     enum ConnectionStatus: Equatable {
         case disconnected
@@ -359,8 +361,7 @@ final class AppState {
             let hasHistorySource = (historySessionId != nil && historySessionId != sessionId)
             let hasVisibleReplay = hasRenderableConversation()
             if !hasVisibleReplay || hasHistorySource {
-                isLoadingHistory = true
-                historyLoadSessionIds = [sessionId]
+                beginHistoryLoadScope(sessionIds: Set([sessionId]))
                 Log.toFile("[AppState] Loading history via session/load for \(sessionId)...")
                 let primaryCwds = loadCwdCandidates(
                     preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
@@ -397,8 +398,7 @@ final class AppState {
                     "[AppState] Resumed \(sessionId) via buffered replay (\(result.bufferedEvents.count) events), skipping session/load"
                 )
             }
-            isLoadingHistory = false
-            historyLoadSessionIds = []
+            endHistoryLoadScope()
             // Ensure no stale streaming indicators
             for msg in messages where msg.isStreaming {
                 msg.isStreaming = false
@@ -473,8 +473,7 @@ final class AppState {
         // Load old session's history into the new ACP process.
         // __routeToSession tells the daemon to forward this to the new session's ACP process,
         // while sessionId tells the ACP which conversation to load from disk.
-        isLoadingHistory = true
-        historyLoadSessionIds = [sourceSessionId, newSessionId]
+        beginHistoryLoadScope(sessionIds: Set([sourceSessionId, newSessionId]))
         Log.toFile("[AppState] Loading history of \(sourceSessionId) into new session \(newSessionId)...")
         let sourceLoadCwds = loadCwdCandidates(
             preferred: [sourceSessionCwd, workspace.path],
@@ -486,8 +485,7 @@ final class AppState {
             candidateCwds: sourceLoadCwds
         )
         let historyLoadFailed = loadedSourceCwd == nil
-        isLoadingHistory = false
-        historyLoadSessionIds = []
+        endHistoryLoadScope()
         for msg in messages where msg.isStreaming {
             msg.isStreaming = false
         }
@@ -544,6 +542,8 @@ final class AppState {
         let mt = mockTransport
         notificationTask?.cancel()
         ptyTask?.cancel()
+        historyLoadCleanupTask?.cancel()
+        historyLoadCleanupTask = nil
         acpClient = nil
         acpService = nil
         daemonClient = nil
@@ -561,6 +561,7 @@ final class AppState {
         isCreatingSession = false
         isLoadingHistory = false
         historyLoadSessionIds = []
+        historyLoadGeneration = 0
         // lastEventSeq intentionally kept — needed for reconnect replay
         // Stop ACP client and close transport asynchronously
         Task.detached {
@@ -652,6 +653,16 @@ final class AppState {
                 guard let event = SessionUpdateParser.parse(notification) else { continue }
                 Log.toFile("[AppState] Session event: \(event)")
                 self.handleSessionEvent(event)
+
+                if case .promptComplete = event,
+                   let notificationSessionId,
+                   self.historyLoadSessionIds.contains(notificationSessionId) {
+                    self.historyLoadSessionIds.remove(notificationSessionId)
+                    if self.historyLoadSessionIds.isEmpty {
+                        self.historyLoadCleanupTask?.cancel()
+                        self.historyLoadCleanupTask = nil
+                    }
+                }
             }
             Log.toFile("[AppState] Notification listener ended")
         }
@@ -661,10 +672,16 @@ final class AppState {
         guard let sessionId else { return true }
         if sessionId == currentSessionId { return true }
 
+        // During/after session/load, allow source-session replay events to continue
+        // until we observe prompt_complete or a fallback timeout.
+        if historyLoadSessionIds.contains(sessionId) {
+            return true
+        }
+
         // During session/load, history events can be emitted for the loaded source
         // sessionId even though we're attached to a different live session.
         if isLoadingHistory {
-            return historyLoadSessionIds.isEmpty || historyLoadSessionIds.contains(sessionId)
+            return historyLoadSessionIds.isEmpty
         }
         return false
     }
@@ -824,8 +841,8 @@ final class AppState {
                 Log.toFile(
                     "[AppState] session/load failed for \(sessionId) (route: \(routeToSessionId ?? "none"), cwd: \(cwd)): \(error)"
                 )
-                // "Session not found" (or route session not attached) is terminal for this
-                // request; trying more cwd values cannot change the outcome.
+                // Routing errors are terminal; cwd retries cannot fix missing attachment.
+                // "Session not found" is often cwd-dependent, so keep trying candidates.
                 if shouldStopSessionLoadRetries(after: error) {
                     break
                 }
@@ -837,7 +854,7 @@ final class AppState {
     /// Whether we should stop trying more cwd candidates for session/load.
     private func shouldStopSessionLoadRetries(after error: Error) -> Bool {
         guard let acpError = error as? ACPError else { return false }
-        return acpError.isSessionNotFound || acpError.isNotAttached
+        return acpError.isNotAttached
     }
 
     /// Returns true when replay produced any user-visible conversation/tool output.
@@ -858,6 +875,29 @@ final class AppState {
             Log.toFile("[AppState] Detached previous session \(currentSessionId)")
         } catch {
             Log.toFile("[AppState] Failed to detach previous session \(currentSessionId): \(error)")
+        }
+    }
+
+    private func beginHistoryLoadScope(sessionIds: Set<String>) {
+        historyLoadGeneration &+= 1
+        historyLoadCleanupTask?.cancel()
+        historyLoadCleanupTask = nil
+        isLoadingHistory = true
+        historyLoadSessionIds = sessionIds
+    }
+
+    private func endHistoryLoadScope() {
+        isLoadingHistory = false
+        guard !historyLoadSessionIds.isEmpty else { return }
+
+        let generation = historyLoadGeneration
+        historyLoadCleanupTask?.cancel()
+        historyLoadCleanupTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            guard generation == self.historyLoadGeneration else { return }
+            self.historyLoadSessionIds = []
+            self.historyLoadCleanupTask = nil
         }
     }
 
