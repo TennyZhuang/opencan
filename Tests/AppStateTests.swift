@@ -602,7 +602,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(u3.displayTitle, "Running Session")
     }
 
-    func testUnifiedSessionDeadNotResumable() {
+    func testUnifiedSessionDeadIsResumableForRecovery() {
         let unified = UnifiedSession(
             sessionId: "dead-sess",
             daemonState: "dead",
@@ -611,7 +611,7 @@ final class AppStateTests: XCTestCase {
             title: nil,
             lastUsedAt: nil
         )
-        XCTAssertFalse(unified.isResumable)
+        XCTAssertTrue(unified.isResumable)
         XCTAssertEqual(unified.displayState, "dead")
     }
 

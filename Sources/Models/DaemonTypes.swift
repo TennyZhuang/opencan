@@ -39,6 +39,7 @@ struct UnifiedSession: Identifiable {
     var id: String { sessionId }
 
     var displayState: String { daemonState ?? "history" }
-    var isResumable: Bool { daemonState != "dead" }
+    /// Even dead daemon sessions are resumable via history recovery.
+    var isResumable: Bool { true }
     var displayTitle: String { title ?? String(sessionId.prefix(8)) }
 }
