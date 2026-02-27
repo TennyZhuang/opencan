@@ -190,6 +190,12 @@ enum ACPError: Error, LocalizedError {
         return data?["details"]?.stringValue
     }
 
+    /// JSON-RPC error code when this is an rpcError.
+    var rpcCode: Int? {
+        guard case .rpcError(let code, _, _) = self else { return nil }
+        return code
+    }
+
     /// True for terminal lookup misses where retrying different cwd is pointless.
     var isSessionNotFound: Bool {
         guard case .rpcError(_, let message, let data) = self else { return false }
@@ -204,5 +210,43 @@ enum ACPError: Error, LocalizedError {
         let details = data?["details"]?.stringValue ?? ""
         let combined = "\(message) \(details)".lowercased()
         return combined.contains("not attached to session")
+    }
+
+    /// True when upstream model routing has no available backend provider.
+    var isModelUnavailable: Bool {
+        guard case .rpcError(_, let message, let data) = self else { return false }
+        let details = data?["details"]?.stringValue ?? ""
+        let combined = "\(message) \(details)".lowercased()
+        return combined.contains("model_not_found")
+            || combined.contains("no available distributor")
+            || combined.contains("无可用渠道")
+    }
+
+    /// Best-effort extraction of backend request id from nested provider errors.
+    var backendRequestID: String? {
+        guard case .rpcError(_, let message, let data) = self else { return nil }
+        let details = data?["details"]?.stringValue ?? ""
+        let combined = "\(message) \(details)"
+        return ACPError.extractRequestID(from: combined)
+    }
+
+    private static func extractRequestID(from text: String) -> String? {
+        let patterns = [
+            #"request id:\s*([A-Za-z0-9_-]+)"#,
+            #"request_id[:=]\s*([A-Za-z0-9_-]+)"#,
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+                continue
+            }
+            let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
+            guard let match = regex.firstMatch(in: text, options: [], range: fullRange),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: text) else {
+                continue
+            }
+            return String(text[range])
+        }
+        return nil
     }
 }

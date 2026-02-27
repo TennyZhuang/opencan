@@ -190,6 +190,38 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(appState.isPrompting, "Should be able to send after reconnect")
     }
 
+    func testPromptModelUnavailableErrorShowsFriendlyGuidance() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setNextPromptError(
+            code: -32603,
+            message: "Internal error: API Error: 503 {\"error\":{\"code\":\"model_not_found\",\"message\":\"no distributor (request id: req-xyz-123)\",\"type\":\"packy_api_error\"}}",
+            data: nil
+        )
+
+        appState.sendMessage("trigger model unavailable")
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        let assistantMessages = appState.messages.filter { $0.role == .assistant }
+        let lastAssistant = try XCTUnwrap(assistantMessages.last)
+        XCTAssertTrue(
+            lastAssistant.content.contains("Model unavailable on current provider group."),
+            "Assistant message should contain concise model-unavailable error"
+        )
+
+        let systemMessages = appState.messages.filter { $0.role == .system }.map(\.content)
+        XCTAssertTrue(
+            systemMessages.contains { $0.contains("switching model/group") && $0.contains("req-xyz-123") },
+            "System guidance should include remediation and request id"
+        )
+    }
+
     func testResumeDifferentSessionDetachesPreviousAttachment() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)
@@ -708,5 +740,9 @@ extension MockACPTransport {
 
     func getDetachedSessionIds() -> [String] {
         detachedSessionIds
+    }
+
+    func setNextPromptError(code: Int, message: String, data: JSONValue?) {
+        nextPromptError = (code: code, message: message, data: data)
     }
 }

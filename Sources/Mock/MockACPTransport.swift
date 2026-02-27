@@ -40,6 +40,8 @@ actor MockACPTransport: ACPTransport {
     var receivedMethods: [String] = []
     /// Track detached session IDs in order.
     var detachedSessionIds: [String] = []
+    /// Optional one-shot error injected for the next session/prompt request.
+    var nextPromptError: (code: Int, message: String, data: JSONValue?)?
 
     init(scenario: MockScenario = .simple) {
         self.scenario = scenario
@@ -123,6 +125,18 @@ actor MockACPTransport: ACPTransport {
         // ACP passthrough (daemon forwards transparently)
         case ACPMethods.sessionPrompt:
             let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
+            if let promptError = nextPromptError {
+                nextPromptError = nil
+                messageContinuation.yield(
+                    .error(
+                        id: id,
+                        code: promptError.code,
+                        message: promptError.message,
+                        data: promptError.data
+                    )
+                )
+                return
+            }
             await streamScenario(requestId: id, sessionId: sessionId)
 
         case ACPMethods.sessionLoad:

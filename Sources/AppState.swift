@@ -612,7 +612,7 @@ final class AppState {
                 await self.refreshDaemonSessions()
             } catch {
                 Log.toFile("[AppState] sendPrompt error: \(error)")
-                self.lastAssistantMessage().content += "\n[Error: \(error.localizedDescription)]"
+                self.presentPromptError(error)
                 for msg in self.messages where msg.role == .assistant && msg.isStreaming {
                     msg.isStreaming = false
                 }
@@ -859,6 +859,70 @@ final class AppState {
         } catch {
             Log.toFile("[AppState] Failed to detach previous session \(currentSessionId): \(error)")
         }
+    }
+
+    /// Present a concise prompt failure in chat and add actionable guidance.
+    private func presentPromptError(_ error: Error) {
+        let presentation = userFacingPromptError(error)
+        let assistant = lastAssistantMessage()
+        let errorLine = "[Error: \(presentation.inline)]"
+        if assistant.content.isEmpty {
+            assistant.content = errorLine
+        } else {
+            assistant.content += "\n\(errorLine)"
+        }
+        if let guidance = presentation.guidance {
+            addSystemMessage(guidance)
+        }
+    }
+
+    private func userFacingPromptError(_ error: Error) -> (inline: String, guidance: String?) {
+        if error is CancellationError {
+            return (
+                "Connection interrupted while waiting for a response.",
+                "Connection dropped during the request. Please resend after reconnecting."
+            )
+        }
+
+        guard let acpError = error as? ACPError else {
+            return (error.localizedDescription, nil)
+        }
+
+        if acpError.isModelUnavailable {
+            if let requestID = acpError.backendRequestID {
+                return (
+                    "Model unavailable on current provider group.",
+                    "Model routing failed (`model_not_found`, request id: \(requestID)). Try switching model/group, then resend."
+                )
+            }
+            return (
+                "Model unavailable on current provider group.",
+                "Model routing failed (`model_not_found`). Try switching model/group, then resend."
+            )
+        }
+
+        if acpError.isNotAttached {
+            return (
+                "Session is no longer attached.",
+                "Server session detached. Re-open the session and retry."
+            )
+        }
+
+        if acpError.isSessionNotFound {
+            return (
+                "Session not found on server.",
+                "Session no longer exists remotely. Recover history or create a new session."
+            )
+        }
+
+        if acpError.rpcCode == -32603 {
+            return (
+                "Server internal error while processing this prompt.",
+                "Server returned JSON-RPC -32603. Please retry in a moment."
+            )
+        }
+
+        return (acpError.errorDescription ?? error.localizedDescription, nil)
     }
 
     private func addSystemMessage(_ text: String) {
