@@ -4,6 +4,7 @@ import SwiftData
 struct SessionPickerView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.modelContext) private var modelContext
+    @AppStorage(AgentCommandStore.defaultAgentKey) private var defaultAgentID = AgentKind.claude.rawValue
     let workspace: Workspace
     @State private var hasConnected = false
     @State private var navigateToChat = false
@@ -108,7 +109,8 @@ struct SessionPickerView: View {
                 cwd: daemon?.cwd ?? workspace.path,
                 lastEventSeq: daemon?.lastEventSeq,
                 title: local?.title,
-                lastUsedAt: local?.lastUsedAt
+                lastUsedAt: local?.lastUsedAt,
+                agentID: local?.agentID
             )
         }
 
@@ -128,11 +130,31 @@ struct SessionPickerView: View {
         }
     }
 
+    private var availableAgents: [AgentKind] {
+        let preferred = AgentKind(rawValue: defaultAgentID)
+        return AgentKind.allCases.sorted { lhs, rhs in
+            if lhs == preferred { return true }
+            if rhs == preferred { return false }
+            return lhs.displayName < rhs.displayName
+        }
+    }
+
     private var sessionListView: some View {
         List {
             Section {
-                Button {
-                    Task { await createNew() }
+                Menu {
+                    ForEach(availableAgents) { agent in
+                        Button {
+                            Task { await createNew(agent: agent) }
+                        } label: {
+                            let command = AgentCommandStore.command(for: agent)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(agent.displayName)
+                                Text(command)
+                                    .font(.caption2)
+                            }
+                        }
+                    }
                 } label: {
                     HStack {
                         Label("New Session", systemImage: "plus.circle")
@@ -158,6 +180,11 @@ struct SessionPickerView: View {
                                         .font(.system(.body, design: .monospaced))
                                         .foregroundStyle(.primary)
                                         .lineLimit(1)
+                                    if let agentName = session.agentDisplayName {
+                                        Text(agentName)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
                                     if let date = session.lastUsedAt {
                                         Text(date.formatted(.relative(presentation: .named)))
                                             .font(.caption)
@@ -181,11 +208,11 @@ struct SessionPickerView: View {
         }
     }
 
-    private func createNew() async {
+    private func createNew(agent: AgentKind) async {
         appState.isCreatingSession = true
         defer { appState.isCreatingSession = false }
         do {
-            try await appState.createNewSession(modelContext: modelContext)
+            try await appState.createNewSession(modelContext: modelContext, agent: agent)
             navigateToChat = true
         } catch {
             appState.connectionError = error.localizedDescription

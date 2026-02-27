@@ -13,7 +13,6 @@ struct NodeFormView: View {
     @State private var host = ""
     @State private var port = "22"
     @State private var username = ""
-    @State private var command = "claude-agent-acp"
     @State private var selectedKey: SSHKeyPair?
     @State private var selectedJump: Node?
     @State private var showImportKey = false
@@ -31,8 +30,6 @@ struct NodeFormView: View {
                     TextField("Port", text: $port)
                         .keyboardType(.numberPad)
                     TextField("Username", text: $username)
-                        .textInputAutocapitalization(.never)
-                    TextField("Command", text: $command)
                         .textInputAutocapitalization(.never)
                 }
 
@@ -123,7 +120,6 @@ struct NodeFormView: View {
         host = node.host
         port = String(node.port)
         username = node.username
-        command = node.command
         selectedKey = node.sshKey
         selectedJump = node.jumpServer
     }
@@ -135,11 +131,10 @@ struct NodeFormView: View {
             node.host = host
             node.port = portNum
             node.username = username
-            node.command = command
             node.sshKey = selectedKey
             node.jumpServer = selectedJump
         } else {
-            let node = Node(name: name, host: host, port: portNum, username: username, command: command)
+            let node = Node(name: name, host: host, port: portNum, username: username)
             node.sshKey = selectedKey
             node.jumpServer = selectedJump
             modelContext.insert(node)

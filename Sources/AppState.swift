@@ -229,20 +229,36 @@ final class AppState {
         }
     }
 
-    /// Create a new ACP session via the daemon.
+    /// Create a new ACP session via the daemon using the app's default agent.
     func createNewSession(modelContext: ModelContext) async throws {
+        let defaultAgent = AgentCommandStore.defaultAgent()
+        try await createNewSession(modelContext: modelContext, agent: defaultAgent)
+    }
+
+    /// Create a new ACP session via the daemon using a specific built-in agent.
+    func createNewSession(modelContext: ModelContext, agent: AgentKind) async throws {
+        let command = AgentCommandStore.command(for: agent)
+        try await createNewSession(
+            modelContext: modelContext,
+            agentID: agent.rawValue,
+            command: command
+        )
+    }
+
+    /// Create a new ACP session via the daemon using explicit agent metadata.
+    private func createNewSession(modelContext: ModelContext, agentID: String, command: String) async throws {
         guard let daemon = daemonClient,
-              let workspace = activeWorkspace,
-              let node = activeNode else {
+              let workspace = activeWorkspace else {
             throw AppStateError.notConnected
         }
 
         messages = []
+        let launchCommand = normalizeAgentCommand(command, fallback: AgentCommandStore.command(forAgentID: agentID))
 
         Log.toFile("[AppState] Creating session via daemon...")
         let sessionId = try await daemon.createSession(
             cwd: workspace.path,
-            command: node.command  // "claude-agent-acp" passed to daemon
+            command: launchCommand
         )
         await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon)
         self.currentSessionId = sessionId
@@ -254,6 +270,8 @@ final class AppState {
         let session = Session(
             sessionId: sessionId,
             sessionCwd: workspace.path,
+            agentID: agentID,
+            agentCommand: launchCommand,
             workspace: workspace
         )
         modelContext.insert(session)
@@ -273,8 +291,7 @@ final class AppState {
     /// - History (not in daemon): create new session + session/load old history
     func resumeSession(sessionId: String, modelContext: ModelContext) async throws {
         guard let daemon = daemonClient,
-              let workspace = activeWorkspace,
-              let node = activeNode else {
+              let workspace = activeWorkspace else {
             throw AppStateError.notConnected
         }
 
@@ -291,6 +308,10 @@ final class AppState {
         } else {
             existingSession?.sessionCwd ?? daemonKnownCwd
         }
+        let sessionAgent = resolveSessionAgent(
+            storedAgentID: existingSession?.agentID,
+            storedAgentCommand: existingSession?.agentCommand
+        )
 
         messages = []
 
@@ -313,7 +334,8 @@ final class AppState {
                 sourceSessionId: sourceSessionId,
                 sourceSessionCwd: sourceSessionCwd,
                 workspace: workspace,
-                node: node,
+                agentID: sessionAgent.id,
+                command: sessionAgent.command,
                 daemon: daemon,
                 modelContext: modelContext
             )
@@ -413,6 +435,11 @@ final class AppState {
                 existing.historySessionId = nil
                 existing.historySessionCwd = nil
             }
+            existing.agentID = existing.agentID ?? sessionAgent.id
+            existing.agentCommand = normalizeAgentCommand(
+                existing.agentCommand,
+                fallback: sessionAgent.command
+            )
             self.activeSession = existing
         } else {
             let session = Session(
@@ -420,6 +447,8 @@ final class AppState {
                 sessionCwd: resolvedSessionCwd,
                 historySessionId: historySessionId == sessionId ? nil : historySessionId,
                 historySessionCwd: historySessionId == sessionId ? nil : sourceSessionCwd,
+                agentID: sessionAgent.id,
+                agentCommand: sessionAgent.command,
                 workspace: workspace
             )
             modelContext.insert(session)
@@ -446,21 +475,24 @@ final class AppState {
 
     /// Resume a "history" session whose daemon has forgotten it.
     /// Creates a fresh ACP process and loads the old session's conversation into it.
+    /// `command` is expected to be resolved and normalized by the caller.
     private func resumeHistorySession(
         oldSessionId: String,
         sourceSessionId: String,
         sourceSessionCwd: String?,
         workspace: Workspace,
-        node: Node,
+        agentID: String,
+        command: String,
         daemon: DaemonClient,
         modelContext: ModelContext
     ) async throws {
         Log.toFile("[AppState] Creating new session to recover history of \(sourceSessionId)...")
 
         // Create a fresh ACP process
+        let launchCommand = command
         let newSessionId = try await daemon.createSession(
             cwd: workspace.path,
-            command: node.command
+            command: launchCommand
         )
 
         await detachCurrentSessionIfNeeded(beforeAttaching: newSessionId, daemon: daemon)
@@ -501,6 +533,8 @@ final class AppState {
             existing.historySessionCwd = sourceSessionId == newSessionId
                 ? nil
                 : (loadedSourceCwd ?? sourceSessionCwd)
+            existing.agentID = agentID
+            existing.agentCommand = launchCommand
             existing.lastUsedAt = Date()
             self.activeSession = existing
         } else {
@@ -511,6 +545,8 @@ final class AppState {
                 historySessionCwd: sourceSessionId == newSessionId
                     ? nil
                     : (loadedSourceCwd ?? sourceSessionCwd),
+                agentID: agentID,
+                agentCommand: launchCommand,
                 workspace: workspace
             )
             modelContext.insert(session)
@@ -796,6 +832,24 @@ final class AppState {
         let msg = ChatMessage(role: .assistant, isStreaming: isPrompting && !isLoadingHistory)
         messages.append(msg)
         return msg
+    }
+
+    /// Resolve persisted session agent metadata into a usable launcher command.
+    private func resolveSessionAgent(
+        storedAgentID: String?,
+        storedAgentCommand: String?
+    ) -> (id: String, command: String) {
+        let fallbackAgent = AgentCommandStore.defaultAgent()
+        let resolvedID = AgentCommandStore.agent(forAgentID: storedAgentID)?.rawValue ?? fallbackAgent.rawValue
+        let fallbackCommand = AgentCommandStore.command(forAgentID: resolvedID)
+        let resolvedCommand = normalizeAgentCommand(storedAgentCommand, fallback: fallbackCommand)
+        return (resolvedID, resolvedCommand)
+    }
+
+    private func normalizeAgentCommand(_ command: String?, fallback: String) -> String {
+        let trimmed = command?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmed, !trimmed.isEmpty else { return fallback }
+        return trimmed
     }
 
     /// Build a deduplicated list of cwd candidates for session/load.

@@ -89,6 +89,35 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(systemMessages.count, 1, "Should have exactly one system message")
     }
 
+    func testCreateNewSessionWithSelectedAgentUsesConfiguredCommand() async throws {
+        try await connectMock()
+
+        let defaults = UserDefaults.standard
+        let key = AgentCommandStore.codexCommandKey
+        let customCommand = "npx @zed-industries/codex-acp"
+        let previous = defaults.string(forKey: key)
+        defaults.set(customCommand, forKey: key)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        try await appState.createNewSession(modelContext: modelContext, agent: .codex)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        let createdCommand = await transport.getLastCreateCommand()
+        XCTAssertEqual(createdCommand, customCommand)
+        XCTAssertEqual(appState.activeSession?.agentID, AgentKind.codex.rawValue)
+        XCTAssertEqual(appState.activeSession?.agentCommand, customCommand)
+    }
+
     func testNewSessionSendMessage() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)
@@ -480,6 +509,37 @@ final class AppStateTests: XCTestCase {
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
     }
 
+    func testResumeHistorySessionReusesStoredAgentCommand() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAttachShouldFail(true)
+        await transport.setMockLoadSteps([
+            .userMessageChunk("Old question"),
+            .textDelta("Old answer."),
+            .promptComplete(.endTurn),
+        ])
+
+        let customCommand = "npx @zed-industries/codex-acp"
+        let session = Session(
+            sessionId: "history-session-with-agent",
+            agentID: AgentKind.codex.rawValue,
+            agentCommand: customCommand,
+            workspace: workspace
+        )
+        modelContext.insert(session)
+        try modelContext.save()
+
+        try await appState.resumeSession(sessionId: "history-session-with-agent", modelContext: modelContext)
+
+        let createdCommand = await transport.getLastCreateCommand()
+        XCTAssertEqual(createdCommand, customCommand)
+    }
+
     func testResumeRecoveredSessionUsesOriginalHistorySource() async throws {
         try await connectMock()
 
@@ -630,7 +690,8 @@ final class AppStateTests: XCTestCase {
             cwd: "/test/path",
             lastEventSeq: 10,
             title: nil,
-            lastUsedAt: nil
+            lastUsedAt: nil,
+            agentID: nil
         )
         XCTAssertEqual(u1.displayState, "idle")
         XCTAssertTrue(u1.isResumable)
@@ -642,7 +703,8 @@ final class AppStateTests: XCTestCase {
             cwd: nil,
             lastEventSeq: nil,
             title: "My Session",
-            lastUsedAt: Date()
+            lastUsedAt: Date(),
+            agentID: nil
         )
         XCTAssertEqual(u2.displayState, "history")
         XCTAssertTrue(u2.isResumable)
@@ -654,7 +716,8 @@ final class AppStateTests: XCTestCase {
             cwd: "/test/path",
             lastEventSeq: 50,
             title: "Running Session",
-            lastUsedAt: Date()
+            lastUsedAt: Date(),
+            agentID: nil
         )
         XCTAssertEqual(u3.displayState, "prompting")
         XCTAssertTrue(u3.isResumable)
@@ -668,10 +731,24 @@ final class AppStateTests: XCTestCase {
             cwd: "/test",
             lastEventSeq: 0,
             title: nil,
-            lastUsedAt: nil
+            lastUsedAt: nil,
+            agentID: nil
         )
         XCTAssertTrue(unified.isResumable)
         XCTAssertEqual(unified.displayState, "dead")
+    }
+
+    func testUnifiedSessionUnknownAgentIDFallsBackToRawValue() {
+        let unified = UnifiedSession(
+            sessionId: "s-unknown-agent",
+            daemonState: "idle",
+            cwd: "/test",
+            lastEventSeq: 1,
+            title: nil,
+            lastUsedAt: nil,
+            agentID: "custom-agent"
+        )
+        XCTAssertEqual(unified.agentDisplayName, "custom-agent")
     }
 
     // MARK: - Helpers
@@ -759,6 +836,14 @@ extension MockACPTransport {
 
     func getLastLoadCwd() -> String? {
         lastLoadCwd
+    }
+
+    func getLastCreateCommand() -> String? {
+        lastCreateCommand
+    }
+
+    func getLastCreateCwd() -> String? {
+        lastCreateCwd
     }
 
     func getReceivedMethods() -> [String] {

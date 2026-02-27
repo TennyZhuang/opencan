@@ -143,4 +143,4 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
 - `daemon/session.attach` returns buffered events since `lastEventSeq`; iOS replays them through `SessionUpdateParser`.
 - `daemon/session.attach` rejects if another client is already attached to that session.
 - Idle timeout is re-armed while sessions are still busy/draining, so daemon auto-exit still happens once sessions become idle/completed and no clients remain.
-- `Node.command` field stores the ACP binary name (default: "claude-agent-acp"); SSH command is always `opencan-daemon attach`.
+- Agent launch commands are configured globally in Agent Settings (`claude-agent-acp` and `codex-acp` defaults); SSH command is always `opencan-daemon attach`.

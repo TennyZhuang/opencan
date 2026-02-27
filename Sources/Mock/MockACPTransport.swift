@@ -32,6 +32,9 @@ actor MockACPTransport: ACPTransport {
     var lastLoadSessionId: String?
     var lastLoadRouteToSessionId: String?
     var lastLoadCwd: String?
+    /// Tracks the most recent daemon/session.create parameters.
+    var lastCreateCwd: String?
+    var lastCreateCommand: String?
 
     /// Track last received method for test assertions.
     var lastReceivedMethod: String?
@@ -85,6 +88,8 @@ actor MockACPTransport: ACPTransport {
             messageContinuation.yield(.response(id: id, result: result))
 
         case DaemonMethods.sessionCreate:
+            lastCreateCwd = params?["cwd"]?.stringValue
+            lastCreateCommand = params?["command"]?.stringValue
             let sessionId = "mock-sess-\(UUID().uuidString.prefix(8))"
             self.mockSessionId = sessionId
             let result: JSONValue = .object([

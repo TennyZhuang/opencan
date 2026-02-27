@@ -6,6 +6,7 @@ struct NodeListView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Node.name) private var nodes: [Node]
     @State private var showAddNode = false
+    @State private var showAgentSettings = false
 
     var body: some View {
         List {
@@ -32,6 +33,13 @@ struct NodeListView: View {
         }
         .navigationTitle("Nodes")
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    showAgentSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     showAddNode = true
@@ -42,6 +50,9 @@ struct NodeListView: View {
         }
         .sheet(isPresented: $showAddNode) {
             NodeFormView()
+        }
+        .sheet(isPresented: $showAgentSettings) {
+            AgentSettingsView()
         }
     }
 

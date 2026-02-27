@@ -120,7 +120,7 @@ actor SSHStdioTransport: ACPTransport {
                 try await outbound.write(buf)
             }
 
-            // Send the command to launch claude-agent-acp
+            // Send the command that launches the remote ACP bridge/agent.
             var cmdBuf = ByteBufferAllocator().buffer(capacity: command.utf8.count + 1)
             cmdBuf.writeString(command + "\n")
             try await outbound.write(cmdBuf)

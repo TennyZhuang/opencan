@@ -14,6 +14,10 @@ final class Session {
     var createdAt: Date
     var lastUsedAt: Date
     var title: String?
+    /// Built-in agent identifier ("claude" / "codex") used for session creation.
+    var agentID: String?
+    /// ACP launch command that created the session.
+    var agentCommand: String?
 
     var workspace: Workspace?
 
@@ -22,6 +26,8 @@ final class Session {
         sessionCwd: String? = nil,
         historySessionId: String? = nil,
         historySessionCwd: String? = nil,
+        agentID: String? = nil,
+        agentCommand: String? = nil,
         workspace: Workspace? = nil
     ) {
         self.sessionId = sessionId
@@ -30,6 +36,8 @@ final class Session {
         self.historySessionCwd = historySessionCwd
         self.createdAt = Date()
         self.lastUsedAt = Date()
+        self.agentID = agentID
+        self.agentCommand = agentCommand
         self.workspace = workspace
     }
 }

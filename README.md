@@ -1,6 +1,6 @@
 # OpenCAN
 
-An iOS client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) that connects to `claude-agent-acp` over SSH. Chat with Claude through a native SwiftUI interface with streaming responses and tool call visualization.
+An iOS client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) that connects to ACP agents (for example `claude-agent-acp` or `codex-acp`) over SSH. Chat through a native SwiftUI interface with streaming responses and tool call visualization.
 
 ## Features
 
@@ -16,7 +16,7 @@ An iOS client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.
 - iOS 17.0+
 - Xcode 15+
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
-- A running `claude-agent-acp` server accessible via SSH
+- A reachable ACP launcher command on the remote host (for example `claude-agent-acp` or `codex-acp`)
 
 ## Build & Run
 

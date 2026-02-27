@@ -7,6 +7,8 @@ final class Node {
     var host: String
     var port: Int
     var username: String
+    /// Legacy per-node ACP command (kept for backward compatibility with
+    /// existing SwiftData stores after moving agent launch config to app-level settings).
     var command: String
 
     var sshKey: SSHKeyPair?

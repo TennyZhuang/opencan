@@ -36,10 +36,18 @@ struct UnifiedSession: Identifiable {
     let lastEventSeq: UInt64?
     let title: String?
     let lastUsedAt: Date?
+    let agentID: String?
     var id: String { sessionId }
 
     var displayState: String { daemonState ?? "history" }
     /// Even dead daemon sessions are resumable via history recovery.
     var isResumable: Bool { true }
     var displayTitle: String { title ?? String(sessionId.prefix(8)) }
+    var agentDisplayName: String? {
+        if let known = AgentCommandStore.agent(forAgentID: agentID)?.displayName {
+            return known
+        }
+        guard let agentID, !agentID.isEmpty else { return nil }
+        return agentID
+    }
 }
