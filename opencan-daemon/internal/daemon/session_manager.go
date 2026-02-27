@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/anthropics/opencan-daemon/internal/proxy"
 )
@@ -71,18 +72,84 @@ func (sm *SessionManager) GetSession(sessionID string) (*proxy.ACPProxy, bool) {
 // ListSessions returns info about all sessions.
 func (sm *SessionManager) ListSessions() []SessionInfo {
 	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
-	infos := make([]SessionInfo, 0, len(sm.sessions))
+	proxies := make([]*proxy.ACPProxy, 0, len(sm.sessions))
 	for _, p := range sm.sessions {
+		proxies = append(proxies, p)
+	}
+	sm.mu.RUnlock()
+
+	needsLoadabilityProbe := false
+	for _, p := range proxies {
+		if shouldFilterSessionFromList(p.State(), p.GetClient() == nil) {
+			needsLoadabilityProbe = true
+			break
+		}
+	}
+
+	var loadableSessionIDs map[string]struct{}
+	hasLoadableSet := false
+	if needsLoadabilityProbe {
+		loadableSessionIDs, hasLoadableSet = sm.loadableSessionSet(proxies)
+	}
+
+	infos := make([]SessionInfo, 0, len(proxies))
+	for _, p := range proxies {
+		state := p.State()
+		if shouldFilterSessionFromList(state, p.GetClient() == nil) && hasLoadableSet {
+			if _, ok := loadableSessionIDs[p.SessionID]; !ok {
+				sm.logger.Debug("hiding non-loadable session from list", "sessionId", p.SessionID, "state", state)
+				continue
+			}
+		}
 		infos = append(infos, SessionInfo{
 			SessionID:    p.SessionID,
 			CWD:          p.CWD,
-			State:        p.State(),
+			State:        state,
 			LastEventSeq: p.EventBuf().LastSeq(),
 		})
 	}
 	return infos
+}
+
+func (sm *SessionManager) loadableSessionSet(proxies []*proxy.ACPProxy) (map[string]struct{}, bool) {
+	var probe *proxy.ACPProxy
+	for _, p := range proxies {
+		state := p.State()
+		hasClient := p.GetClient() != nil
+		if (state == proxy.StateIdle || state == proxy.StateCompleted) && !hasClient {
+			probe = p
+			break
+		}
+		if probe == nil && state != proxy.StateDead && !hasClient {
+			probe = p
+		}
+	}
+	if probe == nil {
+		for _, p := range proxies {
+			if p.State() != proxy.StateDead {
+				probe = p
+				break
+			}
+		}
+	}
+
+	if probe == nil {
+		return nil, false
+	}
+
+	ids, err := probe.LoadableSessionIDs(1200 * time.Millisecond)
+	if err != nil {
+		sm.logger.Warn("session/loadability probe failed; returning unfiltered list", "error", err)
+		return nil, false
+	}
+	return ids, true
+}
+
+func shouldFilterSessionFromList(state proxy.SessionState, hasNoAttachedClient bool) bool {
+	if !hasNoAttachedClient {
+		return false
+	}
+	return state == proxy.StateIdle || state == proxy.StateCompleted
 }
 
 // KillSession terminates the ACP process for the given session.

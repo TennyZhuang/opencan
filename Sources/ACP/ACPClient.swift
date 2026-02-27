@@ -91,11 +91,11 @@ actor ACPClient {
             if let c = pendingRequests.removeValue(forKey: id) {
                 c.resume(returning: result)
             }
-        case .error(let id, let code, let msg, _):
+        case .error(let id, let code, let msg, let data):
             if let id {
                 sentRequestIds.remove(id)
                 if let c = pendingRequests.removeValue(forKey: id) {
-                    c.resume(throwing: ACPError.rpcError(code: code, message: msg))
+                    c.resume(throwing: ACPError.rpcError(code: code, message: msg, data: data))
                 }
             }
         case .notification(_, _):
@@ -169,13 +169,40 @@ actor ACPClient {
 }
 
 enum ACPError: Error, LocalizedError {
-    case rpcError(code: Int, message: String)
+    case rpcError(code: Int, message: String, data: JSONValue?)
     case unexpectedResponse
 
     var errorDescription: String? {
         switch self {
-        case .rpcError(_, let message): "ACP error: \(message)"
-        case .unexpectedResponse: "Unexpected ACP response"
+        case .rpcError(_, let message, let data):
+            if let details = data?["details"]?.stringValue, !details.isEmpty {
+                return "ACP error: \(message) (\(details))"
+            }
+            return "ACP error: \(message)"
+        case .unexpectedResponse:
+            return "Unexpected ACP response"
         }
+    }
+
+    /// Server-provided detail field carried in JSON-RPC error.data.details.
+    var details: String? {
+        guard case .rpcError(_, _, let data) = self else { return nil }
+        return data?["details"]?.stringValue
+    }
+
+    /// True for terminal lookup misses where retrying different cwd is pointless.
+    var isSessionNotFound: Bool {
+        guard case .rpcError(_, let message, let data) = self else { return false }
+        let details = data?["details"]?.stringValue ?? ""
+        let combined = "\(message) \(details)".lowercased()
+        return combined.contains("session not found")
+    }
+
+    /// True when the request was routed to a proxy we're not attached to.
+    var isNotAttached: Bool {
+        guard case .rpcError(_, let message, let data) = self else { return false }
+        let details = data?["details"]?.stringValue ?? ""
+        let combined = "\(message) \(details)".lowercased()
+        return combined.contains("not attached to session")
     }
 }

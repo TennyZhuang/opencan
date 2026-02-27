@@ -5,6 +5,17 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON_DIR="$ROOT_DIR/opencan-daemon"
 BUNDLE_RELATIVE_PATH="opencan-daemon-linux-amd64"
 
+# Xcode build scripts run in a non-login shell, so Homebrew paths are often
+# missing from PATH even when Go is installed.
+if ! command -v go >/dev/null 2>&1; then
+  for bin_dir in /opt/homebrew/bin /usr/local/bin; do
+    if [[ -x "$bin_dir/go" ]]; then
+      export PATH="$bin_dir:$PATH"
+      break
+    fi
+  done
+fi
+
 if [[ "${SKIP_DAEMON_BUNDLE_BUILD:-0}" == "1" ]]; then
   echo "Skipping daemon bundle build (SKIP_DAEMON_BUNDLE_BUILD=1)."
   exit 0

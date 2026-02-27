@@ -236,6 +236,56 @@ func TestDaemon_SessionCreate(t *testing.T) {
 	}
 }
 
+func TestDaemon_SessionListFiltersNonLoadableIdleSessions(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found, run 'make mock-acp' first")
+	}
+
+	// Simulate transient daemon-only sessions that do not appear in ACP session/list.
+	t.Setenv("MOCK_LIST_OMIT_CREATED", "1")
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.create",
+		"params": map[string]interface{}{
+			"cwd":     "/tmp",
+			"command": mockBin,
+		},
+	})
+	resp := readJSONWithScanner(t, scanner)
+	if resp["error"] != nil {
+		t.Fatalf("session.create error: %v", resp["error"])
+	}
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.list",
+		"params":  map[string]interface{}{},
+	})
+	resp = readJSONWithScanner(t, scanner)
+	if resp["error"] != nil {
+		t.Fatalf("session.list error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	sessions := result["sessions"].([]interface{})
+	if len(sessions) != 0 {
+		t.Fatalf("expected transient non-loadable session to be filtered, got %d entries", len(sessions))
+	}
+}
+
 func TestDaemon_SessionCreateAndPrompt(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {

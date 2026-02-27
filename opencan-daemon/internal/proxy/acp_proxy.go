@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/anthropics/opencan-daemon/internal/protocol"
 )
@@ -26,6 +27,7 @@ type PendingRequest struct {
 	OriginalID *protocol.JSONRPCID
 	Client     ClientConn
 	Method     string
+	ResponseCh chan *protocol.Message
 }
 
 // ACPProxy manages a single claude-agent-acp child process and its event buffer.
@@ -276,6 +278,10 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 	if pr.Client != nil {
 		pr.Client.Send(fwd)
 	}
+	if pr.ResponseCh != nil {
+		pr.ResponseCh <- msg.Clone()
+		close(pr.ResponseCh)
+	}
 
 	if pr.Method == protocol.MethodSessionPrompt && msg.IsError() {
 		p.handlePromptTerminalError()
@@ -360,6 +366,9 @@ func (p *ACPProxy) cancelAllPending() {
 		if pr.Client != nil && pr.OriginalID != nil {
 			errMsg := protocol.NewErrorResponse(*pr.OriginalID, -32000, "ACP process exited")
 			pr.Client.Send(errMsg)
+		}
+		if pr.ResponseCh != nil {
+			close(pr.ResponseCh)
 		}
 		delete(p.pendingRequests, id)
 	}
@@ -480,6 +489,102 @@ func (p *ACPProxy) ForwardFromClient(msg *protocol.Message, client ClientConn) e
 	}
 	// Direct forward (e.g., permission response from client)
 	return p.writeMessage(msg)
+}
+
+// LoadableSessionIDs queries ACP session/list and returns the set of history
+// session IDs that session/load can resolve.
+func (p *ACPProxy) LoadableSessionIDs(timeout time.Duration) (map[string]struct{}, error) {
+	resp, err := p.callACPRequest(protocol.MethodSessionList, map[string]interface{}{}, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("session/list error: %s", resp.Error.Message)
+	}
+
+	var payload struct {
+		Sessions []struct {
+			SessionID string `json:"sessionId"`
+		} `json:"sessions"`
+	}
+	if resp.Result != nil {
+		if err := json.Unmarshal(*resp.Result, &payload); err != nil {
+			return nil, fmt.Errorf("decode session/list result: %w", err)
+		}
+	}
+
+	ids := make(map[string]struct{}, len(payload.Sessions))
+	for _, s := range payload.Sessions {
+		if s.SessionID == "" {
+			continue
+		}
+		ids[s.SessionID] = struct{}{}
+	}
+	return ids, nil
+}
+
+func (p *ACPProxy) callACPRequest(method string, params interface{}, timeout time.Duration) (*protocol.Message, error) {
+	if p.State() == StateDead {
+		return nil, fmt.Errorf("session is dead")
+	}
+
+	paramsJSON, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("marshal %s params: %w", method, err)
+	}
+
+	internalID := p.nextInternalID.Add(1)
+	reqID := protocol.IntID(internalID)
+	respCh := make(chan *protocol.Message, 1)
+
+	p.pendingMu.Lock()
+	p.pendingRequests[internalID] = PendingRequest{
+		Method:     method,
+		ResponseCh: respCh,
+	}
+	p.pendingMu.Unlock()
+
+	if err := p.writeMessage(protocol.NewRequest(reqID, method, paramsJSON)); err != nil {
+		p.pendingMu.Lock()
+		delete(p.pendingRequests, internalID)
+		p.pendingMu.Unlock()
+		close(respCh)
+		return nil, err
+	}
+
+	if timeout <= 0 {
+		timeout = 1 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case resp, ok := <-respCh:
+		if !ok || resp == nil {
+			return nil, fmt.Errorf("%s request interrupted", method)
+		}
+		return resp, nil
+	case <-timer.C:
+		p.pendingMu.Lock()
+		if pr, ok := p.pendingRequests[internalID]; ok {
+			delete(p.pendingRequests, internalID)
+			if pr.ResponseCh != nil {
+				close(pr.ResponseCh)
+			}
+		}
+		p.pendingMu.Unlock()
+		return nil, fmt.Errorf("%s request timed out", method)
+	case <-p.doneCh:
+		p.pendingMu.Lock()
+		if pr, ok := p.pendingRequests[internalID]; ok {
+			delete(p.pendingRequests, internalID)
+			if pr.ResponseCh != nil {
+				close(pr.ResponseCh)
+			}
+		}
+		p.pendingMu.Unlock()
+		return nil, fmt.Errorf("ACP process exited")
+	}
 }
 
 // Kill terminates the ACP process.

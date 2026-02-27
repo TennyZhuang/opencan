@@ -2,9 +2,10 @@
 // It reads JSON-RPC from stdin and writes responses/notifications to stdout.
 //
 // Environment variables:
-//   MOCK_PROMPT_DELAY  - delay in ms between streaming events (default 50)
-//   MOCK_CRASH_AFTER   - crash after N events during prompt (0 = no crash)
-//   MOCK_TOOL_CALL     - include a tool call in prompt response (1 = yes)
+//
+//	MOCK_PROMPT_DELAY  - delay in ms between streaming events (default 50)
+//	MOCK_CRASH_AFTER   - crash after N events during prompt (0 = no crash)
+//	MOCK_TOOL_CALL     - include a tool call in prompt response (1 = yes)
 package main
 
 import (
@@ -19,6 +20,8 @@ import (
 var promptDelay = 50 * time.Millisecond
 var crashAfter = 0
 var includeToolCall = false
+var omitCreatedFromList = false
+var sessions []string
 
 func init() {
 	if v := os.Getenv("MOCK_PROMPT_DELAY"); v != "" {
@@ -33,6 +36,9 @@ func init() {
 	}
 	if os.Getenv("MOCK_TOOL_CALL") == "1" {
 		includeToolCall = true
+	}
+	if os.Getenv("MOCK_LIST_OMIT_CREATED") == "1" {
+		omitCreatedFromList = true
 	}
 }
 
@@ -115,6 +121,7 @@ func handleInitialize(id *json.RawMessage) {
 func handleSessionNew(id *json.RawMessage, params json.RawMessage) {
 	sessionCounter++
 	sessionID := fmt.Sprintf("mock-sess-%04d", sessionCounter)
+	sessions = append(sessions, sessionID)
 
 	respond(id, map[string]interface{}{
 		"sessionId": sessionID,
@@ -214,8 +221,17 @@ func handleSessionPrompt(id *json.RawMessage, params json.RawMessage) {
 }
 
 func handleSessionList(id *json.RawMessage) {
+	items := make([]map[string]interface{}, 0, len(sessions))
+	if !omitCreatedFromList {
+		for _, sid := range sessions {
+			items = append(items, map[string]interface{}{
+				"sessionId": sid,
+			})
+		}
+	}
+
 	respond(id, map[string]interface{}{
-		"sessions": []interface{}{},
+		"sessions": items,
 	})
 }
 

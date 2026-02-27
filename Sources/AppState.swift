@@ -267,7 +267,7 @@ final class AppState {
     /// Resume an existing session via daemon attach with event replay.
     /// Strategy depends on session state:
     /// - Running (prompting/draining): buffer replay + live streaming
-    /// - Completed/idle: daemon attach + session/load for full history
+    /// - Completed/idle: daemon attach + buffer replay (session/load only as backfill)
     /// - History (not in daemon): create new session + session/load old history
     func resumeSession(sessionId: String, modelContext: ModelContext) async throws {
         guard let daemon = daemonClient,
@@ -280,7 +280,8 @@ final class AppState {
             predicate: #Predicate { $0.sessionId == sessionId }
         )
         let existingSession = try? modelContext.fetch(sessionDescriptor).first
-        let daemonKnownCwd = daemonSessions.first(where: { $0.sessionId == sessionId })?.cwd
+        let daemonKnownSession = daemonSessions.first(where: { $0.sessionId == sessionId })
+        let daemonKnownCwd = daemonKnownSession?.cwd
         let historySessionId = existingSession?.historySessionId
         let sourceSessionId = historySessionId ?? sessionId
         let sourceSessionCwd: String? = if historySessionId != nil {
@@ -294,12 +295,13 @@ final class AppState {
         await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon)
 
         Log.toFile("[AppState] Attaching to session \(sessionId)...")
-        let lastSeq = lastEventSeq[sessionId] ?? 0
+        let shouldReplayFullBuffer = daemonKnownSession?.state == "idle" || daemonKnownSession?.state == "completed"
+        let desiredAttachSeq = shouldReplayFullBuffer ? 0 : (lastEventSeq[sessionId] ?? 0)
         let result: DaemonAttachResult
         do {
             result = try await daemon.attachSession(
                 sessionId: sessionId,
-                lastEventSeq: lastSeq
+                lastEventSeq: desiredAttachSeq
             )
         } catch {
             // Daemon doesn't know this session — recover via session/load
@@ -345,24 +347,33 @@ final class AppState {
                 Log.toFile("[AppState] Cleared isPrompting after draining/running session replay")
             }
         } else {
-            // Completed/idle session: use session/load for full history
-            isLoadingHistory = true
-            historyLoadSessionIds = [sessionId]
-            Log.toFile("[AppState] Loading full history via session/load for \(sessionId)...")
-            let primaryCwds = loadCwdCandidates(
-                preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
-                workspace: workspace
-            )
-            let loadedPrimaryCwd = await loadSessionFromCandidates(
-                sessionId: sessionId,
-                candidateCwds: primaryCwds
-            )
+            // Completed/idle session: prefer daemon buffer replay first.
+            // session/load is only used as a backfill when replay gives no visible history.
+            for buffered in result.bufferedEvents {
+                if let event = SessionUpdateParser.parse(buffered.event) {
+                    handleSessionEvent(event)
+                }
+                lastEventSeq[sessionId] = buffered.seq
+            }
 
-            if let loadedPrimaryCwd {
-                resolvedSessionCwd = loadedPrimaryCwd
-            } else {
-                var loadedHistory = false
-                if let historySessionId, historySessionId != sessionId {
+            let hasHistorySource = (historySessionId != nil && historySessionId != sessionId)
+            let hasVisibleReplay = hasRenderableConversation()
+            if !hasVisibleReplay || hasHistorySource {
+                isLoadingHistory = true
+                historyLoadSessionIds = [sessionId]
+                Log.toFile("[AppState] Loading history via session/load for \(sessionId)...")
+                let primaryCwds = loadCwdCandidates(
+                    preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
+                    workspace: workspace
+                )
+                let loadedPrimaryCwd = await loadSessionFromCandidates(
+                    sessionId: sessionId,
+                    candidateCwds: primaryCwds
+                )
+
+                if let loadedPrimaryCwd {
+                    resolvedSessionCwd = loadedPrimaryCwd
+                } else if let historySessionId, historySessionId != sessionId {
                     historyLoadSessionIds.insert(historySessionId)
                     let historyCwds = loadCwdCandidates(
                         preferred: [
@@ -378,21 +389,13 @@ final class AppState {
                         routeToSessionId: sessionId,
                         candidateCwds: historyCwds
                     ) {
-                        loadedHistory = true
                         existingSession?.historySessionCwd = loadedHistoryCwd
                     }
                 }
-
-                if !loadedHistory {
-                    Log.toFile("[AppState] session/load failed, falling back to buffer replay for \(sessionId)")
-                    // Fallback to buffer replay
-                    for buffered in result.bufferedEvents {
-                        if let event = SessionUpdateParser.parse(buffered.event) {
-                            handleSessionEvent(event)
-                        }
-                        lastEventSeq[sessionId] = buffered.seq
-                    }
-                }
+            } else {
+                Log.toFile(
+                    "[AppState] Resumed \(sessionId) via buffered replay (\(result.bufferedEvents.count) events), skipping session/load"
+                )
             }
             isLoadingHistory = false
             historyLoadSessionIds = []
@@ -821,9 +824,29 @@ final class AppState {
                 Log.toFile(
                     "[AppState] session/load failed for \(sessionId) (route: \(routeToSessionId ?? "none"), cwd: \(cwd)): \(error)"
                 )
+                // "Session not found" (or route session not attached) is terminal for this
+                // request; trying more cwd values cannot change the outcome.
+                if shouldStopSessionLoadRetries(after: error) {
+                    break
+                }
             }
         }
         return nil
+    }
+
+    /// Whether we should stop trying more cwd candidates for session/load.
+    private func shouldStopSessionLoadRetries(after error: Error) -> Bool {
+        guard let acpError = error as? ACPError else { return false }
+        return acpError.isSessionNotFound || acpError.isNotAttached
+    }
+
+    /// Returns true when replay produced any user-visible conversation/tool output.
+    private func hasRenderableConversation() -> Bool {
+        messages.contains {
+            guard $0.role != .system else { return false }
+            if !$0.toolCalls.isEmpty { return true }
+            return !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
     /// Detach the currently attached daemon session before switching to another one.
