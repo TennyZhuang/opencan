@@ -407,6 +407,84 @@ func TestDaemon_DisconnectAndReattach(t *testing.T) {
 	}
 }
 
+func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	defer conn1.Close()
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Client 1 creates and attaches a session.
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.create",
+		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
+	})
+	resp := readJSONWithScanner(t, scanner1)
+	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.attach",
+		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
+	})
+	resp = readJSONWithScanner(t, scanner1)
+	if resp["error"] != nil {
+		t.Fatalf("client1 attach error: %v", resp["error"])
+	}
+
+	// Client 2 cannot attach while client 1 owns the session.
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn2, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.attach",
+		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
+	})
+	resp = readJSONWithScanner(t, scanner2)
+	if resp["error"] == nil {
+		t.Fatal("expected attach rejection for second client")
+	}
+
+	// Once client 1 detaches, client 2 can attach successfully.
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "daemon/session.detach",
+		"params":  map[string]interface{}{"sessionId": sessionID},
+	})
+	resp = readJSONWithScanner(t, scanner1)
+	if resp["error"] != nil {
+		t.Fatalf("client1 detach error: %v", resp["error"])
+	}
+
+	sendJSON(conn2, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.attach",
+		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
+	})
+	resp = readJSONWithScanner(t, scanner2)
+	if resp["error"] != nil {
+		t.Fatalf("client2 attach after detach should succeed: %v", resp["error"])
+	}
+}
+
 func TestDaemon_SessionLoadRouteToSession(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {

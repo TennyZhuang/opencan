@@ -394,17 +394,39 @@ func (p *ACPProxy) EventBuf() *EventBuffer { return p.eventBuffer }
 
 // AttachClient sets the active client. Returns the resulting state.
 func (p *ACPProxy) AttachClient(c ClientConn) SessionState {
-	p.client.Store(&clientWrapper{conn: c})
-	state := p.State()
-	switch state {
-	case StateCompleted:
-		p.setState(StateIdle)
-		return StateIdle
-	case StateDraining:
-		p.setState(StatePrompting)
-		return StatePrompting
-	}
+	state, _ := p.TryAttachClient(c)
 	return state
+}
+
+// TryAttachClient attaches a client if no other client is attached.
+// Returns false when another client already owns the session.
+func (p *ACPProxy) TryAttachClient(c ClientConn) (SessionState, bool) {
+	for {
+		current := p.client.Load()
+		if current != nil {
+			if current.conn != c {
+				return p.State(), false
+			}
+		} else {
+			if !p.client.CompareAndSwap(nil, &clientWrapper{conn: c}) {
+				// Lost a race; re-check ownership.
+				continue
+			}
+		}
+
+		// Keep behavior identical to AttachClient for valid attaches.
+		p.client.Store(&clientWrapper{conn: c})
+		state := p.State()
+		switch state {
+		case StateCompleted:
+			p.setState(StateIdle)
+			return StateIdle, true
+		case StateDraining:
+			p.setState(StatePrompting)
+			return StatePrompting, true
+		}
+		return state, true
+	}
 }
 
 // DetachClient removes the client if it matches.

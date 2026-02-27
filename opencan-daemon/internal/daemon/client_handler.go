@@ -199,8 +199,12 @@ func (h *ClientHandler) handleSessionAttach(msg *protocol.Message) {
 		return
 	}
 
-	// Attach client
-	state := p.AttachClient(h)
+	// Attach client (single owner per session)
+	state, attached := p.TryAttachClient(h)
+	if !attached {
+		h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "session already attached by another client: "+params.SessionID))
+		return
+	}
 	h.attachedProxies[params.SessionID] = p
 
 	// Get buffered events since lastEventSeq
