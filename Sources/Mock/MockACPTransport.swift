@@ -266,4 +266,24 @@ actor MockACPTransport: ACPTransport {
     func setScenario(_ scenario: MockScenario) {
         self.scenario = scenario
     }
+
+    /// Testing hook: inject a session/update text delta notification.
+    func emitSessionTextDeltaForTest(sessionId: String, text: String, seq: Int? = nil) {
+        var params: [String: JSONValue] = [
+            "sessionId": .string(sessionId),
+            "update": .object([
+                "sessionUpdate": .string("agent_message_chunk"),
+                "content": .object([
+                    "type": .string("text"),
+                    "text": .string(text),
+                ])
+            ])
+        ]
+        if let seq {
+            params["__seq"] = .int(seq)
+        }
+        messageContinuation.yield(
+            .notification(method: ACPMethods.sessionUpdate, params: .object(params))
+        )
+    }
 }

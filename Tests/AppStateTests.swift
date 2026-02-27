@@ -212,6 +212,35 @@ final class AppStateTests: XCTestCase {
         XCTAssertLessThan(detachIndex, attachIndex, "Detach should happen before attaching the new session")
     }
 
+    func testIgnoresNotificationsFromOtherSessions() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let currentSessionId = try XCTUnwrap(appState.currentSessionId)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.emitSessionTextDeltaForTest(
+            sessionId: "foreign-session",
+            text: "ignore-this-event"
+        )
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(
+            appState.messages.contains { $0.content.contains("ignore-this-event") },
+            "Events from other sessions should not mutate the active chat"
+        )
+
+        await transport.emitSessionTextDeltaForTest(
+            sessionId: currentSessionId,
+            text: "accept-this-event"
+        )
+        try await waitFor(timeout: 2) {
+            self.appState.messages.contains { $0.content.contains("accept-this-event") }
+        }
+    }
+
     // MARK: - Resume Tests: Completed/Idle Session
 
     func testResumeCompletedSession() async throws {

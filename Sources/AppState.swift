@@ -47,6 +47,8 @@ final class AppState {
     private var isStreamingThought = false
     /// Per-session event sequence tracking for daemon replay.
     private var lastEventSeq: [String: UInt64] = [:]
+    /// Session IDs that are allowed to emit events during session/load history replay.
+    private var historyLoadSessionIds: Set<String> = []
 
     enum ConnectionStatus: Equatable {
         case disconnected
@@ -345,6 +347,7 @@ final class AppState {
         } else {
             // Completed/idle session: use session/load for full history
             isLoadingHistory = true
+            historyLoadSessionIds = [sessionId]
             Log.toFile("[AppState] Loading full history via session/load for \(sessionId)...")
             let primaryCwds = loadCwdCandidates(
                 preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
@@ -360,6 +363,7 @@ final class AppState {
             } else {
                 var loadedHistory = false
                 if let historySessionId, historySessionId != sessionId {
+                    historyLoadSessionIds.insert(historySessionId)
                     let historyCwds = loadCwdCandidates(
                         preferred: [
                             existingSession?.historySessionCwd,
@@ -391,6 +395,7 @@ final class AppState {
                 }
             }
             isLoadingHistory = false
+            historyLoadSessionIds = []
             // Ensure no stale streaming indicators
             for msg in messages where msg.isStreaming {
                 msg.isStreaming = false
@@ -466,6 +471,7 @@ final class AppState {
         // __routeToSession tells the daemon to forward this to the new session's ACP process,
         // while sessionId tells the ACP which conversation to load from disk.
         isLoadingHistory = true
+        historyLoadSessionIds = [sourceSessionId, newSessionId]
         Log.toFile("[AppState] Loading history of \(sourceSessionId) into new session \(newSessionId)...")
         let sourceLoadCwds = loadCwdCandidates(
             preferred: [sourceSessionCwd, workspace.path],
@@ -478,6 +484,7 @@ final class AppState {
         )
         let historyLoadFailed = loadedSourceCwd == nil
         isLoadingHistory = false
+        historyLoadSessionIds = []
         for msg in messages where msg.isStreaming {
             msg.isStreaming = false
         }
@@ -550,6 +557,7 @@ final class AppState {
         isPrompting = false
         isCreatingSession = false
         isLoadingHistory = false
+        historyLoadSessionIds = []
         // lastEventSeq intentionally kept — needed for reconnect replay
         // Stop ACP client and close transport asynchronously
         Task.detached {
@@ -622,15 +630,40 @@ final class AppState {
                 // Track __seq from daemon-forwarded notifications
                 if case .notification(_, let params) = notification,
                    let seq = params?["__seq"]?.intValue,
-                   let sid = self.currentSessionId {
-                    self.lastEventSeq[sid] = UInt64(seq)
+                   let routedSessionId = self.currentSessionId {
+                    self.lastEventSeq[routedSessionId] = UInt64(seq)
                 }
+
+                let notificationSessionId: String?
+                if case .notification(_, let params) = notification {
+                    notificationSessionId = params?["sessionId"]?.stringValue
+                } else {
+                    notificationSessionId = nil
+                }
+
+                guard self.shouldHandleSessionNotification(for: notificationSessionId) else {
+                    Log.toFile("[AppState] Ignoring event for non-active session \(notificationSessionId ?? "nil")")
+                    continue
+                }
+
                 guard let event = SessionUpdateParser.parse(notification) else { continue }
                 Log.toFile("[AppState] Session event: \(event)")
                 self.handleSessionEvent(event)
             }
             Log.toFile("[AppState] Notification listener ended")
         }
+    }
+
+    private func shouldHandleSessionNotification(for sessionId: String?) -> Bool {
+        guard let sessionId else { return true }
+        if sessionId == currentSessionId { return true }
+
+        // During session/load, history events can be emitted for the loaded source
+        // sessionId even though we're attached to a different live session.
+        if isLoadingHistory {
+            return historyLoadSessionIds.isEmpty || historyLoadSessionIds.contains(sessionId)
+        }
+        return false
     }
 
     private func handleSessionEvent(_ event: SessionEvent) {
