@@ -240,6 +240,7 @@ final class AppState {
             cwd: workspace.path,
             command: node.command  // "claude-agent-acp" passed to daemon
         )
+        await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon)
         self.currentSessionId = sessionId
         self.lastEventSeq[sessionId] = 0
 
@@ -287,6 +288,8 @@ final class AppState {
         }
 
         messages = []
+
+        await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon)
 
         Log.toFile("[AppState] Attaching to session \(sessionId)...")
         let lastSeq = lastEventSeq[sessionId] ?? 0
@@ -451,6 +454,8 @@ final class AppState {
             cwd: workspace.path,
             command: node.command
         )
+
+        await detachCurrentSessionIfNeeded(beforeAttaching: newSessionId, daemon: daemon)
 
         // Attach to the new session
         let _ = try await daemon.attachSession(sessionId: newSessionId, lastEventSeq: 0)
@@ -786,6 +791,18 @@ final class AppState {
             }
         }
         return nil
+    }
+
+    /// Detach the currently attached daemon session before switching to another one.
+    /// Detach failures are logged but do not block the new attach flow.
+    private func detachCurrentSessionIfNeeded(beforeAttaching targetSessionId: String, daemon: DaemonClient) async {
+        guard let currentSessionId, currentSessionId != targetSessionId else { return }
+        do {
+            try await daemon.detachSession(sessionId: currentSessionId)
+            Log.toFile("[AppState] Detached previous session \(currentSessionId)")
+        } catch {
+            Log.toFile("[AppState] Failed to detach previous session \(currentSessionId): \(error)")
+        }
     }
 
     private func addSystemMessage(_ text: String) {

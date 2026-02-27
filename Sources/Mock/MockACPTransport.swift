@@ -38,6 +38,8 @@ actor MockACPTransport: ACPTransport {
 
     /// Track all received methods in order.
     var receivedMethods: [String] = []
+    /// Track detached session IDs in order.
+    var detachedSessionIds: [String] = []
 
     init(scenario: MockScenario = .simple) {
         self.scenario = scenario
@@ -105,6 +107,9 @@ actor MockACPTransport: ACPTransport {
             messageContinuation.yield(.response(id: id, result: result))
 
         case DaemonMethods.sessionDetach:
+            if let sessionId = params?["sessionId"]?.stringValue {
+                detachedSessionIds.append(sessionId)
+            }
             messageContinuation.yield(.response(id: id, result: .object([:])))
 
         case DaemonMethods.sessionList:

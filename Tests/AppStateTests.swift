@@ -190,6 +190,28 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(appState.isPrompting, "Should be able to send after reconnect")
     }
 
+    func testResumeDifferentSessionDetachesPreviousAttachment() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let initialSessionId = try XCTUnwrap(appState.currentSessionId)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        await transport.setMockAttachState("idle")
+
+        try await appState.resumeSession(sessionId: "other-session", modelContext: modelContext)
+
+        let detachedSessionIds = await transport.getDetachedSessionIds()
+        XCTAssertEqual(detachedSessionIds.last, initialSessionId, "Should detach previous session before switching")
+
+        let receivedMethods = await transport.getReceivedMethods()
+        let detachIndex = try XCTUnwrap(receivedMethods.lastIndex(of: DaemonMethods.sessionDetach))
+        let attachIndex = try XCTUnwrap(receivedMethods.lastIndex(of: DaemonMethods.sessionAttach))
+        XCTAssertLessThan(detachIndex, attachIndex, "Detach should happen before attaching the new session")
+    }
+
     // MARK: - Resume Tests: Completed/Idle Session
 
     func testResumeCompletedSession() async throws {
@@ -649,5 +671,13 @@ extension MockACPTransport {
 
     func getLastLoadCwd() -> String? {
         lastLoadCwd
+    }
+
+    func getReceivedMethods() -> [String] {
+        receivedMethods
+    }
+
+    func getDetachedSessionIds() -> [String] {
+        detachedSessionIds
     }
 }
