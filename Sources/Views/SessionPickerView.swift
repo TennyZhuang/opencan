@@ -110,7 +110,8 @@ struct SessionPickerView: View {
                 lastEventSeq: daemon?.lastEventSeq,
                 title: local?.title,
                 lastUsedAt: local?.lastUsedAt,
-                agentID: local?.agentID
+                agentID: local?.agentID,
+                agentCommand: local?.agentCommand ?? daemon?.command
             )
         }
 

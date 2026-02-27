@@ -374,6 +374,41 @@ final class AppStateTests: XCTestCase {
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
     }
 
+    func testResumeLegacySessionUsesDaemonReportedCommand() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string("legacy-claude"),
+                "cwd": .string("/test/path"),
+                "state": .string("idle"),
+                "lastEventSeq": .int(7),
+                "command": .string("claude-agent-acp"),
+            ]
+        ])
+        await transport.setMockAttachState("idle")
+        await transport.setMockLoadSteps([
+            .userMessageChunk("hello"),
+            .textDelta("from history"),
+            .promptComplete(.endTurn),
+        ])
+        await appState.refreshDaemonSessions()
+
+        let session = Session(sessionId: "legacy-claude", workspace: workspace)
+        modelContext.insert(session)
+        try modelContext.save()
+
+        try await appState.resumeSession(sessionId: "legacy-claude", modelContext: modelContext)
+
+        XCTAssertEqual(appState.activeSession?.agentID, AgentKind.claude.rawValue)
+        XCTAssertEqual(appState.activeSession?.agentCommand, "claude-agent-acp")
+    }
+
     // MARK: - Resume Tests: Draining Session
 
     func testResumeDrainingSession() async throws {
@@ -540,6 +575,43 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(createdCommand, customCommand)
     }
 
+    func testResumeLegacyHistorySessionFallsBackToClaudeCommand() async throws {
+        let defaults = UserDefaults.standard
+        let defaultKey = AgentCommandStore.defaultAgentKey
+        let previousDefault = defaults.string(forKey: defaultKey)
+        defaults.set(AgentKind.codex.rawValue, forKey: defaultKey)
+        defer {
+            if let previousDefault {
+                defaults.set(previousDefault, forKey: defaultKey)
+            } else {
+                defaults.removeObject(forKey: defaultKey)
+            }
+        }
+
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAttachShouldFail(true)
+        await transport.setMockLoadSteps([
+            .userMessageChunk("legacy"),
+            .textDelta("history"),
+            .promptComplete(.endTurn),
+        ])
+
+        let session = Session(sessionId: "legacy-no-agent-metadata", workspace: workspace)
+        modelContext.insert(session)
+        try modelContext.save()
+
+        try await appState.resumeSession(sessionId: "legacy-no-agent-metadata", modelContext: modelContext)
+
+        let createdCommand = await transport.getLastCreateCommand()
+        XCTAssertEqual(createdCommand, AgentKind.claude.defaultCommand)
+    }
+
     func testResumeRecoveredSessionUsesOriginalHistorySource() async throws {
         try await connectMock()
 
@@ -691,7 +763,8 @@ final class AppStateTests: XCTestCase {
             lastEventSeq: 10,
             title: nil,
             lastUsedAt: nil,
-            agentID: nil
+            agentID: nil,
+            agentCommand: nil
         )
         XCTAssertEqual(u1.displayState, "idle")
         XCTAssertTrue(u1.isResumable)
@@ -704,7 +777,8 @@ final class AppStateTests: XCTestCase {
             lastEventSeq: nil,
             title: "My Session",
             lastUsedAt: Date(),
-            agentID: nil
+            agentID: nil,
+            agentCommand: nil
         )
         XCTAssertEqual(u2.displayState, "history")
         XCTAssertTrue(u2.isResumable)
@@ -717,7 +791,8 @@ final class AppStateTests: XCTestCase {
             lastEventSeq: 50,
             title: "Running Session",
             lastUsedAt: Date(),
-            agentID: nil
+            agentID: nil,
+            agentCommand: nil
         )
         XCTAssertEqual(u3.displayState, "prompting")
         XCTAssertTrue(u3.isResumable)
@@ -732,7 +807,8 @@ final class AppStateTests: XCTestCase {
             lastEventSeq: 0,
             title: nil,
             lastUsedAt: nil,
-            agentID: nil
+            agentID: nil,
+            agentCommand: nil
         )
         XCTAssertTrue(unified.isResumable)
         XCTAssertEqual(unified.displayState, "dead")
@@ -746,7 +822,8 @@ final class AppStateTests: XCTestCase {
             lastEventSeq: 1,
             title: nil,
             lastUsedAt: nil,
-            agentID: "custom-agent"
+            agentID: "custom-agent",
+            agentCommand: nil
         )
         XCTAssertEqual(unified.agentDisplayName, "custom-agent")
     }

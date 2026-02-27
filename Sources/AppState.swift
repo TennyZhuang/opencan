@@ -301,6 +301,7 @@ final class AppState {
         let existingSession = try? modelContext.fetch(sessionDescriptor).first
         let daemonKnownSession = daemonSessions.first(where: { $0.sessionId == sessionId })
         let daemonKnownCwd = daemonKnownSession?.cwd
+        let daemonKnownCommand = daemonKnownSession?.command
         let historySessionId = existingSession?.historySessionId
         let sourceSessionId = historySessionId ?? sessionId
         let sourceSessionCwd: String? = if historySessionId != nil {
@@ -310,7 +311,8 @@ final class AppState {
         }
         let sessionAgent = resolveSessionAgent(
             storedAgentID: existingSession?.agentID,
-            storedAgentCommand: existingSession?.agentCommand
+            storedAgentCommand: existingSession?.agentCommand,
+            daemonCommand: daemonKnownCommand
         )
 
         messages = []
@@ -837,18 +839,44 @@ final class AppState {
     /// Resolve persisted session agent metadata into a usable launcher command.
     private func resolveSessionAgent(
         storedAgentID: String?,
-        storedAgentCommand: String?
+        storedAgentCommand: String?,
+        daemonCommand: String?
     ) -> (id: String, command: String) {
-        let fallbackAgent = AgentCommandStore.defaultAgent()
-        let resolvedID = AgentCommandStore.agent(forAgentID: storedAgentID)?.rawValue ?? fallbackAgent.rawValue
-        let fallbackCommand = AgentCommandStore.command(forAgentID: resolvedID)
-        let resolvedCommand = normalizeAgentCommand(storedAgentCommand, fallback: fallbackCommand)
-        return (resolvedID, resolvedCommand)
+        let normalizedStoredCommand = normalizeOptionalAgentCommand(storedAgentCommand)
+        let normalizedDaemonCommand = normalizeOptionalAgentCommand(daemonCommand)
+
+        // Persisted metadata from the local session record has highest priority.
+        if let storedAgent = AgentCommandStore.agent(forAgentID: storedAgentID) {
+            return (
+                storedAgent.rawValue,
+                normalizedStoredCommand
+                    ?? normalizedDaemonCommand
+                    ?? AgentCommandStore.command(for: storedAgent)
+            )
+        }
+
+        // Legacy sessions (without local metadata): prefer daemon-reported command.
+        if let normalizedDaemonCommand {
+            let inferred = AgentCommandStore.inferAgent(fromCommand: normalizedDaemonCommand) ?? .claude
+            return (inferred.rawValue, normalizedDaemonCommand)
+        }
+
+        if let normalizedStoredCommand {
+            let inferred = AgentCommandStore.inferAgent(fromCommand: normalizedStoredCommand) ?? .claude
+            return (inferred.rawValue, normalizedStoredCommand)
+        }
+
+        // Final fallback for pre-agent-metadata sessions.
+        return (AgentKind.claude.rawValue, AgentCommandStore.command(for: .claude))
     }
 
     private func normalizeAgentCommand(_ command: String?, fallback: String) -> String {
+        normalizeOptionalAgentCommand(command) ?? fallback
+    }
+
+    private func normalizeOptionalAgentCommand(_ command: String?) -> String? {
         let trimmed = command?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let trimmed, !trimmed.isEmpty else { return fallback }
+        guard let trimmed, !trimmed.isEmpty else { return nil }
         return trimmed
     }
 

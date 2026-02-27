@@ -40,6 +40,24 @@ enum AgentCommandStore {
         return command(for: agent, defaults: defaults)
     }
 
+    /// Best-effort mapping from a raw launcher command back to a built-in agent.
+    static func inferAgent(fromCommand launcherCommand: String?) -> AgentKind? {
+        guard let raw = launcherCommand?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+
+        if raw.contains("codex-acp") { return .codex }
+        if raw.contains("claude-agent-acp") { return .claude }
+
+        for agent in AgentKind.allCases {
+            if raw == agent.defaultCommand || raw == command(for: agent) {
+                return agent
+            }
+        }
+        return nil
+    }
+
     static func defaultAgent(defaults: UserDefaults = .standard) -> AgentKind {
         guard let raw = defaults.string(forKey: defaultAgentKey),
               let agent = AgentKind(rawValue: raw) else {

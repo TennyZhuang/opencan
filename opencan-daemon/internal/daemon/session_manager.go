@@ -15,6 +15,7 @@ type SessionInfo struct {
 	CWD          string             `json:"cwd"`
 	State        proxy.SessionState `json:"state"`
 	LastEventSeq uint64             `json:"lastEventSeq"`
+	Command      string             `json:"command,omitempty"`
 }
 
 // SessionManager manages all ACPProxy instances.
@@ -106,6 +107,7 @@ func (sm *SessionManager) ListSessions() []SessionInfo {
 			CWD:          p.CWD,
 			State:        state,
 			LastEventSeq: p.EventBuf().LastSeq(),
+			Command:      p.Command,
 		})
 	}
 	return infos

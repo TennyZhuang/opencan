@@ -12,6 +12,7 @@ struct DaemonSessionInfo: Identifiable {
     let cwd: String
     let state: String      // "starting", "idle", "prompting", "draining", "completed", "dead"
     let lastEventSeq: UInt64
+    let command: String?
 
     var id: String { sessionId }
 }
@@ -37,6 +38,7 @@ struct UnifiedSession: Identifiable {
     let title: String?
     let lastUsedAt: Date?
     let agentID: String?
+    let agentCommand: String?
     var id: String { sessionId }
 
     var displayState: String { daemonState ?? "history" }
@@ -46,6 +48,9 @@ struct UnifiedSession: Identifiable {
     var agentDisplayName: String? {
         if let known = AgentCommandStore.agent(forAgentID: agentID)?.displayName {
             return known
+        }
+        if let inferred = AgentCommandStore.inferAgent(fromCommand: agentCommand) {
+            return inferred.displayName
         }
         guard let agentID, !agentID.isEmpty else { return nil }
         return agentID

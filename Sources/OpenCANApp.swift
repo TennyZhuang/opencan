@@ -20,7 +20,9 @@ struct OpenCANApp: App {
         WindowGroup {
             ContentView()
                 .environment(appState)
-                .onAppear { seedDemoDataIfNeeded() }
+                .onAppear {
+                    seedDemoDataIfNeeded()
+                }
         }
         .modelContainer(modelContainer)
     }

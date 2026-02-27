@@ -93,7 +93,8 @@ actor DaemonClient {
                 sessionId: id,
                 cwd: item["cwd"]?.stringValue ?? "",
                 state: item["state"]?.stringValue ?? "unknown",
-                lastEventSeq: UInt64(item["lastEventSeq"]?.intValue ?? 0)
+                lastEventSeq: UInt64(item["lastEventSeq"]?.intValue ?? 0),
+                command: item["command"]?.stringValue
             )
         }
     }

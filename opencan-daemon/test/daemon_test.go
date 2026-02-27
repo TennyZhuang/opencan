@@ -102,6 +102,20 @@ func readJSONWithScanner(t *testing.T, scanner *bufio.Scanner) map[string]interf
 	return result
 }
 
+// readResponseWithID scans until a JSON-RPC response/error with the requested id arrives.
+// Notifications can be interleaved before the response.
+func readResponseWithID(t *testing.T, scanner *bufio.Scanner, id float64) map[string]interface{} {
+	t.Helper()
+	for i := 0; i < 20; i++ {
+		msg := readJSONWithScanner(t, scanner)
+		if msgID, ok := msg["id"].(float64); ok && msgID == id {
+			return msg
+		}
+	}
+	t.Fatalf("response id %.0f not found after reading interleaved messages", id)
+	return nil
+}
+
 func TestDaemon_Hello(t *testing.T) {
 	d, sockPath := testDaemon(t)
 	defer d.Stop()
@@ -519,7 +533,7 @@ func TestDaemon_DisconnectAndReattach(t *testing.T) {
 		"method":  "daemon/session.create",
 		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
 	})
-	resp := readJSONWithScanner(t, scanner1)
+	resp := readResponseWithID(t, scanner1, 1)
 	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
 
 	sendJSON(conn1, map[string]interface{}{
@@ -603,7 +617,7 @@ func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
 		"method":  "daemon/session.create",
 		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
 	})
-	resp := readJSONWithScanner(t, scanner1)
+	resp := readResponseWithID(t, scanner1, 1)
 	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
 
 	sendJSON(conn1, map[string]interface{}{
@@ -612,7 +626,7 @@ func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
 		"method":  "daemon/session.attach",
 		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
 	})
-	resp = readJSONWithScanner(t, scanner1)
+	resp = readResponseWithID(t, scanner1, 2)
 	if resp["error"] != nil {
 		t.Fatalf("client1 attach error: %v", resp["error"])
 	}
@@ -630,7 +644,7 @@ func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
 		"method":  "daemon/session.attach",
 		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
 	})
-	resp = readJSONWithScanner(t, scanner2)
+	resp = readResponseWithID(t, scanner2, 1)
 	if resp["error"] == nil {
 		t.Fatal("expected attach rejection for second client")
 	}
@@ -642,7 +656,7 @@ func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
 		"method":  "daemon/session.detach",
 		"params":  map[string]interface{}{"sessionId": sessionID},
 	})
-	resp = readJSONWithScanner(t, scanner1)
+	resp = readResponseWithID(t, scanner1, 3)
 	if resp["error"] != nil {
 		t.Fatalf("client1 detach error: %v", resp["error"])
 	}
@@ -653,7 +667,7 @@ func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
 		"method":  "daemon/session.attach",
 		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
 	})
-	resp = readJSONWithScanner(t, scanner2)
+	resp = readResponseWithID(t, scanner2, 2)
 	if resp["error"] != nil {
 		t.Fatalf("client2 attach after detach should succeed: %v", resp["error"])
 	}
@@ -755,7 +769,7 @@ func TestDaemon_SessionLoadRouteToSession(t *testing.T) {
 		"method":  "daemon/session.attach",
 		"params":  map[string]interface{}{"sessionId": newSessionID, "lastEventSeq": 0},
 	})
-	resp = readJSONWithScanner(t, scanner)
+	resp = readResponseWithID(t, scanner, 2)
 	if resp["error"] != nil {
 		t.Fatalf("attach error: %v", resp["error"])
 	}
@@ -775,7 +789,7 @@ func TestDaemon_SessionLoadRouteToSession(t *testing.T) {
 		},
 	})
 
-	resp = readJSONWithScanner(t, scanner)
+	resp = readResponseWithID(t, scanner, 1001)
 
 	// Should succeed — the daemon routed to the new session's proxy
 	if resp["error"] != nil {
