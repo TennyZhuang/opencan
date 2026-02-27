@@ -145,6 +145,56 @@ func TestRouteResponse_PromptErrorClearsRunningState(t *testing.T) {
 	}
 }
 
+func TestRouteResponse_PromptSuccessClearsRunningState(t *testing.T) {
+	p := newTestProxy(StatePrompting, nil)
+	client := &fakeClientConn{}
+	p.AttachClient(client)
+
+	origID := protocol.IntID(8)
+	internalID := int64(102)
+	p.pendingRequests[internalID] = PendingRequest{
+		OriginalID: &origID,
+		Client:     client,
+		Method:     protocol.MethodSessionPrompt,
+	}
+
+	result, _ := json.Marshal(map[string]interface{}{
+		"stopReason": "end_turn",
+	})
+	resp := protocol.NewResponse(protocol.IntID(internalID), result)
+
+	p.routeResponse(resp)
+
+	if p.State() != StateIdle {
+		t.Fatalf("proxy state = %v, want %v", p.State(), StateIdle)
+	}
+	if len(client.sent) != 1 {
+		t.Fatalf("forwarded messages = %d, want 1", len(client.sent))
+	}
+	if client.sent[0].ID == nil || client.sent[0].ID.IntValue() != origID.IntValue() {
+		t.Fatalf("forwarded ID = %v, want %v", client.sent[0].ID, origID)
+	}
+}
+
+func TestRouteResponse_PromptSuccessClearsDrainingStateWithoutClient(t *testing.T) {
+	p := newTestProxy(StateDraining, nil)
+	internalID := int64(103)
+	p.pendingRequests[internalID] = PendingRequest{
+		Method: protocol.MethodSessionPrompt,
+	}
+
+	result, _ := json.Marshal(map[string]interface{}{
+		"stopReason": "end_turn",
+	})
+	resp := protocol.NewResponse(protocol.IntID(internalID), result)
+
+	p.routeResponse(resp)
+
+	if p.State() != StateCompleted {
+		t.Fatalf("proxy state = %v, want %v", p.State(), StateCompleted)
+	}
+}
+
 func TestSetState_DeadIsTerminal(t *testing.T) {
 	p := newTestProxy(StateDead, nil)
 

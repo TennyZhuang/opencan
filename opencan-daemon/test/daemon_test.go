@@ -377,6 +377,127 @@ func TestDaemon_SessionCreateAndPrompt(t *testing.T) {
 	}
 }
 
+func TestDaemon_PromptResponseWithoutPromptCompleteStillEndsPrompting(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+	t.Setenv("MOCK_OMIT_PROMPT_COMPLETE", "1")
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Create session.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.create",
+		"params": map[string]interface{}{
+			"cwd":     "/tmp",
+			"command": mockBin,
+		},
+	})
+	resp := readJSONWithScanner(t, scanner)
+	if resp["error"] != nil {
+		t.Fatalf("session.create error: %v", resp["error"])
+	}
+	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+
+	// Attach session.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.attach",
+		"params": map[string]interface{}{
+			"sessionId":    sessionID,
+			"lastEventSeq": 0,
+		},
+	})
+	resp = readJSONWithScanner(t, scanner)
+	if resp["error"] != nil {
+		t.Fatalf("session.attach error: %v", resp["error"])
+	}
+
+	// Prompt. Mock omits prompt_complete but still returns stopReason.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1001,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": sessionID,
+			"prompt": []map[string]interface{}{
+				{"type": "text", "text": "hello"},
+			},
+		},
+	})
+
+	sawPromptComplete := false
+	for {
+		msg := readJSONWithScanner(t, scanner)
+		if method, ok := msg["method"].(string); ok {
+			if method == "session/update" {
+				params, _ := msg["params"].(map[string]interface{})
+				update, _ := params["update"].(map[string]interface{})
+				if update["sessionUpdate"] == "prompt_complete" {
+					sawPromptComplete = true
+				}
+			}
+			continue
+		}
+		if msgID, ok := msg["id"].(float64); ok && msgID == 1001 {
+			result := msg["result"].(map[string]interface{})
+			if result["stopReason"] != "end_turn" {
+				t.Fatalf("unexpected stopReason: %v", result["stopReason"])
+			}
+			break
+		}
+	}
+	if sawPromptComplete {
+		t.Fatal("mock unexpectedly emitted prompt_complete")
+	}
+
+	// Prompt lifecycle should still terminate in daemon state machine.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2001,
+		"method":  "daemon/session.list",
+		"params":  map[string]interface{}{},
+	})
+	resp = readJSONWithScanner(t, scanner)
+	if resp["error"] != nil {
+		t.Fatalf("session.list error: %v", resp["error"])
+	}
+	sessions := resp["result"].(map[string]interface{})["sessions"].([]interface{})
+	if len(sessions) == 0 {
+		t.Fatal("expected at least one session")
+	}
+
+	state := ""
+	for _, item := range sessions {
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if entry["sessionId"] == sessionID {
+			state, _ = entry["state"].(string)
+			break
+		}
+	}
+	if state == "" {
+		t.Fatalf("session %s not found in session.list", sessionID)
+	}
+	if state != "idle" {
+		t.Fatalf("session state = %q, want %q", state, "idle")
+	}
+}
+
 func TestDaemon_DisconnectAndReattach(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {

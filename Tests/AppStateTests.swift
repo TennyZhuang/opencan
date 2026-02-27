@@ -151,6 +151,33 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(userMessages.count, 2, "Should have two user messages")
     }
 
+    func testSendMessageWithoutPromptCompleteStillClearsPrompting() async throws {
+        try await connectMock(scenario: .missingPromptComplete)
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.sendMessage("Hello")
+        XCTAssertTrue(appState.isPrompting, "isPrompting should be true after send")
+
+        // No prompt_complete is emitted, so completion must still happen via
+        // terminal session/prompt response fallback.
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        XCTAssertFalse(appState.isPrompting, "isPrompting should clear on terminal prompt response")
+        XCTAssertFalse(
+            appState.messages.contains { $0.role == .assistant && $0.isStreaming },
+            "No assistant messages should remain streaming after prompt response"
+        )
+
+        let assistantText = appState.messages
+            .filter { $0.role == .assistant }
+            .map(\.content)
+            .joined()
+        XCTAssertTrue(
+            assistantText.contains("omits prompt_complete"),
+            "Assistant output should still be rendered, got: \(assistantText)"
+        )
+    }
+
     func testSendWhilePromptingIsBlocked() async throws {
         try await connectMock(scenario: .complex) // slower scenario
         try await appState.createNewSession(modelContext: modelContext)

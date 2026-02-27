@@ -193,9 +193,10 @@ final class OpenCANUITests: XCTestCase {
             "Sessions section should appear after creating a session"
         )
 
-        // Find the session cell by matching text that starts with "mock-sess-"
+        // Session rows display a truncated session id when there's no title.
+        // For mock sessions this starts with "mock-ses".
         let mockSessionText = app.staticTexts.matching(
-            NSPredicate(format: "label BEGINSWITH 'mock-sess-'")
+            NSPredicate(format: "label BEGINSWITH 'mock-ses'")
         )
         XCTAssertTrue(
             mockSessionText.firstMatch.waitForExistence(timeout: 3),

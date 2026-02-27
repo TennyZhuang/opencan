@@ -4,6 +4,8 @@ import Foundation
 enum MockScenario {
     /// Simple text reply, no tool calls.
     case simple
+    /// Simple text reply but intentionally omits prompt_complete.
+    case missingPromptComplete
     /// Reply with a tool call (e.g. Read file), then text after.
     case withToolCall
     /// Reply with extended thinking, then text.
@@ -25,6 +27,16 @@ enum MockScenario {
                 .textDelta("How can I help you today?"),
                 .delay(milliseconds: 50),
                 .promptComplete(.endTurn),
+            ]
+
+        case .missingPromptComplete:
+            return [
+                .delay(milliseconds: 100),
+                .textDelta("Hello! "),
+                .delay(milliseconds: 50),
+                .textDelta("I'm the mock assistant. "),
+                .delay(milliseconds: 50),
+                .textDelta("This stream intentionally omits prompt_complete."),
             ]
 
         case .withToolCall:

@@ -98,6 +98,23 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 - `lastAssistantMessage()` sets `isStreaming` to `isPrompting` (not hardcoded `true`) so notifications arriving outside a prompt (e.g., after `session/load`) don't leave stale spinners.
 - `agent_thought_chunk` events are streamed as `thoughtDelta` with a `\n> ` prefix on the first chunk (matching the blockquote style of full `thought` events). An `isStreamingThought` flag tracks this across chunks.
 
+## Message Delivery Contract (Normative)
+
+This is the end-to-end contract for "agent output reaches UI" and is treated as a regression boundary.
+
+1. **Prompt lifecycle must terminate:** every `session/prompt` must drive daemon/UI out of running state via at least one terminal signal:
+   - `session/update` with `sessionUpdate: "prompt_complete"`, or
+   - JSON-RPC error response for `session/prompt`, or
+   - JSON-RPC success response for `session/prompt` (for fallback if `prompt_complete` is missing).
+2. **No stale daemon running state:** after a terminal prompt signal, daemon session state MUST NOT remain `prompting`/`draining`; it transitions to `idle` (attached client) or `completed` (detached/draining).
+3. **Delivery + replay ordering:** every forwarded `session/update` carries `__seq`; `daemon/session.attach(lastEventSeq)` replays all buffered events with `seq > lastEventSeq` in order.
+4. **Scoped UI application:** AppState only applies active-session updates (plus explicitly tracked history-load source sessions). Other-session updates are ignored with log context.
+5. **Renderable output guarantee:** parsed assistant/user/tool/thought updates must mutate `AppState.messages` so terminal user-visible content is preserved after live stream or replay.
+
+**Contract regression tests to keep green:**
+- Daemon unit/integration: `TestRouteResponse_PromptSuccessClearsRunningState`, `TestRouteResponse_PromptSuccessClearsDrainingStateWithoutClient`, `TestDaemon_PromptResponseWithoutPromptCompleteStillEndsPrompting`.
+- iOS AppState flows: `testNewSessionSendMessage`, `testSendMessageWithoutPromptCompleteStillClearsPrompting`, `testIgnoresNotificationsFromOtherSessions`, `testResumeDrainingPromptCompleteInBuffer`, `testResumeHistorySession`.
+
 **Scroll behavior:**
 - `contentVersion` (debounced via 150ms `Task.sleep`) drives auto-scroll. The delay lets MarkdownView (UIKit-backed) finish async layout before `scrollTo` fires, avoiding scroll-past-content into blank space.
 - `forceScrollToBottom` is set when the user sends a message — always scrolls to bottom regardless of current position.

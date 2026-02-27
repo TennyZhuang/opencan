@@ -283,8 +283,8 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 		close(pr.ResponseCh)
 	}
 
-	if pr.Method == protocol.MethodSessionPrompt && msg.IsError() {
-		p.handlePromptTerminalError()
+	if pr.Method == protocol.MethodSessionPrompt && (msg.IsResponse() || msg.IsError()) {
+		p.handlePromptTerminalResponse()
 	}
 }
 
@@ -336,19 +336,16 @@ func (p *ACPProxy) buildAutoApproveResponse(msg *protocol.Message) *protocol.Mes
 }
 
 func (p *ACPProxy) handlePromptComplete() {
-	switch p.State() {
-	case StatePrompting, StateDraining:
-		if p.GetClient() != nil {
-			p.setState(StateIdle)
-		} else {
-			p.setState(StateCompleted)
-		}
-	}
+	p.finishPromptLifecycle()
 }
 
-// handlePromptTerminalError clears stale running states if a prompt request
-// fails before emitting prompt_complete.
-func (p *ACPProxy) handlePromptTerminalError() {
+// handlePromptTerminalResponse clears stale running states when a prompt
+// request reaches a terminal response without emitting prompt_complete.
+func (p *ACPProxy) handlePromptTerminalResponse() {
+	p.finishPromptLifecycle()
+}
+
+func (p *ACPProxy) finishPromptLifecycle() {
 	switch p.State() {
 	case StatePrompting, StateDraining:
 		if p.GetClient() != nil {

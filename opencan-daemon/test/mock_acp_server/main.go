@@ -6,6 +6,7 @@
 //	MOCK_PROMPT_DELAY  - delay in ms between streaming events (default 50)
 //	MOCK_CRASH_AFTER   - crash after N events during prompt (0 = no crash)
 //	MOCK_TOOL_CALL     - include a tool call in prompt response (1 = yes)
+//	MOCK_OMIT_PROMPT_COMPLETE - skip prompt_complete notification (1 = yes)
 package main
 
 import (
@@ -20,6 +21,7 @@ import (
 var promptDelay = 50 * time.Millisecond
 var crashAfter = 0
 var includeToolCall = false
+var omitPromptComplete = false
 var omitCreatedFromList = false
 var sessions []string
 
@@ -36,6 +38,9 @@ func init() {
 	}
 	if os.Getenv("MOCK_TOOL_CALL") == "1" {
 		includeToolCall = true
+	}
+	if os.Getenv("MOCK_OMIT_PROMPT_COMPLETE") == "1" {
+		omitPromptComplete = true
 	}
 	if os.Getenv("MOCK_LIST_OMIT_CREATED") == "1" {
 		omitCreatedFromList = true
@@ -209,11 +214,13 @@ func handleSessionPrompt(id *json.RawMessage, params json.RawMessage) {
 		},
 	})
 
-	// Prompt complete
-	sendEvent(map[string]interface{}{
-		"sessionUpdate": "prompt_complete",
-		"stopReason":    "end_turn",
-	})
+	if !omitPromptComplete {
+		// Prompt complete
+		sendEvent(map[string]interface{}{
+			"sessionUpdate": "prompt_complete",
+			"stopReason":    "end_turn",
+		})
+	}
 
 	respond(id, map[string]interface{}{
 		"stopReason": "end_turn",
