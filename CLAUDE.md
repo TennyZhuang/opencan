@@ -12,8 +12,8 @@ xcodegen generate
 xcodebuild -scheme OpenCAN -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -quiet build
 
 # Note: OpenCAN target has a post-build script that cross-compiles the
-# daemon to opencan-daemon/bin/opencan-daemon-linux-amd64 (gitignored cache)
-# and copies it into the app bundle as opencan-daemon-linux-amd64.
+# daemon directly into the app bundle as opencan-daemon-linux-amd64
+# on every build.
 # Set SKIP_DAEMON_BUNDLE_BUILD=1 to skip this in local builds.
 
 # Install and launch on simulator (replace UDID as needed)
