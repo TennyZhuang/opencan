@@ -2,6 +2,7 @@ MODULE := github.com/anthropics/opencan-daemon
 BINARY := opencan-daemon
 VERSION := 0.1.0
 TARGETS := linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
+IOS_BUNDLE_OUTPUT ?= ../Resources/$(BINARY)-linux-amd64
 
 .PHONY: build test test-integration clean build-all mock-acp install-ios
 
@@ -25,9 +26,10 @@ build-all:
 
 # Build linux-amd64 and copy to iOS app Resources for auto-deploy
 install-ios:
+	@mkdir -p "$(dir $(IOS_BUNDLE_OUTPUT))"
 	GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=$(VERSION)" \
-		-o ../Resources/$(BINARY)-linux-amd64 ./cmd/opencan-daemon
-	@echo "Installed to ../Resources/$(BINARY)-linux-amd64"
+		-o "$(IOS_BUNDLE_OUTPUT)" ./cmd/opencan-daemon
+	@echo "Installed to $(IOS_BUNDLE_OUTPUT)"
 
 mock-acp:
 	go build -o bin/mock-acp-server ./test/mock_acp_server

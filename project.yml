@@ -22,9 +22,17 @@ targets:
       - Sources
       - path: Resources
         buildPhase: resources
+        excludes:
+          - opencan-daemon-linux-amd64
     dependencies:
       - package: Citadel
       - package: MarkdownView
+    postBuildScripts:
+      - name: Build bundled daemon
+        script: |
+          set -euo pipefail
+          "${SRCROOT}/Scripts/build-daemon-bundle.sh"
+        basedOnDependencyAnalysis: false
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES

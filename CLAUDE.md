@@ -11,6 +11,11 @@ xcodegen generate
 # Build for iOS Simulator
 xcodebuild -scheme OpenCAN -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -quiet build
 
+# Note: OpenCAN target has a post-build script that cross-compiles the
+# daemon to opencan-daemon/bin/opencan-daemon-linux-amd64 (gitignored cache)
+# and copies it into the app bundle as opencan-daemon-linux-amd64.
+# Set SKIP_DAEMON_BUNDLE_BUILD=1 to skip this in local builds.
+
 # Install and launch on simulator (replace UDID as needed)
 SIM=363362BD-4565-4127-AD34-255975041E1E
 APP=$(find ~/Library/Developer/Xcode/DerivedData/OpenCAN-*/Build/Products/Debug-iphonesimulator -name "OpenCAN.app" -maxdepth 1 | head -1)
@@ -115,7 +120,7 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to `claude-ag
 
 **Daemon architecture:**
 - `opencan-daemon/` contains the Go daemon source. See `docs/daemon-architecture.md` for full design.
-- **Auto-deploy:** On first connect, `SSHConnectionManager.ensureDaemonInstalled()` checks for `~/.opencan/bin/opencan-daemon` on the server. If missing, uploads the linux-amd64 binary from the iOS app bundle via SFTP. Rebuild with `cd opencan-daemon && make install-ios` after daemon changes.
+- **Auto-deploy:** On first connect, `SSHConnectionManager.ensureDaemonInstalled()` checks for `~/.opencan/bin/opencan-daemon` on the server. If missing, uploads the linux-amd64 binary from the iOS app bundle via SFTP. App builds automatically refresh this bundled daemon binary; `cd opencan-daemon && make install-ios` remains available for manual rebuilds.
 - ACPProxy state machine: Starting → Idle → Prompting → Draining → Completed → Dead.
 - EventBuffer: ring buffer (max 100000) with sequence numbers for reconnect replay. Eviction copies to a new slice to avoid retaining the old backing array.
 - `daemon/session.attach` returns buffered events since `lastEventSeq`; iOS replays them through `SessionUpdateParser`.
