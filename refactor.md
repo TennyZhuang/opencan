@@ -180,6 +180,23 @@ iOS:
 
 ## Web-Searched Backlog (Not Yet Implemented)
 
+### [In Progress] UI trial: `ListViewKit` chat timeline
+- Date: 2026-02-28
+- Scope:
+  - Added `ListViewKit` dependency and replaced `ChatView`'s `ScrollView + LazyVStack` timeline with a UIKit-backed `ChatMessageListView`.
+  - Kept existing bubble/tool-call visual style by rendering the same markdown + tool cards in hosted row views.
+- Files:
+  - `Sources/Views/ChatView.swift`
+  - `Sources/Views/ChatMessageListView.swift`
+  - `project.yml`
+  - `Package.swift`
+- Validation:
+  - `xcodebuild -scheme OpenCAN -destination "platform=iOS Simulator,name=iPhone 17 Pro" -quiet build` ✅
+- Follow-up before final acceptance:
+  - Manual check for row-height correctness while markdown streams.
+  - Manual check for near-bottom auto-follow behavior during long prompts.
+  - Decide whether to keep hosted SwiftUI rows or migrate row internals to pure UIKit (for better measurement predictability).
+
 ### UI candidate: `ListViewKit` (high priority for scroll stability)
 - Repo: https://github.com/Lakr233/ListViewKit
 - Why it matches this codebase:

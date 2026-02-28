@@ -7,6 +7,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/orlandos-nl/Citadel", from: "0.7.0"),
         .package(url: "https://github.com/Lakr233/MarkdownView", from: "3.4.0"),
+        .package(url: "https://github.com/Lakr233/ListViewKit", branch: "main"),
     ],
     targets: [
         .executableTarget(
@@ -14,6 +15,7 @@ let package = Package(
             dependencies: [
                 "Citadel",
                 .product(name: "MarkdownView", package: "MarkdownView"),
+                .product(name: "ListViewKit", package: "ListViewKit"),
             ],
             path: "Sources",
             resources: [
