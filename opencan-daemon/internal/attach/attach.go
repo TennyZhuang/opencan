@@ -66,14 +66,7 @@ func startDaemon() error {
 		return err
 	}
 
-	cmd := exec.Command(exePath, "start", "--foreground")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true, // Detach from terminal session
-	}
-	// Daemon logs to file, not stdout/stderr
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.Stdin = nil
+	cmd := exec.Command(exePath, "start")
 
 	if err := cmd.Start(); err != nil {
 		return err

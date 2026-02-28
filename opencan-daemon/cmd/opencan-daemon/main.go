@@ -10,6 +10,7 @@ import (
 
 	"github.com/anthropics/opencan-daemon/internal/attach"
 	"github.com/anthropics/opencan-daemon/internal/daemon"
+	godaemon "github.com/sevlyar/go-daemon"
 	"github.com/spf13/cobra"
 )
 
@@ -40,10 +41,23 @@ func startCmd() *cobra.Command {
 		Use:   "start",
 		Short: "Start the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			var daemonCtx *godaemon.Context
 			if !foreground {
-				// TODO: fork self with --foreground
-				fmt.Fprintln(os.Stderr, "Background mode not yet implemented, use --foreground")
-				os.Exit(1)
+				daemonCtx = &godaemon.Context{
+					// Re-exec as foreground child so daemon.Run stays unchanged.
+					Args: daemonizedArgs(verbose),
+				}
+				child, err := daemonCtx.Reborn()
+				if err != nil {
+					return fmt.Errorf("daemonize: %w", err)
+				}
+				if child != nil {
+					// Parent exits successfully; child continues in foreground mode.
+					return nil
+				}
+				defer func() {
+					_ = daemonCtx.Release()
+				}()
 			}
 
 			level := slog.LevelInfo
@@ -73,6 +87,14 @@ func startCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&foreground, "foreground", false, "Run in foreground (don't daemonize)")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Enable debug logging")
 	return cmd
+}
+
+func daemonizedArgs(verbose bool) []string {
+	args := []string{os.Args[0], "start", "--foreground"}
+	if verbose {
+		args = append(args, "--verbose")
+	}
+	return args
 }
 
 func attachCmd() *cobra.Command {
