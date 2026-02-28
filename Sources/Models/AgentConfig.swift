@@ -1,7 +1,7 @@
 import Foundation
 
 /// Built-in ACP agent integrations.
-enum AgentKind: String, CaseIterable, Identifiable {
+enum AgentKind: String, CaseIterable, Identifiable, Hashable {
     case claude
     case codex
 

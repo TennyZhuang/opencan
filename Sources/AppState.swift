@@ -17,6 +17,8 @@ final class AppState {
 
     // Daemon sessions (replaces remoteSessions)
     var daemonSessions: [DaemonSessionInfo] = []
+    /// Built-in agents whose ACP launch commands are available on the connected node.
+    var availableNodeAgents: [AgentKind] = AgentKind.allCases
 
     // Chat
     var messages: [ChatMessage] = []
@@ -51,6 +53,8 @@ final class AppState {
     private var historyLoadSessionIds: Set<String> = []
     private var historyLoadCleanupTask: Task<Void, Never>?
     private var historyLoadGeneration: UInt64 = 0
+    /// Guards against concurrent `refreshDaemonSessions` calls.
+    private var isRefreshingDaemonSessions = false
 
     enum ConnectionStatus: Equatable {
         case disconnected
@@ -159,6 +163,7 @@ final class AppState {
                 }
                 self.daemonClient = daemon
                 self.daemonSessions = info.sessions
+                await self.refreshAvailableAgents()
                 Log.app.info("Daemon connected: v\(info.daemonVersion), \(info.sessions.count) sessions")
                 Log.toFile("[AppState] Daemon connected: v\(info.daemonVersion)")
 
@@ -206,6 +211,7 @@ final class AppState {
                 let info = try await daemon.hello()
                 self.daemonClient = daemon
                 self.daemonSessions = info.sessions
+                await self.refreshAvailableAgents()
                 Log.toFile("[AppState] Mock daemon connected")
 
                 startNotificationListener()
@@ -221,21 +227,58 @@ final class AppState {
     }
 
     /// Refresh daemon session snapshot used by SessionPicker state badges.
+    /// Concurrent calls are coalesced — if a refresh is already in flight,
+    /// subsequent calls wait for it instead of issuing a duplicate request.
     func refreshDaemonSessions() async {
         guard let daemon = daemonClient else { return }
+        guard !isRefreshingDaemonSessions else { return }
+        isRefreshingDaemonSessions = true
+        defer { isRefreshingDaemonSessions = false }
         if let updated = try? await daemon.listSessions() {
             self.daemonSessions = updated
         }
     }
 
+    /// Probe remote ACP launch command availability for built-in agents.
+    func refreshAvailableAgents() async {
+        guard let daemon = daemonClient else { return }
+
+        let probeRequests = AgentKind.allCases.map { agent in
+            (id: agent.rawValue, command: AgentCommandStore.command(for: agent))
+        }
+
+        do {
+            let results = try await daemon.probeAgents(probeRequests)
+            let availableIDs = Set(results.filter(\.available).map(\.id))
+            let available = AgentKind.allCases.filter { availableIDs.contains($0.rawValue) }
+            self.availableNodeAgents = available
+            Log.toFile("[AppState] Agent probe: available=\(available.map(\.rawValue).joined(separator: ","))")
+        } catch {
+            // Backward compatibility: old daemon versions don't support probing.
+            self.availableNodeAgents = AgentKind.allCases
+            Log.toFile("[AppState] Agent probe failed, falling back to all agents: \(error)")
+        }
+    }
+
     /// Create a new ACP session via the daemon using the app's default agent.
     func createNewSession(modelContext: ModelContext) async throws {
-        let defaultAgent = AgentCommandStore.defaultAgent()
-        try await createNewSession(modelContext: modelContext, agent: defaultAgent)
+        let preferredAgent = AgentCommandStore.defaultAgent()
+        if availableNodeAgents.contains(preferredAgent) {
+            try await createNewSession(modelContext: modelContext, agent: preferredAgent)
+            return
+        }
+        if let fallbackAgent = availableNodeAgents.first {
+            try await createNewSession(modelContext: modelContext, agent: fallbackAgent)
+            return
+        }
+        throw AppStateError.noAvailableAgents
     }
 
     /// Create a new ACP session via the daemon using a specific built-in agent.
     func createNewSession(modelContext: ModelContext, agent: AgentKind) async throws {
+        guard availableNodeAgents.contains(agent) else {
+            throw AppStateError.agentUnavailable(agent.displayName)
+        }
         let command = AgentCommandStore.command(for: agent)
         try await createNewSession(
             modelContext: modelContext,
@@ -613,6 +656,8 @@ final class AppState {
         isPrompting = false
         isCreatingSession = false
         isLoadingHistory = false
+        isRefreshingDaemonSessions = false
+        availableNodeAgents = AgentKind.allCases
         historyLoadSessionIds = []
         historyLoadGeneration = 0
         // lastEventSeq intentionally kept — needed for reconnect replay
@@ -663,7 +708,6 @@ final class AppState {
                     msg.isStreaming = false
                 }
                 self.isPrompting = false
-                await self.refreshDaemonSessions()
             } catch {
                 Log.toFile("[AppState] sendPrompt error: \(error)")
                 self.presentPromptError(error)
@@ -671,7 +715,6 @@ final class AppState {
                     msg.isStreaming = false
                 }
                 self.isPrompting = false
-                await self.refreshDaemonSessions()
             }
         }
     }
@@ -1132,11 +1175,15 @@ final class AppState {
 enum AppStateError: Error, LocalizedError {
     case notConnected
     case timeout
+    case noAvailableAgents
+    case agentUnavailable(String)
 
     var errorDescription: String? {
         switch self {
         case .notConnected: "Not connected to a workspace"
         case .timeout: "Connection timed out — server did not respond"
+        case .noAvailableAgents: "No available ACP agents on this node"
+        case .agentUnavailable(let displayName): "\(displayName) is not available on this node"
         }
     }
 }

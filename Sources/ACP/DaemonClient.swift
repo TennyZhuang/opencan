@@ -43,6 +43,24 @@ actor DaemonClient {
         return sessionId
     }
 
+    /// Probe whether agent launcher commands are available on this node.
+    func probeAgents(_ agents: [(id: String, command: String)]) async throws -> [DaemonAgentAvailability] {
+        let payloadAgents = agents.map { agent in
+            JSONValue.object([
+                "id": .string(agent.id),
+                "command": .string(agent.command)
+            ])
+        }
+        let params: JSONValue = .object([
+            "agents": .array(payloadAgents)
+        ])
+        let result = try await client.sendRequest(
+            method: DaemonMethods.agentProbe,
+            params: params
+        )
+        return parseAgentAvailability(result["agents"])
+    }
+
     /// Attach to an existing session, receiving buffered events since lastEventSeq.
     func attachSession(sessionId: String, lastEventSeq: UInt64) async throws -> DaemonAttachResult {
         let params: JSONValue = .object([
@@ -96,6 +114,20 @@ actor DaemonClient {
                 lastEventSeq: UInt64(item["lastEventSeq"]?.intValue ?? 0),
                 command: item["command"]?.stringValue,
                 title: item["title"]?.stringValue
+            )
+        }
+    }
+
+    private func parseAgentAvailability(_ value: JSONValue?) -> [DaemonAgentAvailability] {
+        guard let arr = value?.arrayValue else { return [] }
+        return arr.compactMap { item in
+            guard let id = item["id"]?.stringValue else { return nil }
+            let command = item["command"]?.stringValue ?? ""
+            let available = item["available"]?.boolValue ?? false
+            return DaemonAgentAvailability(
+                id: id,
+                command: command,
+                available: available
             )
         }
     }

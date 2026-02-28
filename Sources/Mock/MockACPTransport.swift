@@ -47,6 +47,8 @@ actor MockACPTransport: ACPTransport {
     var killedSessionIds: [String] = []
     /// Optional one-shot error injected for the next session/prompt request.
     var nextPromptError: (code: Int, message: String, data: JSONValue?)?
+    /// Optional per-agent probe results. If absent, probes default to available.
+    var mockAgentAvailabilityByID: [String: Bool] = [:]
 
     init(scenario: MockScenario = .simple) {
         self.scenario = scenario
@@ -88,6 +90,22 @@ actor MockACPTransport: ACPTransport {
                 "sessions": .array(mockSessionList.map { .object($0) })
             ])
             messageContinuation.yield(.response(id: id, result: result))
+
+        case DaemonMethods.agentProbe:
+            let requestedAgents = params?["agents"]?.arrayValue ?? []
+            let results = requestedAgents.compactMap { agent -> JSONValue? in
+                guard let id = agent["id"]?.stringValue else { return nil }
+                let command = agent["command"]?.stringValue ?? ""
+                let available = mockAgentAvailabilityByID[id] ?? true
+                return .object([
+                    "id": .string(id),
+                    "command": .string(command),
+                    "available": .bool(available)
+                ])
+            }
+            messageContinuation.yield(.response(id: id, result: .object([
+                "agents": .array(results)
+            ])))
 
         case DaemonMethods.sessionCreate:
             lastCreateCwd = params?["cwd"]?.stringValue
@@ -345,6 +363,10 @@ actor MockACPTransport: ACPTransport {
 
     func setMockLoadFailSessionCwdPairs(_ pairs: Set<String>) {
         self.mockLoadFailSessionCwdPairs = pairs
+    }
+
+    func setMockAgentAvailabilityByID(_ availability: [String: Bool]) {
+        self.mockAgentAvailabilityByID = availability
     }
 
     func getLastLoadSessionId() -> String? {

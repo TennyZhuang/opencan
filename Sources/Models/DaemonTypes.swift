@@ -6,6 +6,13 @@ struct DaemonInfo {
     let sessions: [DaemonSessionInfo]
 }
 
+/// Agent command availability on the connected node.
+struct DaemonAgentAvailability: Equatable {
+    let id: String
+    let command: String
+    let available: Bool
+}
+
 /// Snapshot of a daemon-managed session.
 struct DaemonSessionInfo: Identifiable {
     let sessionId: String

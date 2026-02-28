@@ -165,6 +165,61 @@ func TestDaemon_Hello_StringRequestIDRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDaemon_AgentProbe(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/agent.probe",
+		"params": map[string]interface{}{
+			"agents": []map[string]interface{}{
+				{
+					"id":      "shell",
+					"command": "/bin/sh -lc 'echo ok'",
+				},
+				{
+					"id":      "missing",
+					"command": "definitely-not-installed-acp-binary",
+				},
+			},
+		},
+	})
+
+	resp := readJSON(t, conn)
+	result := resp["result"].(map[string]interface{})
+	agents, ok := result["agents"].([]interface{})
+	if !ok || len(agents) != 2 {
+		t.Fatalf("expected 2 probed agents, got %v", result["agents"])
+	}
+
+	byID := map[string]map[string]interface{}{}
+	for _, raw := range agents {
+		entry := raw.(map[string]interface{})
+		byID[entry["id"].(string)] = entry
+	}
+
+	shell := byID["shell"]
+	if shell == nil {
+		t.Fatalf("missing probe result for shell: %#v", byID)
+	}
+	if shell["available"] != true {
+		t.Fatalf("expected shell probe available=true, got %#v", shell)
+	}
+
+	missing := byID["missing"]
+	if missing == nil {
+		t.Fatalf("missing probe result for missing command: %#v", byID)
+	}
+	if missing["available"] != false {
+		t.Fatalf("expected missing probe available=false, got %#v", missing)
+	}
+}
+
 func TestDaemon_DaemonNotificationWithoutIDDoesNotCrash(t *testing.T) {
 	d, sockPath := testDaemon(t)
 	defer d.Stop()

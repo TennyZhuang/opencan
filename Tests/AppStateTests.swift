@@ -118,6 +118,80 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.activeSession?.agentCommand, customCommand)
     }
 
+    func testRefreshAvailableAgentsUsesProbeResults() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAgentAvailabilityByID([
+            AgentKind.claude.rawValue: true,
+            AgentKind.codex.rawValue: false,
+        ])
+
+        await appState.refreshAvailableAgents()
+
+        XCTAssertEqual(appState.availableNodeAgents, [.claude])
+    }
+
+    func testCreateNewSessionFallsBackWhenDefaultAgentUnavailable() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAgentAvailabilityByID([
+            AgentKind.claude.rawValue: true,
+            AgentKind.codex.rawValue: false,
+        ])
+        await appState.refreshAvailableAgents()
+
+        let defaults = UserDefaults.standard
+        let key = AgentCommandStore.defaultAgentKey
+        let previous = defaults.string(forKey: key)
+        defaults.set(AgentKind.codex.rawValue, forKey: key)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        try await appState.createNewSession(modelContext: modelContext)
+
+        XCTAssertEqual(appState.activeSession?.agentID, AgentKind.claude.rawValue)
+    }
+
+    func testCreateNewSessionFailsWhenNoAvailableAgents() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAgentAvailabilityByID([
+            AgentKind.claude.rawValue: false,
+            AgentKind.codex.rawValue: false,
+        ])
+        await appState.refreshAvailableAgents()
+
+        do {
+            try await appState.createNewSession(modelContext: modelContext)
+            XCTFail("Expected createNewSession to throw when no agents are available")
+        } catch let error as AppStateError {
+            guard case .noAvailableAgents = error else {
+                XCTFail("Expected noAvailableAgents error, got \(error)")
+                return
+            }
+        }
+    }
+
     func testDiscardEmptyActiveSessionDeletesLocalRecordAndDaemonSession() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)
@@ -918,6 +992,125 @@ final class AppStateTests: XCTestCase {
             agentCommand: nil
         )
         XCTAssertFalse(withEvents.isEmptyPlaceholder)
+    }
+
+    // MARK: - Session List Lifecycle Tests
+
+    func testRefreshDaemonSessionsDeduplicatesConcurrentCalls() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string("s-1"),
+                "cwd": .string("/test/path"),
+                "state": .string("idle"),
+                "lastEventSeq": .int(5),
+            ]
+        ])
+
+        // Fire two concurrent refreshes — only one should actually call daemon
+        async let r1: () = appState.refreshDaemonSessions()
+        async let r2: () = appState.refreshDaemonSessions()
+        _ = await (r1, r2)
+
+        // Count how many sessionList calls were made
+        let methods = await transport.getReceivedMethods()
+        let listCalls = methods.filter { $0 == DaemonMethods.sessionList }
+        XCTAssertEqual(listCalls.count, 1, "Concurrent refreshes should be coalesced into one call")
+    }
+
+    func testSendMessageDoesNotRefreshDaemonSessionsFromPromptResponse() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        // After createNewSession: 1 sessionList call from its internal refresh.
+        // The notification-driven prompt_complete handler may also refresh (from
+        // handleSessionEvent). Verify the prompt *response* path no longer triggers
+        // a redundant refresh on top of the notification-driven one.
+        let methodsBefore = await transport.getReceivedMethods()
+        let listCallsBefore = methodsBefore.filter { $0 == DaemonMethods.sessionList }.count
+
+        appState.sendMessage("Hello")
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        // Allow the async Task from promptComplete notification handler to settle
+        try await Task.sleep(for: .milliseconds(100))
+
+        let methodsAfter = await transport.getReceivedMethods()
+        let listCallsAfter = methodsAfter.filter { $0 == DaemonMethods.sessionList }.count
+
+        // At most 1 new call: from the notification-driven promptComplete handler.
+        // Previously there were 2 (notification + response path); now only 1.
+        let newCalls = listCallsAfter - listCallsBefore
+        XCTAssertLessThanOrEqual(
+            newCalls, 1,
+            "sendMessage should trigger at most 1 session refresh (from notification), got \(newCalls)"
+        )
+    }
+
+    func testDiscardEmptySessionRefreshesDaemonSessions() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        let methodsBefore = await transport.getReceivedMethods()
+        let listCallsBefore = methodsBefore.filter { $0 == DaemonMethods.sessionList }.count
+
+        await appState.discardEmptyActiveSessionIfNeeded(modelContext: modelContext)
+
+        let methodsAfter = await transport.getReceivedMethods()
+        let listCallsAfter = methodsAfter.filter { $0 == DaemonMethods.sessionList }.count
+
+        XCTAssertEqual(
+            listCallsAfter, listCallsBefore + 1,
+            "discardEmptyActiveSession should refresh daemon sessions to update the list"
+        )
+    }
+
+    func testCleanupConnectionClearsDaemonSessions() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string("s-1"),
+                "cwd": .string("/test/path"),
+                "state": .string("idle"),
+                "lastEventSeq": .int(5),
+            ]
+        ])
+        await appState.refreshDaemonSessions()
+        XCTAssertFalse(appState.daemonSessions.isEmpty, "Sessions should be populated before disconnect")
+
+        appState.disconnect()
+        XCTAssertTrue(appState.daemonSessions.isEmpty, "disconnect should clear daemon sessions")
+    }
+
+    func testRefreshAfterDisconnectIsNoOp() async throws {
+        try await connectMock()
+        appState.disconnect()
+
+        // Refresh after disconnect should not crash or populate sessions
+        await appState.refreshDaemonSessions()
+        XCTAssertTrue(appState.daemonSessions.isEmpty, "refresh after disconnect should be a no-op")
     }
 
     // MARK: - Helpers

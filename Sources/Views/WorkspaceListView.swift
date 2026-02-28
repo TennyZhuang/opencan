@@ -22,7 +22,22 @@ struct WorkspaceListView: View {
             }
         }
         .navigationTitle(node.name)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
         .toolbar {
+            #if os(iOS)
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 6) {
+                    Text(node.name)
+                        .font(.headline)
+                    ForEach(nodeAgentBadges) { agent in
+                        AgentAvailabilityBadge(agent: agent)
+                    }
+                }
+                .lineLimit(1)
+            }
+            #endif
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     showAddWorkspace = true
@@ -44,6 +59,7 @@ struct WorkspaceListView: View {
             let isSameNode = appState.activeNode?.persistentModelID == node.persistentModelID
             if appState.connectionStatus == .connected, isSameNode {
                 // Already connected to this node
+                Task { await appState.refreshAvailableAgents() }
             } else if appState.connectionStatus == .connecting, isSameNode {
                 // Already connecting to this node, wait
             } else if OpenCANApp.isUITesting {
@@ -55,6 +71,11 @@ struct WorkspaceListView: View {
                 appState.connect(node: node)
             }
         }
+    }
+
+    private var nodeAgentBadges: [AgentKind] {
+        guard appState.activeNode?.persistentModelID == node.persistentModelID else { return [] }
+        return appState.availableNodeAgents
     }
 
     private var connectingView: some View {
@@ -123,6 +144,28 @@ struct WorkspaceListView: View {
         let workspaces = node.workspaces ?? []
         for index in offsets {
             modelContext.delete(workspaces[index])
+        }
+    }
+}
+
+struct AgentAvailabilityBadge: View {
+    let agent: AgentKind
+
+    var body: some View {
+        Text(agent.displayName)
+            .font(.caption2)
+            .fontWeight(.medium)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.15))
+            .foregroundStyle(color)
+            .clipShape(Capsule())
+    }
+
+    private var color: Color {
+        switch agent {
+        case .claude: .blue
+        case .codex: .purple
         }
     }
 }

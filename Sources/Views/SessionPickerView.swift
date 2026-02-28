@@ -20,7 +20,18 @@ struct SessionPickerView: View {
             }
             .onAppear {
                 appState.activeWorkspace = workspace
-                Task { await appState.refreshDaemonSessions() }
+                Task {
+                    await appState.refreshDaemonSessions()
+                    await appState.refreshAvailableAgents()
+                }
+            }
+            .onDisappear {
+                // Clear activeWorkspace when leaving this view so stale state
+                // doesn't leak into a sibling workspace's SessionPickerView
+                // during navigation transitions.
+                if appState.activeWorkspace?.persistentModelID == workspace.persistentModelID {
+                    appState.activeWorkspace = nil
+                }
             }
     }
 
@@ -76,16 +87,23 @@ struct SessionPickerView: View {
     }
 
     private var availableAgents: [AgentKind] {
+        let availableSet = Set(appState.availableNodeAgents)
         let preferred = AgentKind(rawValue: defaultAgentID)
-        return AgentKind.allCases.sorted { lhs, rhs in
+        return AgentKind.allCases
+            .filter { availableSet.contains($0) }
+            .sorted { lhs, rhs in
             if lhs == preferred { return true }
             if rhs == preferred { return false }
             return lhs.displayName < rhs.displayName
         }
     }
 
-    private var defaultAgent: AgentKind {
-        AgentKind(rawValue: defaultAgentID) ?? .claude
+    private var defaultCreateAgent: AgentKind? {
+        let preferred = AgentKind(rawValue: defaultAgentID)
+        if let preferred, availableAgents.contains(preferred) {
+            return preferred
+        }
+        return availableAgents.first
     }
 
     private var sessionListView: some View {
@@ -93,7 +111,8 @@ struct SessionPickerView: View {
             Section {
                 if OpenCANApp.isUITesting {
                     Button {
-                        Task { await createNew(agent: defaultAgent) }
+                        guard let agent = defaultCreateAgent else { return }
+                        Task { await createNew(agent: agent) }
                     } label: {
                         HStack {
                             Label("New Session", systemImage: "plus.circle")
@@ -103,18 +122,22 @@ struct SessionPickerView: View {
                             }
                         }
                     }
-                    .disabled(appState.isCreatingSession)
+                    .disabled(appState.isCreatingSession || defaultCreateAgent == nil)
                 } else {
                     Menu {
-                        ForEach(availableAgents) { agent in
-                            Button {
-                                Task { await createNew(agent: agent) }
-                            } label: {
-                                let command = AgentCommandStore.command(for: agent)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(agent.displayName)
-                                    Text(command)
-                                        .font(.caption2)
+                        if availableAgents.isEmpty {
+                            Text("No available agents on this node")
+                        } else {
+                            ForEach(availableAgents) { agent in
+                                Button {
+                                    Task { await createNew(agent: agent) }
+                                } label: {
+                                    let command = AgentCommandStore.command(for: agent)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(agent.displayName)
+                                        Text(command)
+                                            .font(.caption2)
+                                    }
                                 }
                             }
                         }
@@ -127,7 +150,7 @@ struct SessionPickerView: View {
                             }
                         }
                     }
-                    .disabled(appState.isCreatingSession)
+                    .disabled(appState.isCreatingSession || availableAgents.isEmpty)
                 }
             }
 

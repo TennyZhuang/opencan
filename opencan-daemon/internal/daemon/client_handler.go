@@ -126,6 +126,8 @@ func (h *ClientHandler) handleDaemonMethod(msg *protocol.Message) {
 	switch msg.Method {
 	case protocol.MethodDaemonHello:
 		h.handleHello(msg)
+	case protocol.MethodDaemonAgentProbe:
+		h.handleAgentProbe(msg)
 	case protocol.MethodDaemonSessionCreate:
 		h.handleSessionCreate(msg)
 	case protocol.MethodDaemonSessionAttach:
@@ -148,6 +150,21 @@ func (h *ClientHandler) handleHello(msg *protocol.Message) {
 	result, _ := json.Marshal(map[string]interface{}{
 		"daemonVersion": "0.1.0",
 		"sessions":      sessions,
+	})
+	h.Send(protocol.NewResponse(*msg.ID, result))
+}
+
+func (h *ClientHandler) handleAgentProbe(msg *protocol.Message) {
+	var params struct {
+		Agents []AgentProbeRequest `json:"agents"`
+	}
+	if msg.Params != nil {
+		json.Unmarshal(*msg.Params, &params)
+	}
+
+	results := ProbeAgentCommands(params.Agents)
+	result, _ := json.Marshal(map[string]interface{}{
+		"agents": results,
 	})
 	h.Send(protocol.NewResponse(*msg.ID, result))
 }

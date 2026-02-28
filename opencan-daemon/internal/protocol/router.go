@@ -3,6 +3,7 @@ package protocol
 // Daemon method constants.
 const (
 	MethodDaemonHello         = "daemon/hello"
+	MethodDaemonAgentProbe    = "daemon/agent.probe"
 	MethodDaemonSessionCreate = "daemon/session.create"
 	MethodDaemonSessionAttach = "daemon/session.attach"
 	MethodDaemonSessionDetach = "daemon/session.detach"
