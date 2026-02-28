@@ -43,6 +43,8 @@ actor MockACPTransport: ACPTransport {
     var receivedMethods: [String] = []
     /// Track detached session IDs in order.
     var detachedSessionIds: [String] = []
+    /// Track killed session IDs in order.
+    var killedSessionIds: [String] = []
     /// Optional one-shot error injected for the next session/prompt request.
     var nextPromptError: (code: Int, message: String, data: JSONValue?)?
 
@@ -125,6 +127,9 @@ actor MockACPTransport: ACPTransport {
             ])))
 
         case DaemonMethods.sessionKill:
+            if let sessionId = params?["sessionId"]?.stringValue {
+                killedSessionIds.append(sessionId)
+            }
             messageContinuation.yield(.response(id: id, result: .object([:])))
 
         // ACP passthrough (daemon forwards transparently)
@@ -142,7 +147,8 @@ actor MockACPTransport: ACPTransport {
                 )
                 return
             }
-            await streamScenario(requestId: id, sessionId: sessionId)
+            let steps = scenario.steps
+            await streamScenario(requestId: id, sessionId: sessionId, steps: steps)
 
         case ACPMethods.sessionLoad:
             let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
@@ -151,8 +157,11 @@ actor MockACPTransport: ACPTransport {
             lastLoadSessionId = sessionId
             lastLoadRouteToSessionId = routeToSessionId
             lastLoadCwd = cwd
+            let failSessionIDs = mockLoadFailSessionIDs
+            let failSessionCwdPairs = mockLoadFailSessionCwdPairs
+            let steps = mockLoadSteps
             let failKey = "\(sessionId)|\(cwd)"
-            if mockLoadFailSessionIDs.contains(sessionId) || mockLoadFailSessionCwdPairs.contains(failKey) {
+            if failSessionIDs.contains(sessionId) || failSessionCwdPairs.contains(failKey) {
                 messageContinuation.yield(
                     .error(id: id, code: -32603, message: "Internal error", data: .object([
                         "details": .string("Session not found")
@@ -160,7 +169,7 @@ actor MockACPTransport: ACPTransport {
                 )
                 return
             }
-            await streamLoadHistory(requestId: id, sessionId: sessionId)
+            await streamLoadHistory(requestId: id, sessionId: sessionId, steps: steps)
 
         default:
             messageContinuation.yield(
@@ -173,9 +182,10 @@ actor MockACPTransport: ACPTransport {
 
     private func streamScenario(
         requestId: JSONRPCMessage.JSONRPCID,
-        sessionId: String
+        sessionId: String,
+        steps: [MockStep]
     ) async {
-        for step in scenario.steps {
+        for step in steps {
             guard !isClosed else { return }
             await executeStep(step, sessionId: sessionId)
         }
@@ -189,9 +199,10 @@ actor MockACPTransport: ACPTransport {
     /// Stream history events during session/load, then return response.
     private func streamLoadHistory(
         requestId: JSONRPCMessage.JSONRPCID,
-        sessionId: String
+        sessionId: String,
+        steps: [MockStep]
     ) async {
-        for step in mockLoadSteps {
+        for step in steps {
             guard !isClosed else { return }
             await executeStep(step, sessionId: sessionId)
         }
@@ -304,5 +315,71 @@ actor MockACPTransport: ACPTransport {
         messageContinuation.yield(
             .notification(method: ACPMethods.sessionUpdate, params: .object(params))
         )
+    }
+
+    // MARK: - Test Helpers
+
+    func setMockAttachState(_ state: String) {
+        self.mockAttachState = state
+    }
+
+    func setMockAttachBufferedEvents(_ events: [[String: JSONValue]]) {
+        self.mockAttachBufferedEvents = events
+    }
+
+    func setMockAttachShouldFail(_ fail: Bool) {
+        self.mockAttachShouldFail = fail
+    }
+
+    func setMockSessionList(_ list: [[String: JSONValue]]) {
+        self.mockSessionList = list
+    }
+
+    func setMockLoadSteps(_ steps: [MockStep]) {
+        self.mockLoadSteps = steps
+    }
+
+    func setMockLoadFailSessionIDs(_ ids: Set<String>) {
+        self.mockLoadFailSessionIDs = ids
+    }
+
+    func setMockLoadFailSessionCwdPairs(_ pairs: Set<String>) {
+        self.mockLoadFailSessionCwdPairs = pairs
+    }
+
+    func getLastLoadSessionId() -> String? {
+        lastLoadSessionId
+    }
+
+    func getLastLoadRouteToSessionId() -> String? {
+        lastLoadRouteToSessionId
+    }
+
+    func getLastLoadCwd() -> String? {
+        lastLoadCwd
+    }
+
+    func getLastCreateCommand() -> String? {
+        lastCreateCommand
+    }
+
+    func getLastCreateCwd() -> String? {
+        lastCreateCwd
+    }
+
+    func getReceivedMethods() -> [String] {
+        receivedMethods
+    }
+
+    func getDetachedSessionIds() -> [String] {
+        detachedSessionIds
+    }
+
+    func getKilledSessionIds() -> [String] {
+        killedSessionIds
+    }
+
+    func setNextPromptError(code: Int, message: String, data: JSONValue?) {
+        nextPromptError = (code: code, message: message, data: data)
     }
 }

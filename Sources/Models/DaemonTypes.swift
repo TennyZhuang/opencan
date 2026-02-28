@@ -46,6 +46,16 @@ struct UnifiedSession: Identifiable {
     var displayState: String { daemonState ?? "history" }
     /// Even dead daemon sessions are resumable via history recovery.
     var isResumable: Bool { true }
+    /// Placeholder sessions with no title/events are typically accidental.
+    var isEmptyPlaceholder: Bool {
+        let hasLocalTitle = !(title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let hasDaemonTitle = !(daemonTitle?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let hasEvents = (lastEventSeq ?? 0) > 0
+        let state = daemonState ?? "history"
+        let isRunning = state == "starting" || state == "prompting" || state == "draining"
+        let isExternal = state == "external"
+        return !hasLocalTitle && !hasDaemonTitle && !hasEvents && !isRunning && !isExternal
+    }
     var displayTitle: String {
         if let title, !title.isEmpty { return title }
         if let daemonTitle, !daemonTitle.isEmpty { return daemonTitle }

@@ -676,6 +676,45 @@ final class AppState {
         }
     }
 
+    /// Delete the current session if it has no user-visible content.
+    /// Called when leaving ChatView so accidental empty sessions don't pollute the list.
+    func discardEmptyActiveSessionIfNeeded(modelContext: ModelContext) async {
+        guard let session = activeSession else { return }
+        guard shouldDiscardEmptySession(session) else { return }
+
+        let sessionId = session.sessionId
+        Log.toFile("[AppState] Discarding empty session \(sessionId)")
+
+        if let daemon = daemonClient {
+            if currentSessionId == sessionId {
+                do {
+                    try await daemon.detachSession(sessionId: sessionId)
+                } catch {
+                    Log.toFile("[AppState] Failed to detach empty session \(sessionId): \(error)")
+                }
+            }
+            do {
+                try await daemon.killSession(sessionId: sessionId)
+            } catch {
+                Log.toFile("[AppState] Failed to kill empty session \(sessionId): \(error)")
+            }
+        }
+
+        modelContext.delete(session)
+        try? modelContext.save()
+
+        if currentSessionId == sessionId {
+            currentSessionId = nil
+            messages = []
+        }
+        if activeSession?.persistentModelID == session.persistentModelID {
+            activeSession = nil
+        }
+        lastEventSeq.removeValue(forKey: sessionId)
+
+        await refreshDaemonSessions()
+    }
+
     // MARK: - Notifications
 
     private func startNotificationListener() {
@@ -961,6 +1000,29 @@ final class AppState {
             if !$0.toolCalls.isEmpty { return true }
             return !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
+    }
+
+    private func shouldDiscardEmptySession(_ session: Session) -> Bool {
+        guard !isPrompting else { return false }
+        guard !isLoadingHistory else { return false }
+        guard hasRenderableConversation() == false else { return false }
+
+        let hasLocalTitle = !(session.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        guard !hasLocalTitle else { return false }
+
+        guard let daemonSession = daemonSessions.first(where: { $0.sessionId == session.sessionId }) else {
+            return true
+        }
+
+        let state = daemonSession.state
+        if state == "starting" || state == "prompting" || state == "draining" || state == "external" {
+            return false
+        }
+        if daemonSession.lastEventSeq > 0 {
+            return false
+        }
+        let hasDaemonTitle = !(daemonSession.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        return !hasDaemonTitle
     }
 
     /// Detach the currently attached daemon session before switching to another one.

@@ -60,6 +60,7 @@ struct SessionPickerView: View {
                 agentCommand: local?.agentCommand ?? daemon?.command
             )
         }
+        .filter { !$0.isEmptyPlaceholder }
 
         // Sort: active (prompting/draining) first, then by lastUsedAt desc.
         // External and daemon sessions are intermixed by time.

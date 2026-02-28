@@ -118,6 +118,65 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.activeSession?.agentCommand, customCommand)
     }
 
+    func testDiscardEmptyActiveSessionDeletesLocalRecordAndDaemonSession() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let sessionId = appState.currentSessionId else {
+            XCTFail("Session ID should be set")
+            return
+        }
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await appState.discardEmptyActiveSessionIfNeeded(modelContext: modelContext)
+
+        XCTAssertNil(appState.currentSessionId)
+        XCTAssertNil(appState.activeSession)
+        XCTAssertTrue(appState.messages.isEmpty)
+
+        let descriptor = FetchDescriptor<Session>(
+            predicate: #Predicate { $0.sessionId == sessionId }
+        )
+        let persisted = try modelContext.fetch(descriptor)
+        XCTAssertTrue(persisted.isEmpty, "Empty session should be removed from SwiftData")
+
+        let detached = await transport.getDetachedSessionIds()
+        let killed = await transport.getKilledSessionIds()
+        XCTAssertEqual(detached.last, sessionId)
+        XCTAssertEqual(killed.last, sessionId)
+    }
+
+    func testDiscardEmptyActiveSessionDoesNotDeleteSessionWithConversation() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let sessionId = appState.currentSessionId else {
+            XCTFail("Session ID should be set")
+            return
+        }
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        appState.sendMessage("hello")
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        await appState.discardEmptyActiveSessionIfNeeded(modelContext: modelContext)
+
+        let descriptor = FetchDescriptor<Session>(
+            predicate: #Predicate { $0.sessionId == sessionId }
+        )
+        let persisted = try modelContext.fetch(descriptor)
+        XCTAssertEqual(persisted.count, 1, "Non-empty session should be kept")
+
+        let killed = await transport.getKilledSessionIds()
+        XCTAssertFalse(killed.contains(sessionId), "Non-empty session should not be killed")
+    }
+
     func testNewSessionSendMessage() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)
@@ -833,6 +892,34 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(unified.agentDisplayName, "custom-agent")
     }
 
+    func testUnifiedSessionEmptyPlaceholderDetection() {
+        let empty = UnifiedSession(
+            sessionId: "s-empty",
+            daemonState: "idle",
+            cwd: "/test",
+            lastEventSeq: 0,
+            title: nil,
+            daemonTitle: nil,
+            lastUsedAt: nil,
+            agentID: nil,
+            agentCommand: nil
+        )
+        XCTAssertTrue(empty.isEmptyPlaceholder)
+
+        let withEvents = UnifiedSession(
+            sessionId: "s-with-events",
+            daemonState: "idle",
+            cwd: "/test",
+            lastEventSeq: 1,
+            title: nil,
+            daemonTitle: nil,
+            lastUsedAt: nil,
+            agentID: nil,
+            agentCommand: nil
+        )
+        XCTAssertFalse(withEvents.isEmptyPlaceholder)
+    }
+
     // MARK: - Helpers
 
     /// Build buffered event dicts from MockSteps for configuring mock attach responses.
@@ -874,69 +961,5 @@ final class AppStateTests: XCTestCase {
             seq += 1
         }
         return events
-    }
-}
-
-// MARK: - MockACPTransport test configuration helpers
-
-extension MockACPTransport {
-    func setMockAttachState(_ state: String) {
-        self.mockAttachState = state
-    }
-
-    func setMockAttachBufferedEvents(_ events: [[String: JSONValue]]) {
-        self.mockAttachBufferedEvents = events
-    }
-
-    func setMockAttachShouldFail(_ fail: Bool) {
-        self.mockAttachShouldFail = fail
-    }
-
-    func setMockSessionList(_ list: [[String: JSONValue]]) {
-        self.mockSessionList = list
-    }
-
-    func setMockLoadSteps(_ steps: [MockStep]) {
-        self.mockLoadSteps = steps
-    }
-
-    func setMockLoadFailSessionIDs(_ ids: Set<String>) {
-        self.mockLoadFailSessionIDs = ids
-    }
-
-    func setMockLoadFailSessionCwdPairs(_ pairs: Set<String>) {
-        self.mockLoadFailSessionCwdPairs = pairs
-    }
-
-    func getLastLoadSessionId() -> String? {
-        lastLoadSessionId
-    }
-
-    func getLastLoadRouteToSessionId() -> String? {
-        lastLoadRouteToSessionId
-    }
-
-    func getLastLoadCwd() -> String? {
-        lastLoadCwd
-    }
-
-    func getLastCreateCommand() -> String? {
-        lastCreateCommand
-    }
-
-    func getLastCreateCwd() -> String? {
-        lastCreateCwd
-    }
-
-    func getReceivedMethods() -> [String] {
-        receivedMethods
-    }
-
-    func getDetachedSessionIds() -> [String] {
-        detachedSessionIds
-    }
-
-    func setNextPromptError(code: Int, message: String, data: JSONValue?) {
-        nextPromptError = (code: code, message: message, data: data)
     }
 }

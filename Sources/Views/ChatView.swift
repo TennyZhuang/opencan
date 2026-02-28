@@ -1,7 +1,9 @@
 import SwiftUI
+import SwiftData
 
 struct ChatView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.modelContext) private var modelContext
     @State private var forceScrollToken = 0
 
     var body: some View {
@@ -30,6 +32,11 @@ struct ChatView: View {
                 Button("Disconnect", role: .destructive) {
                     appState.disconnect()
                 }
+            }
+        }
+        .onDisappear {
+            Task {
+                await appState.discardEmptyActiveSessionIfNeeded(modelContext: modelContext)
             }
         }
     }
