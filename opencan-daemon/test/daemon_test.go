@@ -166,6 +166,11 @@ func TestDaemon_Hello_StringRequestIDRoundTrip(t *testing.T) {
 }
 
 func TestDaemon_AgentProbe(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found, run 'make mock-acp' first")
+	}
+
 	d, sockPath := testDaemon(t)
 	defer d.Stop()
 
@@ -179,8 +184,8 @@ func TestDaemon_AgentProbe(t *testing.T) {
 		"params": map[string]interface{}{
 			"agents": []map[string]interface{}{
 				{
-					"id":      "shell",
-					"command": "/bin/sh -lc 'echo ok'",
+					"id":      "mock",
+					"command": mockBin,
 				},
 				{
 					"id":      "missing",
@@ -203,12 +208,12 @@ func TestDaemon_AgentProbe(t *testing.T) {
 		byID[entry["id"].(string)] = entry
 	}
 
-	shell := byID["shell"]
-	if shell == nil {
-		t.Fatalf("missing probe result for shell: %#v", byID)
+	mock := byID["mock"]
+	if mock == nil {
+		t.Fatalf("missing probe result for mock command: %#v", byID)
 	}
-	if shell["available"] != true {
-		t.Fatalf("expected shell probe available=true, got %#v", shell)
+	if mock["available"] != true {
+		t.Fatalf("expected mock probe available=true, got %#v", mock)
 	}
 
 	missing := byID["missing"]

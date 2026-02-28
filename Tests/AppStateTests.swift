@@ -133,6 +133,28 @@ final class AppStateTests: XCTestCase {
 
         await appState.refreshAvailableAgents()
 
+        XCTAssertTrue(appState.hasReliableAgentAvailability)
+        XCTAssertEqual(appState.availableNodeAgents, [.claude])
+    }
+
+    func testRefreshAvailableAgentsUnsupportedProbeKeepsPreviousAvailability() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAgentAvailabilityByID([
+            AgentKind.claude.rawValue: true,
+            AgentKind.codex.rawValue: false,
+        ])
+        await appState.refreshAvailableAgents()
+
+        await transport.setMockAgentProbeUnsupported(true)
+        await appState.refreshAvailableAgents()
+
+        XCTAssertTrue(appState.hasReliableAgentAvailability)
         XCTAssertEqual(appState.availableNodeAgents, [.claude])
     }
 
@@ -190,6 +212,34 @@ final class AppStateTests: XCTestCase {
                 return
             }
         }
+    }
+
+    func testCreateNewSessionStillWorksWhenProbeUnsupported() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAgentProbeUnsupported(true)
+        await appState.refreshAvailableAgents()
+
+        let defaults = UserDefaults.standard
+        let key = AgentCommandStore.defaultAgentKey
+        let previous = defaults.string(forKey: key)
+        defaults.set(AgentKind.codex.rawValue, forKey: key)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        try await appState.createNewSession(modelContext: modelContext)
+
+        XCTAssertEqual(appState.activeSession?.agentID, AgentKind.codex.rawValue)
     }
 
     func testDiscardEmptyActiveSessionDeletesLocalRecordAndDaemonSession() async throws {

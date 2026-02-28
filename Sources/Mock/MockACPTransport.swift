@@ -49,6 +49,8 @@ actor MockACPTransport: ACPTransport {
     var nextPromptError: (code: Int, message: String, data: JSONValue?)?
     /// Optional per-agent probe results. If absent, probes default to available.
     var mockAgentAvailabilityByID: [String: Bool] = [:]
+    /// If true, daemon/agent.probe returns method not found.
+    var mockAgentProbeUnsupported = false
 
     init(scenario: MockScenario = .simple) {
         self.scenario = scenario
@@ -92,6 +94,12 @@ actor MockACPTransport: ACPTransport {
             messageContinuation.yield(.response(id: id, result: result))
 
         case DaemonMethods.agentProbe:
+            if mockAgentProbeUnsupported {
+                messageContinuation.yield(
+                    .error(id: id, code: -32601, message: "Method not found: \(DaemonMethods.agentProbe)", data: nil)
+                )
+                return
+            }
             let requestedAgents = params?["agents"]?.arrayValue ?? []
             let results = requestedAgents.compactMap { agent -> JSONValue? in
                 guard let id = agent["id"]?.stringValue else { return nil }
@@ -367,6 +375,10 @@ actor MockACPTransport: ACPTransport {
 
     func setMockAgentAvailabilityByID(_ availability: [String: Bool]) {
         self.mockAgentAvailabilityByID = availability
+    }
+
+    func setMockAgentProbeUnsupported(_ unsupported: Bool) {
+        self.mockAgentProbeUnsupported = unsupported
     }
 
     func getLastLoadSessionId() -> String? {

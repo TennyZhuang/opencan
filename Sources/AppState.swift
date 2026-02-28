@@ -17,8 +17,10 @@ final class AppState {
 
     // Daemon sessions (replaces remoteSessions)
     var daemonSessions: [DaemonSessionInfo] = []
-    /// Built-in agents whose ACP launch commands are available on the connected node.
-    var availableNodeAgents: [AgentKind] = AgentKind.allCases
+    /// Built-in agents whose ACP launch commands were confirmed available on the connected node.
+    var availableNodeAgents: [AgentKind] = []
+    /// True only when availability comes from a successful daemon probe.
+    var hasReliableAgentAvailability = false
 
     // Chat
     var messages: [ChatMessage] = []
@@ -81,6 +83,8 @@ final class AppState {
         connectionStatus = .connecting
         connectionError = nil
         activeNode = node
+        availableNodeAgents = []
+        hasReliableAgentAvailability = false
 
         // Build jump server params
         let jumpHost = node.jumpServer?.host
@@ -193,6 +197,8 @@ final class AppState {
         connectionError = nil
         activeWorkspace = workspace
         activeNode = workspace.node
+        availableNodeAgents = []
+        hasReliableAgentAvailability = false
 
         Task {
             let transport = MockACPTransport(scenario: scenario)
@@ -233,7 +239,14 @@ final class AppState {
         guard let daemon = daemonClient else { return }
         guard !isRefreshingDaemonSessions else { return }
         isRefreshingDaemonSessions = true
-        defer { isRefreshingDaemonSessions = false }
+        defer {
+            Task { @MainActor in
+                // Keep the coalescing gate for one extra turn so near-simultaneous
+                // callers reuse this refresh instead of issuing a second list request.
+                await Task.yield()
+                self.isRefreshingDaemonSessions = false
+            }
+        }
         if let updated = try? await daemon.listSessions() {
             self.daemonSessions = updated
         }
@@ -242,6 +255,9 @@ final class AppState {
     /// Probe remote ACP launch command availability for built-in agents.
     func refreshAvailableAgents() async {
         guard let daemon = daemonClient else { return }
+
+        let previousAgents = availableNodeAgents
+        let previousReliability = hasReliableAgentAvailability
 
         let probeRequests = AgentKind.allCases.map { agent in
             (id: agent.rawValue, command: AgentCommandStore.command(for: agent))
@@ -252,16 +268,23 @@ final class AppState {
             let availableIDs = Set(results.filter(\.available).map(\.id))
             let available = AgentKind.allCases.filter { availableIDs.contains($0.rawValue) }
             self.availableNodeAgents = available
+            self.hasReliableAgentAvailability = true
             Log.toFile("[AppState] Agent probe: available=\(available.map(\.rawValue).joined(separator: ","))")
         } catch {
-            // Backward compatibility: old daemon versions don't support probing.
-            self.availableNodeAgents = AgentKind.allCases
-            Log.toFile("[AppState] Agent probe failed, falling back to all agents: \(error)")
+            // Keep last known state to avoid UI flicker on transient probe failures.
+            self.availableNodeAgents = previousAgents
+            self.hasReliableAgentAvailability = previousReliability
+            Log.toFile("[AppState] Agent probe failed, keeping previous availability: \(error)")
         }
     }
 
     /// Create a new ACP session via the daemon using the app's default agent.
     func createNewSession(modelContext: ModelContext) async throws {
+        if !hasReliableAgentAvailability {
+            let defaultAgent = AgentCommandStore.defaultAgent()
+            try await createNewSession(modelContext: modelContext, agent: defaultAgent)
+            return
+        }
         let preferredAgent = AgentCommandStore.defaultAgent()
         if availableNodeAgents.contains(preferredAgent) {
             try await createNewSession(modelContext: modelContext, agent: preferredAgent)
@@ -276,7 +299,7 @@ final class AppState {
 
     /// Create a new ACP session via the daemon using a specific built-in agent.
     func createNewSession(modelContext: ModelContext, agent: AgentKind) async throws {
-        guard availableNodeAgents.contains(agent) else {
+        guard !hasReliableAgentAvailability || availableNodeAgents.contains(agent) else {
             throw AppStateError.agentUnavailable(agent.displayName)
         }
         let command = AgentCommandStore.command(for: agent)
@@ -657,7 +680,8 @@ final class AppState {
         isCreatingSession = false
         isLoadingHistory = false
         isRefreshingDaemonSessions = false
-        availableNodeAgents = AgentKind.allCases
+        availableNodeAgents = []
+        hasReliableAgentAvailability = false
         historyLoadSessionIds = []
         historyLoadGeneration = 0
         // lastEventSeq intentionally kept — needed for reconnect replay

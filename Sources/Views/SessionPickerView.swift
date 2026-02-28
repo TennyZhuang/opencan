@@ -87,10 +87,15 @@ struct SessionPickerView: View {
     }
 
     private var availableAgents: [AgentKind] {
-        let availableSet = Set(appState.availableNodeAgents)
+        let filtered: [AgentKind]
+        if appState.hasReliableAgentAvailability {
+            let availableSet = Set(appState.availableNodeAgents)
+            filtered = AgentKind.allCases.filter { availableSet.contains($0) }
+        } else {
+            filtered = AgentKind.allCases
+        }
         let preferred = AgentKind(rawValue: defaultAgentID)
-        return AgentKind.allCases
-            .filter { availableSet.contains($0) }
+        return filtered
             .sorted { lhs, rhs in
             if lhs == preferred { return true }
             if rhs == preferred { return false }
@@ -125,7 +130,7 @@ struct SessionPickerView: View {
                     .disabled(appState.isCreatingSession || defaultCreateAgent == nil)
                 } else {
                     Menu {
-                        if availableAgents.isEmpty {
+                        if appState.hasReliableAgentAvailability && availableAgents.isEmpty {
                             Text("No available agents on this node")
                         } else {
                             ForEach(availableAgents) { agent in
@@ -150,7 +155,7 @@ struct SessionPickerView: View {
                             }
                         }
                     }
-                    .disabled(appState.isCreatingSession || availableAgents.isEmpty)
+                    .disabled(appState.isCreatingSession || (appState.hasReliableAgentAvailability && availableAgents.isEmpty))
                 }
             }
 

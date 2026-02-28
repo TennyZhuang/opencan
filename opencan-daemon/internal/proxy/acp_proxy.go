@@ -63,7 +63,10 @@ type clientWrapper struct {
 // creates a session, and starts the background read loop.
 // Returns the proxy or an error if initialization fails.
 func NewACPProxy(cwd, command string, logger *slog.Logger) (*ACPProxy, error) {
-	cmd := exec.Command(command)
+	cmd, _, err := BuildExecCommand(command)
+	if err != nil {
+		return nil, fmt.Errorf("parse command: %w", err)
+	}
 	cmd.Dir = cwd
 
 	stdin, err := cmd.StdinPipe()

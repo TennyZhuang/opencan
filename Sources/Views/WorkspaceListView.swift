@@ -75,6 +75,8 @@ struct WorkspaceListView: View {
 
     private var nodeAgentBadges: [AgentKind] {
         guard appState.activeNode?.persistentModelID == node.persistentModelID else { return [] }
+        guard appState.connectionStatus == .connected else { return [] }
+        guard appState.hasReliableAgentAvailability else { return [] }
         return appState.availableNodeAgents
     }
 
