@@ -6,77 +6,22 @@ struct SessionPickerView: View {
     @Environment(\.modelContext) private var modelContext
     @AppStorage(AgentCommandStore.defaultAgentKey) private var defaultAgentID = AgentKind.claude.rawValue
     let workspace: Workspace
-    @State private var hasConnected = false
     @State private var navigateToChat = false
     @State private var loadingSessionId: String?
 
     var body: some View {
-        Group {
-            if !hasConnected {
-                connectingView
-            } else {
-                sessionListView
+        sessionListView
+            .navigationTitle("Sessions")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .navigationDestination(isPresented: $navigateToChat) {
+                ChatView()
             }
-        }
-        .navigationTitle("Sessions")
-        #if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-        #endif
-        .navigationDestination(isPresented: $navigateToChat) {
-            ChatView()
-        }
-        .onAppear {
-            let isSameWorkspace = appState.activeWorkspace?.persistentModelID == workspace.persistentModelID
-            if appState.connectionStatus == .connected, isSameWorkspace {
-                hasConnected = true
+            .onAppear {
+                appState.activeWorkspace = workspace
                 Task { await appState.refreshDaemonSessions() }
-            } else if appState.connectionStatus == .connecting, isSameWorkspace {
-                // Already connecting to this workspace, wait for it
-            } else if OpenCANApp.isUITesting {
-                appState.connectMock(workspace: workspace, scenario: OpenCANApp.uiTestMockScenario)
-            } else {
-                appState.connect(workspace: workspace)
             }
-        }
-        .onChange(of: appState.connectionStatus) {
-            if appState.connectionStatus == .connected,
-               appState.activeWorkspace?.persistentModelID == workspace.persistentModelID {
-                hasConnected = true
-            }
-        }
-    }
-
-    private var connectingView: some View {
-        VStack(spacing: 16) {
-            if appState.connectionStatus == .connecting {
-                if let progress = appState.daemonUploadProgress {
-                    ProgressView(value: progress) {
-                        Text("Installing daemon...")
-                            .foregroundStyle(.secondary)
-                    } currentValueLabel: {
-                        Text("\(Int(progress * 100))%")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .progressViewStyle(.linear)
-                    .padding(.horizontal, 40)
-                } else {
-                    ProgressView()
-                    Text("Connecting to \(workspace.node?.name ?? "node")...")
-                        .foregroundStyle(.secondary)
-                }
-            } else if let error = appState.connectionError {
-                Image(systemName: "xmark.circle")
-                    .font(.largeTitle)
-                    .foregroundStyle(.red)
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                Button("Retry") { appState.connect(workspace: workspace) }
-            }
-        }
-        .padding()
     }
 
     /// Merge daemon sessions and local SwiftData sessions into a single list.
@@ -109,21 +54,19 @@ struct SessionPickerView: View {
                 cwd: daemon?.cwd ?? workspace.path,
                 lastEventSeq: daemon?.lastEventSeq,
                 title: local?.title,
+                daemonTitle: daemon?.title,
                 lastUsedAt: local?.lastUsedAt,
                 agentID: local?.agentID,
                 agentCommand: local?.agentCommand ?? daemon?.command
             )
         }
 
-        // Sort: active (prompting/draining) first → daemon-known → by lastUsedAt desc
+        // Sort: active (prompting/draining) first, then by lastUsedAt desc.
+        // External and daemon sessions are intermixed by time.
         return unified.sorted { a, b in
             let aActive = a.daemonState == "prompting" || a.daemonState == "draining"
             let bActive = b.daemonState == "prompting" || b.daemonState == "draining"
             if aActive != bActive { return aActive }
-
-            let aDaemon = a.daemonState != nil
-            let bDaemon = b.daemonState != nil
-            if aDaemon != bDaemon { return aDaemon }
 
             let aDate = a.lastUsedAt ?? .distantPast
             let bDate = b.lastUsedAt ?? .distantPast
@@ -279,6 +222,7 @@ struct SessionStateBadge: View {
         case "dead": "Dead"
         case "starting": "Starting"
         case "history": "History"
+        case "external": "External"
         default: state.capitalized
         }
     }
@@ -292,6 +236,7 @@ struct SessionStateBadge: View {
         case "dead": .red
         case "starting": .yellow
         case "history": .secondary
+        case "external": .purple
         default: .gray
         }
     }

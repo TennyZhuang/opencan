@@ -94,7 +94,8 @@ actor DaemonClient {
                 cwd: item["cwd"]?.stringValue ?? "",
                 state: item["state"]?.stringValue ?? "unknown",
                 lastEventSeq: UInt64(item["lastEventSeq"]?.intValue ?? 0),
-                command: item["command"]?.stringValue
+                command: item["command"]?.stringValue,
+                title: item["title"]?.stringValue
             )
         }
     }

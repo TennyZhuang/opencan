@@ -10,22 +10,16 @@ struct WorkspaceListView: View {
     @State private var newPath = ""
 
     var body: some View {
-        List {
-            ForEach(node.workspaces ?? []) { workspace in
-                NavigationLink {
-                    SessionPickerView(workspace: workspace)
-                } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(workspace.name)
-                            .font(.headline)
-                        Text(workspace.path)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 2)
-                }
+        Group {
+            if appState.connectionStatus == .connecting,
+               appState.activeNode?.persistentModelID == node.persistentModelID {
+                connectingView
+            } else if appState.connectionStatus == .failed,
+                      appState.activeNode?.persistentModelID == node.persistentModelID {
+                connectingView
+            } else {
+                workspaceListContent
             }
-            .onDelete(perform: deleteWorkspaces)
         }
         .navigationTitle(node.name)
         .toolbar {
@@ -45,6 +39,74 @@ struct WorkspaceListView: View {
                 newName = ""
                 newPath = ""
             }
+        }
+        .onAppear {
+            let isSameNode = appState.activeNode?.persistentModelID == node.persistentModelID
+            if appState.connectionStatus == .connected, isSameNode {
+                // Already connected to this node
+            } else if appState.connectionStatus == .connecting, isSameNode {
+                // Already connecting to this node, wait
+            } else if OpenCANApp.isUITesting {
+                // UI tests use mock transport — connectMock needs a workspace
+                if let workspace = node.workspaces?.first {
+                    appState.connectMock(workspace: workspace, scenario: OpenCANApp.uiTestMockScenario)
+                }
+            } else {
+                appState.connect(node: node)
+            }
+        }
+    }
+
+    private var connectingView: some View {
+        VStack(spacing: 16) {
+            if appState.connectionStatus == .connecting {
+                if let progress = appState.daemonUploadProgress {
+                    ProgressView(value: progress) {
+                        Text("Installing daemon...")
+                            .foregroundStyle(.secondary)
+                    } currentValueLabel: {
+                        Text("\(Int(progress * 100))%")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .progressViewStyle(.linear)
+                    .padding(.horizontal, 40)
+                } else {
+                    ProgressView()
+                    Text("Connecting to \(node.name)...")
+                        .foregroundStyle(.secondary)
+                }
+            } else if let error = appState.connectionError {
+                Image(systemName: "xmark.circle")
+                    .font(.largeTitle)
+                    .foregroundStyle(.red)
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                Button("Retry") { appState.connect(node: node) }
+            }
+        }
+        .padding()
+    }
+
+    private var workspaceListContent: some View {
+        List {
+            ForEach(node.workspaces ?? []) { workspace in
+                NavigationLink {
+                    SessionPickerView(workspace: workspace)
+                } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(workspace.name)
+                            .font(.headline)
+                        Text(workspace.path)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            .onDelete(perform: deleteWorkspaces)
         }
     }
 

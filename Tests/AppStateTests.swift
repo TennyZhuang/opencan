@@ -762,6 +762,7 @@ final class AppStateTests: XCTestCase {
             cwd: "/test/path",
             lastEventSeq: 10,
             title: nil,
+            daemonTitle: nil,
             lastUsedAt: nil,
             agentID: nil,
             agentCommand: nil
@@ -776,6 +777,7 @@ final class AppStateTests: XCTestCase {
             cwd: nil,
             lastEventSeq: nil,
             title: "My Session",
+            daemonTitle: nil,
             lastUsedAt: Date(),
             agentID: nil,
             agentCommand: nil
@@ -790,6 +792,7 @@ final class AppStateTests: XCTestCase {
             cwd: "/test/path",
             lastEventSeq: 50,
             title: "Running Session",
+            daemonTitle: nil,
             lastUsedAt: Date(),
             agentID: nil,
             agentCommand: nil
@@ -806,6 +809,7 @@ final class AppStateTests: XCTestCase {
             cwd: "/test",
             lastEventSeq: 0,
             title: nil,
+            daemonTitle: nil,
             lastUsedAt: nil,
             agentID: nil,
             agentCommand: nil
@@ -821,6 +825,7 @@ final class AppStateTests: XCTestCase {
             cwd: "/test",
             lastEventSeq: 1,
             title: nil,
+            daemonTitle: nil,
             lastUsedAt: nil,
             agentID: "custom-agent",
             agentCommand: nil

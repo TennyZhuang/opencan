@@ -488,9 +488,16 @@ func (p *ACPProxy) ForwardFromClient(msg *protocol.Message, client ClientConn) e
 	return p.writeMessage(msg)
 }
 
-// LoadableSessionIDs queries ACP session/list and returns the set of history
-// session IDs that session/load can resolve.
-func (p *ACPProxy) LoadableSessionIDs(timeout time.Duration) (map[string]struct{}, error) {
+// LoadableSession holds metadata for a session discovered via ACP session/list.
+type LoadableSession struct {
+	SessionID string
+	CWD       string
+	Title     string
+}
+
+// LoadableSessions queries ACP session/list and returns full metadata
+// for all sessions that session/load can resolve.
+func (p *ACPProxy) LoadableSessions(timeout time.Duration) ([]LoadableSession, error) {
 	resp, err := p.callACPRequest(protocol.MethodSessionList, map[string]interface{}{}, timeout)
 	if err != nil {
 		return nil, err
@@ -502,6 +509,8 @@ func (p *ACPProxy) LoadableSessionIDs(timeout time.Duration) (map[string]struct{
 	var payload struct {
 		Sessions []struct {
 			SessionID string `json:"sessionId"`
+			CWD       string `json:"cwd"`
+			Title     string `json:"title"`
 		} `json:"sessions"`
 	}
 	if resp.Result != nil {
@@ -510,11 +519,29 @@ func (p *ACPProxy) LoadableSessionIDs(timeout time.Duration) (map[string]struct{
 		}
 	}
 
-	ids := make(map[string]struct{}, len(payload.Sessions))
+	sessions := make([]LoadableSession, 0, len(payload.Sessions))
 	for _, s := range payload.Sessions {
 		if s.SessionID == "" {
 			continue
 		}
+		sessions = append(sessions, LoadableSession{
+			SessionID: s.SessionID,
+			CWD:       s.CWD,
+			Title:     s.Title,
+		})
+	}
+	return sessions, nil
+}
+
+// LoadableSessionIDs queries ACP session/list and returns the set of history
+// session IDs that session/load can resolve.
+func (p *ACPProxy) LoadableSessionIDs(timeout time.Duration) (map[string]struct{}, error) {
+	sessions, err := p.LoadableSessions(timeout)
+	if err != nil {
+		return nil, err
+	}
+	ids := make(map[string]struct{}, len(sessions))
+	for _, s := range sessions {
 		ids[s.SessionID] = struct{}{}
 	}
 	return ids, nil

@@ -16,6 +16,7 @@ type SessionInfo struct {
 	State        proxy.SessionState `json:"state"`
 	LastEventSeq uint64             `json:"lastEventSeq"`
 	Command      string             `json:"command,omitempty"`
+	Title        string             `json:"title,omitempty"`
 }
 
 // SessionManager manages all ACPProxy instances.
@@ -70,7 +71,11 @@ func (sm *SessionManager) GetSession(sessionID string) (*proxy.ACPProxy, bool) {
 	return nil, false
 }
 
-// ListSessions returns info about all sessions.
+// maxExternalSessions is the hard cap on external sessions returned per list call.
+const maxExternalSessions = 50
+
+// ListSessions returns info about all sessions, including external sessions
+// discovered via ACP session/list that are not managed by this daemon.
 func (sm *SessionManager) ListSessions() []SessionInfo {
 	sm.mu.RLock()
 	proxies := make([]*proxy.ACPProxy, 0, len(sm.sessions))
@@ -79,25 +84,30 @@ func (sm *SessionManager) ListSessions() []SessionInfo {
 	}
 	sm.mu.RUnlock()
 
-	needsLoadabilityProbe := false
+	// Collect the set of daemon-managed session IDs.
+	daemonIDs := make(map[string]struct{}, len(proxies))
 	for _, p := range proxies {
-		if shouldFilterSessionFromList(p.State(), p.GetClient() == nil) {
-			needsLoadabilityProbe = true
-			break
-		}
+		daemonIDs[p.SessionID] = struct{}{}
 	}
 
-	var loadableSessionIDs map[string]struct{}
-	hasLoadableSet := false
-	if needsLoadabilityProbe {
-		loadableSessionIDs, hasLoadableSet = sm.loadableSessionSet(proxies)
+	// Always probe ACP session/list when we have any proxy available.
+	// The result serves two purposes:
+	//   1. Filter idle/completed daemon sessions that are no longer loadable.
+	//   2. Discover external sessions not managed by this daemon.
+	loadableSessions, hasLoadableSet := sm.loadableSessions(proxies)
+
+	loadableIDs := make(map[string]struct{}, len(loadableSessions))
+	for _, s := range loadableSessions {
+		loadableIDs[s.SessionID] = struct{}{}
 	}
 
-	infos := make([]SessionInfo, 0, len(proxies))
+	infos := make([]SessionInfo, 0, len(proxies)+maxExternalSessions)
+
+	// Daemon-managed sessions (with loadability filtering for idle/completed).
 	for _, p := range proxies {
 		state := p.State()
 		if shouldFilterSessionFromList(state, p.GetClient() == nil) && hasLoadableSet {
-			if _, ok := loadableSessionIDs[p.SessionID]; !ok {
+			if _, ok := loadableIDs[p.SessionID]; !ok {
 				sm.logger.Debug("hiding non-loadable session from list", "sessionId", p.SessionID, "state", state)
 				continue
 			}
@@ -110,10 +120,31 @@ func (sm *SessionManager) ListSessions() []SessionInfo {
 			Command:      p.Command,
 		})
 	}
+
+	// External sessions: in ACP list but not daemon-managed.
+	if hasLoadableSet {
+		externalCount := 0
+		for _, ls := range loadableSessions {
+			if externalCount >= maxExternalSessions {
+				break
+			}
+			if _, isDaemon := daemonIDs[ls.SessionID]; isDaemon {
+				continue
+			}
+			infos = append(infos, SessionInfo{
+				SessionID: ls.SessionID,
+				CWD:       ls.CWD,
+				State:     proxy.StateExternal,
+				Title:     ls.Title,
+			})
+			externalCount++
+		}
+	}
+
 	return infos
 }
 
-func (sm *SessionManager) loadableSessionSet(proxies []*proxy.ACPProxy) (map[string]struct{}, bool) {
+func (sm *SessionManager) loadableSessions(proxies []*proxy.ACPProxy) ([]proxy.LoadableSession, bool) {
 	var probe *proxy.ACPProxy
 	for _, p := range proxies {
 		state := p.State()
@@ -139,12 +170,12 @@ func (sm *SessionManager) loadableSessionSet(proxies []*proxy.ACPProxy) (map[str
 		return nil, false
 	}
 
-	ids, err := probe.LoadableSessionIDs(1200 * time.Millisecond)
+	sessions, err := probe.LoadableSessions(1200 * time.Millisecond)
 	if err != nil {
 		sm.logger.Warn("session/loadability probe failed; returning unfiltered list", "error", err)
 		return nil, false
 	}
-	return ids, true
+	return sessions, true
 }
 
 func shouldFilterSessionFromList(state proxy.SessionState, hasNoAttachedClient bool) bool {

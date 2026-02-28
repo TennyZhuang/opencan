@@ -12,6 +12,7 @@ const (
 	StateDraining                      // Client disconnected, waiting for prompt to complete
 	StateCompleted                     // Drain complete, prompt finished while client was away
 	StateDead                          // ACP process exited
+	StateExternal                      // Session exists on disk but not managed by daemon
 )
 
 var stateNames = map[SessionState]string{
@@ -21,6 +22,7 @@ var stateNames = map[SessionState]string{
 	StateDraining:  "draining",
 	StateCompleted: "completed",
 	StateDead:      "dead",
+	StateExternal:  "external",
 }
 
 func (s SessionState) String() string {

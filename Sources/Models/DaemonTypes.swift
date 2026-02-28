@@ -10,9 +10,10 @@ struct DaemonInfo {
 struct DaemonSessionInfo: Identifiable {
     let sessionId: String
     let cwd: String
-    let state: String      // "starting", "idle", "prompting", "draining", "completed", "dead"
+    let state: String      // "starting", "idle", "prompting", "draining", "completed", "dead", "external"
     let lastEventSeq: UInt64
     let command: String?
+    let title: String?
 
     var id: String { sessionId }
 }
@@ -36,6 +37,7 @@ struct UnifiedSession: Identifiable {
     let cwd: String?
     let lastEventSeq: UInt64?
     let title: String?
+    let daemonTitle: String?   // title from daemon (e.g., ACP session/list for external sessions)
     let lastUsedAt: Date?
     let agentID: String?
     let agentCommand: String?
@@ -44,7 +46,11 @@ struct UnifiedSession: Identifiable {
     var displayState: String { daemonState ?? "history" }
     /// Even dead daemon sessions are resumable via history recovery.
     var isResumable: Bool { true }
-    var displayTitle: String { title ?? String(sessionId.prefix(8)) }
+    var displayTitle: String {
+        if let title, !title.isEmpty { return title }
+        if let daemonTitle, !daemonTitle.isEmpty { return daemonTitle }
+        return String(sessionId.prefix(8))
+    }
     var agentDisplayName: String? {
         if let known = AgentCommandStore.agent(forAgentID: agentID)?.displayName {
             return known

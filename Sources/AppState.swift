@@ -61,22 +61,21 @@ final class AppState {
 
     // MARK: - Connection
 
-    /// Connect to a workspace's node via SSH and the daemon.
-    /// After this, call createNewSession() or resumeSession() to start chatting.
+    /// Connect to a node via SSH and the daemon.
+    /// After this, set activeWorkspace and call createNewSession() or resumeSession() to start chatting.
     /// If already connected, tears down the old connection first.
-    func connect(workspace: Workspace) {
+    func connect(node: Node) {
         if connectionStatus == .connected || connectionStatus == .connecting {
             cleanupConnection()
         }
-        guard let node = workspace.node, let key = node.sshKey else {
-            connectionError = "Node or SSH key not configured"
+        guard let key = node.sshKey else {
+            connectionError = "SSH key not configured"
             connectionStatus = .failed
             return
         }
 
         connectionStatus = .connecting
         connectionError = nil
-        activeWorkspace = workspace
         activeNode = node
 
         // Build jump server params
@@ -318,6 +317,22 @@ final class AppState {
         messages = []
 
         await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon)
+
+        // External sessions (not managed by daemon) go straight to history recovery.
+        if daemonKnownSession?.state == "external" {
+            Log.toFile("[AppState] External session \(sessionId), recovering via session/load")
+            try await resumeHistorySession(
+                oldSessionId: sessionId,
+                sourceSessionId: sourceSessionId,
+                sourceSessionCwd: sourceSessionCwd,
+                workspace: workspace,
+                agentID: sessionAgent.id,
+                command: sessionAgent.command,
+                daemon: daemon,
+                modelContext: modelContext
+            )
+            return
+        }
 
         Log.toFile("[AppState] Attaching to session \(sessionId)...")
         let shouldReplayFullBuffer = daemonKnownSession?.state == "idle" || daemonKnownSession?.state == "completed"
