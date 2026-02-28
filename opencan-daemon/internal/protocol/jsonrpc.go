@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/creachadair/jrpc2"
 )
 
 // JSONRPCID represents a JSON-RPC request ID that can be either int or string.
@@ -173,13 +175,40 @@ func ParseLine(line []byte) (*Message, error) {
 		return nil, nil
 	}
 
+	rawLine := []byte(trimmed)
+
+	// Let jrpc2 validate/parse request and notification envelopes.
+	// Fallback logic below still handles responses/errors and preserves
+	// existing permissive behavior for malformed request-like payloads.
+	if reqs, err := jrpc2.ParseRequests(rawLine); err == nil && len(reqs) == 1 {
+		parsed := reqs[0]
+		if parsed.Error == nil && parsed.Method != "" {
+			msg := &Message{
+				JSONRPC: "2.0",
+				Method:  parsed.Method,
+			}
+			if parsed.ID != "" {
+				id, err := parseJSONRPCID(json.RawMessage(parsed.ID))
+				if err != nil {
+					return nil, fmt.Errorf("invalid JSON-RPC message: %w", err)
+				}
+				msg.ID = &id
+			}
+			if len(parsed.Params) != 0 {
+				params := json.RawMessage(parsed.Params)
+				msg.Params = &params
+			}
+			return msg, nil
+		}
+	}
+
 	var raw map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+	if err := json.Unmarshal(rawLine, &raw); err != nil {
 		return nil, fmt.Errorf("invalid JSON-RPC message: %w", err)
 	}
 
 	var msg Message
-	if err := json.Unmarshal([]byte(trimmed), &msg); err != nil {
+	if err := json.Unmarshal(rawLine, &msg); err != nil {
 		return nil, fmt.Errorf("invalid JSON-RPC message: %w", err)
 	}
 
@@ -191,6 +220,17 @@ func ParseLine(line []byte) (*Message, error) {
 		msg.Result = &nullResult
 	}
 	return &msg, nil
+}
+
+func parseJSONRPCID(raw json.RawMessage) (JSONRPCID, error) {
+	var id JSONRPCID
+	if err := json.Unmarshal(raw, &id); err != nil {
+		return JSONRPCID{}, err
+	}
+	if id.IsZero() {
+		return JSONRPCID{}, fmt.Errorf("missing id")
+	}
+	return id, nil
 }
 
 // Serialize serializes a Message to JSON bytes (without trailing newline).
