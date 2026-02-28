@@ -141,6 +141,30 @@ func TestDaemon_Hello(t *testing.T) {
 	}
 }
 
+func TestDaemon_Hello_StringRequestIDRoundTrip(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      "hello-1",
+		"method":  "daemon/hello",
+		"params":  map[string]interface{}{"clientVersion": "0.1.0"},
+	})
+
+	resp := readJSON(t, conn)
+	id, ok := resp["id"].(string)
+	if !ok {
+		t.Fatalf("expected string id round-trip, got %T (%v)", resp["id"], resp["id"])
+	}
+	if id != "hello-1" {
+		t.Fatalf("expected id hello-1, got %q", id)
+	}
+}
+
 func TestDaemon_DaemonNotificationWithoutIDDoesNotCrash(t *testing.T) {
 	d, sockPath := testDaemon(t)
 	defer d.Stop()

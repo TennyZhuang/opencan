@@ -115,6 +115,23 @@ func TestParseLine_Response(t *testing.T) {
 	}
 }
 
+func TestParseLine_ResponseWithNullResult(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","id":1,"result":null}`)
+	msg, err := ParseLine(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !msg.IsResponse() {
+		t.Fatal("expected response for explicit null result")
+	}
+	if msg.Result == nil {
+		t.Fatal("expected non-nil raw result for explicit null")
+	}
+	if got := string(*msg.Result); got != "null" {
+		t.Fatalf("expected raw result null, got %q", got)
+	}
+}
+
 func TestParseLine_Error(t *testing.T) {
 	line := []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"not found"}}`)
 	msg, err := ParseLine(line)
@@ -144,6 +161,31 @@ func TestParseLine_NonJSON(t *testing.T) {
 		if msg != nil {
 			t.Fatalf("expected nil for %q, got %v", string(line), msg)
 		}
+	}
+}
+
+func TestParseLine_TrimmedJSON(t *testing.T) {
+	line := []byte(" \t{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"daemon/hello\"}\r\n")
+	msg, err := ParseLine(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg == nil || !msg.IsRequest() {
+		t.Fatalf("expected request, got %#v", msg)
+	}
+	if msg.ID.IntValue() != 7 {
+		t.Fatalf("expected ID 7, got %v", msg.ID)
+	}
+}
+
+func TestParseLine_InvalidJSON(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","id":1,`)
+	msg, err := ParseLine(line)
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+	if msg != nil {
+		t.Fatalf("expected nil message on parse error, got %#v", msg)
 	}
 }
 
@@ -179,6 +221,28 @@ func TestExtractSessionID_Missing(t *testing.T) {
 	msg := &Message{Params: &params}
 	if got := ExtractSessionID(msg); got != "" {
 		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+func TestExtractRouteToSession(t *testing.T) {
+	params := json.RawMessage(`{"sessionId":"old","__routeToSession":"new"}`)
+	msg := &Message{Params: &params}
+	if got := ExtractRouteToSession(msg); got != "new" {
+		t.Fatalf("expected routeToSession 'new', got %q", got)
+	}
+}
+
+func TestExtractRouteToSession_MissingOrInvalid(t *testing.T) {
+	tests := []json.RawMessage{
+		json.RawMessage(`{"sessionId":"old"}`),
+		json.RawMessage(`{"__routeToSession":123}`),
+		json.RawMessage(`[]`),
+	}
+	for _, params := range tests {
+		msg := &Message{Params: &params}
+		if got := ExtractRouteToSession(msg); got != "" {
+			t.Fatalf("expected empty routeToSession for %s, got %q", string(params), got)
+		}
 	}
 }
 
@@ -233,6 +297,23 @@ func TestSetParam(t *testing.T) {
 		t.Fatalf("sessionId lost, got %s", string(p["sessionId"]))
 	}
 	if string(p["__seq"]) != "42" {
+		t.Fatalf("__seq wrong, got %s", string(p["__seq"]))
+	}
+}
+
+func TestSetParam_ReplacesNonObjectParams(t *testing.T) {
+	params := json.RawMessage(`[]`)
+	msg := &Message{Params: &params}
+
+	if err := msg.SetParam("__seq", uint64(9)); err != nil {
+		t.Fatal(err)
+	}
+
+	var p map[string]json.RawMessage
+	if err := json.Unmarshal(*msg.Params, &p); err != nil {
+		t.Fatal(err)
+	}
+	if string(p["__seq"]) != "9" {
 		t.Fatalf("__seq wrong, got %s", string(p["__seq"]))
 	}
 }

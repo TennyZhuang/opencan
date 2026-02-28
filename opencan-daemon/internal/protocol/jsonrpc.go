@@ -12,7 +12,7 @@ type JSONRPCID struct {
 	stringVal *string
 }
 
-func IntID(v int64) JSONRPCID    { return JSONRPCID{intVal: &v} }
+func IntID(v int64) JSONRPCID     { return JSONRPCID{intVal: &v} }
 func StringID(v string) JSONRPCID { return JSONRPCID{stringVal: &v} }
 
 func (id JSONRPCID) IsInt() bool    { return id.intVal != nil }
@@ -173,9 +173,22 @@ func ParseLine(line []byte) (*Message, error) {
 		return nil, nil
 	}
 
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return nil, fmt.Errorf("invalid JSON-RPC message: %w", err)
+	}
+
 	var msg Message
 	if err := json.Unmarshal([]byte(trimmed), &msg); err != nil {
 		return nil, fmt.Errorf("invalid JSON-RPC message: %w", err)
+	}
+
+	// encoding/json sets *json.RawMessage fields to nil for explicit null values.
+	// Preserve explicit `result: null` so downstream logic can classify this as
+	// a valid JSON-RPC response.
+	if _, hasResult := raw["result"]; hasResult && msg.Result == nil {
+		nullResult := json.RawMessage("null")
+		msg.Result = &nullResult
 	}
 	return &msg, nil
 }
