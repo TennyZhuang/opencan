@@ -3,6 +3,8 @@ package proxy
 import (
 	"encoding/json"
 	"sync"
+
+	"github.com/gammazero/deque"
 )
 
 // BufferedEvent is a notification event with a sequence number.
@@ -15,7 +17,7 @@ type BufferedEvent struct {
 // with monotonically increasing sequence numbers.
 type EventBuffer struct {
 	mu      sync.RWMutex
-	events  []BufferedEvent
+	events  deque.Deque[BufferedEvent]
 	nextSeq uint64
 	maxSize int
 }
@@ -25,8 +27,10 @@ func NewEventBuffer(maxSize int) *EventBuffer {
 	if maxSize <= 0 {
 		maxSize = 10000
 	}
+	var events deque.Deque[BufferedEvent]
+	events.SetBaseCap(min(maxSize, 256))
 	return &EventBuffer{
-		events:  make([]BufferedEvent, 0, 256),
+		events:  events,
 		nextSeq: 1,
 		maxSize: maxSize,
 	}
@@ -40,18 +44,14 @@ func (b *EventBuffer) Append(event json.RawMessage) uint64 {
 	seq := b.nextSeq
 	b.nextSeq++
 
-	b.events = append(b.events, BufferedEvent{
+	b.events.PushBack(BufferedEvent{
 		Seq:   seq,
 		Event: event,
 	})
 
 	// Evict oldest events if over capacity.
-	// Copy to a new slice so the old backing array can be GC'd.
-	if len(b.events) > b.maxSize {
-		excess := len(b.events) - b.maxSize
-		kept := make([]BufferedEvent, b.maxSize)
-		copy(kept, b.events[excess:])
-		b.events = kept
+	for b.events.Len() > b.maxSize {
+		b.events.PopFront()
 	}
 
 	return seq
@@ -63,12 +63,20 @@ func (b *EventBuffer) Since(afterSeq uint64) []BufferedEvent {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	for i, e := range b.events {
-		if e.Seq > afterSeq {
-			result := make([]BufferedEvent, len(b.events)-i)
-			copy(result, b.events[i:])
-			return result
+	n := b.events.Len()
+	start := -1
+	for i := 0; i < n; i++ {
+		if b.events.At(i).Seq > afterSeq {
+			start = i
+			break
 		}
+	}
+	if start >= 0 {
+		result := make([]BufferedEvent, 0, n-start)
+		for i := start; i < n; i++ {
+			result = append(result, b.events.At(i))
+		}
+		return result
 	}
 	return nil
 }
@@ -78,15 +86,15 @@ func (b *EventBuffer) LastSeq() uint64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	if len(b.events) == 0 {
+	if b.events.Len() == 0 {
 		return 0
 	}
-	return b.events[len(b.events)-1].Seq
+	return b.events.Back().Seq
 }
 
 // Len returns the current number of events in the buffer.
 func (b *EventBuffer) Len() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return len(b.events)
+	return b.events.Len()
 }
