@@ -33,7 +33,7 @@ struct SessionPickerView: View {
             } else if appState.connectionStatus == .connecting, isSameWorkspace {
                 // Already connecting to this workspace, wait for it
             } else if OpenCANApp.isUITesting {
-                appState.connectMock(workspace: workspace)
+                appState.connectMock(workspace: workspace, scenario: OpenCANApp.uiTestMockScenario)
             } else {
                 appState.connect(workspace: workspace)
             }
@@ -140,32 +140,51 @@ struct SessionPickerView: View {
         }
     }
 
+    private var defaultAgent: AgentKind {
+        AgentKind(rawValue: defaultAgentID) ?? .claude
+    }
+
     private var sessionListView: some View {
         List {
             Section {
-                Menu {
-                    ForEach(availableAgents) { agent in
-                        Button {
-                            Task { await createNew(agent: agent) }
-                        } label: {
-                            let command = AgentCommandStore.command(for: agent)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(agent.displayName)
-                                Text(command)
-                                    .font(.caption2)
+                if OpenCANApp.isUITesting {
+                    Button {
+                        Task { await createNew(agent: defaultAgent) }
+                    } label: {
+                        HStack {
+                            Label("New Session", systemImage: "plus.circle")
+                            if appState.isCreatingSession, loadingSessionId == nil {
+                                Spacer()
+                                ProgressView()
                             }
                         }
                     }
-                } label: {
-                    HStack {
-                        Label("New Session", systemImage: "plus.circle")
-                        if appState.isCreatingSession, loadingSessionId == nil {
-                            Spacer()
-                            ProgressView()
+                    .disabled(appState.isCreatingSession)
+                } else {
+                    Menu {
+                        ForEach(availableAgents) { agent in
+                            Button {
+                                Task { await createNew(agent: agent) }
+                            } label: {
+                                let command = AgentCommandStore.command(for: agent)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(agent.displayName)
+                                    Text(command)
+                                        .font(.caption2)
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack {
+                            Label("New Session", systemImage: "plus.circle")
+                            if appState.isCreatingSession, loadingSessionId == nil {
+                                Spacer()
+                                ProgressView()
+                            }
                         }
                     }
+                    .disabled(appState.isCreatingSession)
                 }
-                .disabled(appState.isCreatingSession)
             }
 
             let sessions = unifiedSessions

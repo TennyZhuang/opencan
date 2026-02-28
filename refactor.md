@@ -180,22 +180,30 @@ iOS:
 
 ## Web-Searched Backlog (Not Yet Implemented)
 
-### [In Progress] UI trial: `ListViewKit` chat timeline
+### [Accepted] UI trial: `ListViewKit` chat timeline (FlowDown-style rows)
 - Date: 2026-02-28
 - Scope:
-  - Added `ListViewKit` dependency and replaced `ChatView`'s `ScrollView + LazyVStack` timeline with a UIKit-backed `ChatMessageListView`.
-  - Kept existing bubble/tool-call visual style by rendering the same markdown + tool cards in hosted row views.
+  - Replaced the previous hosted-SwiftUI row approach with UIKit-native `ListRowView` subclasses, aligned with FlowDown's MessageListView usage pattern.
+  - Introduced dedicated row types:
+    - user message gradient bubble row
+    - assistant markdown row via `MarkdownTextView`
+    - system hint row
+    - tool status hint row
+    - streaming activity row
+  - Kept OpenCAN interaction semantics and data flow; changed timeline rendering internals only.
 - Files:
-  - `Sources/Views/ChatView.swift`
   - `Sources/Views/ChatMessageListView.swift`
-  - `project.yml`
-  - `Package.swift`
+  - `Sources/Views/SessionPickerView.swift`
+  - `Sources/OpenCANApp.swift`
+  - `Sources/Mock/MockScenario.swift`
+  - `UITests/OpenCANUITests.swift`
 - Validation:
   - `xcodebuild -scheme OpenCAN -destination "platform=iOS Simulator,name=iPhone 17 Pro" -quiet build` ✅
-- Follow-up before final acceptance:
-  - Manual check for row-height correctness while markdown streams.
-  - Manual check for near-bottom auto-follow behavior during long prompts.
-  - Decide whether to keep hosted SwiftUI rows or migrate row internals to pure UIKit (for better measurement predictability).
+  - `xcodebuild test -scheme OpenCAN -destination "platform=iOS Simulator,name=iPhone 17 Pro" -only-testing:OpenCANUITests/OpenCANUITests/testSendMessageAndReceiveResponse -only-testing:OpenCANUITests/OpenCANUITests/testLongStreamingKeepsTailVisible` ✅
+- Notes:
+  - Added `MockScenario.longStream` and `--uitesting-long-stream` launch arg for repeatable long-stream scroll-follow regression checks.
+  - Kept `SessionPickerView` in button mode for UI tests (no menu interaction) to preserve deterministic automation.
+  - Trial judged acceptable: less hacky than hosted rows, better measurement predictability, and testable tail-follow behavior.
 
 ### UI candidate: `ListViewKit` (high priority for scroll stability)
 - Repo: https://github.com/Lakr233/ListViewKit

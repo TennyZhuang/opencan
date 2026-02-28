@@ -4,6 +4,15 @@ import SwiftData
 @main
 struct OpenCANApp: App {
     static let isUITesting = CommandLine.arguments.contains("--uitesting")
+    static let uiTestMockScenario: MockScenario = {
+        if CommandLine.arguments.contains("--uitesting-long-stream") {
+            return .longStream
+        }
+        if CommandLine.arguments.contains("--uitesting-with-tool-call") {
+            return .withToolCall
+        }
+        return .simple
+    }()
 
     @State private var appState = AppState()
     let modelContainer: ModelContainer

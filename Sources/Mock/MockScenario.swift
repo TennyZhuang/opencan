@@ -14,6 +14,8 @@ enum MockScenario {
     case complex
     /// Simulates an error mid-stream.
     case error
+    /// Long streaming response for timeline/scroll stress tests.
+    case longStream
 
     var steps: [MockStep] {
         switch self {
@@ -99,6 +101,20 @@ enum MockScenario {
                 .delay(milliseconds: 50),
                 .promptComplete(.endTurn),
             ]
+        case .longStream:
+            var steps: [MockStep] = [
+                .delay(milliseconds: 80),
+                .textDelta("Starting long stream test.\n\n"),
+            ]
+            for index in 1 ... 40 {
+                steps.append(.delay(milliseconds: 30))
+                steps.append(.textDelta("Line \(index): The quick brown fox jumps over the lazy dog.\n"))
+            }
+            steps.append(.delay(milliseconds: 40))
+            steps.append(.textDelta("\nEND_LONG_STREAM_TOKEN"))
+            steps.append(.delay(milliseconds: 30))
+            steps.append(.promptComplete(.endTurn))
+            return steps
         }
     }
 }

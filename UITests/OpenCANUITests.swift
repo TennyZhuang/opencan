@@ -94,11 +94,30 @@ final class OpenCANUITests: XCTestCase {
         )
     }
 
+    /// Tap New Session and select a default agent when session creation uses a menu.
+    private func tapNewSession(in app: XCUIApplication) {
+        let newSessionButton = app.buttons["New Session"]
+        XCTAssertTrue(newSessionButton.waitForExistence(timeout: 10))
+        newSessionButton.tap()
+
+        // In newer UI, New Session opens a menu instead of creating immediately.
+        let claudeAction = app.buttons["Claude Code"]
+        if claudeAction.waitForExistence(timeout: 1) {
+            claudeAction.tap()
+            return
+        }
+
+        let codexAction = app.buttons["Codex"]
+        if codexAction.waitForExistence(timeout: 1) {
+            codexAction.tap()
+        }
+    }
+
     /// Create a new session and verify we land in ChatView.
     private func createSessionAndEnterChat() {
         navigateToSessionPicker()
 
-        app.buttons["New Session"].tap()
+        tapNewSession(in: app)
 
         // Verify system message proves session was actually created
         let systemMessage = app.staticTexts["New session on home"]
@@ -124,7 +143,7 @@ final class OpenCANUITests: XCTestCase {
         let newSessionButton = app.buttons["New Session"]
         XCTAssertTrue(newSessionButton.isEnabled, "New Session button should be enabled before tap")
 
-        newSessionButton.tap()
+        tapNewSession(in: app)
 
         // Mock creates session nearly instantly — we may already be in ChatView.
         // Verify either: (a) button is disabled (still on session picker), or
@@ -219,6 +238,49 @@ final class OpenCANUITests: XCTestCase {
         XCTAssertTrue(disconnectButton.waitForExistence(timeout: 5))
     }
 
+    func testLongStreamingKeepsTailVisible() throws {
+        app.terminate()
+        let longApp = XCUIApplication()
+        longApp.launchArguments = ["--uitesting", "--uitesting-long-stream"]
+        longApp.launch()
+
+        let cp32 = longApp.staticTexts["cp32"]
+        XCTAssertTrue(cp32.waitForExistence(timeout: 5))
+        cp32.tap()
+
+        let home = longApp.staticTexts["home"]
+        XCTAssertTrue(home.waitForExistence(timeout: 3))
+        home.tap()
+
+        let newSessionButton = longApp.buttons["New Session"]
+        XCTAssertTrue(newSessionButton.waitForExistence(timeout: 10))
+        tapNewSession(in: longApp)
+
+        let input = longApp.textFields.firstMatch
+        XCTAssertTrue(input.waitForExistence(timeout: 5))
+        input.tap()
+        input.typeText("Run long stream")
+        longApp.buttons["arrow.up.circle.fill"].tap()
+
+        let tailText = longApp.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "END_LONG_STREAM_TOKEN")
+        ).firstMatch
+        XCTAssertTrue(
+            tailText.waitForExistence(timeout: 20),
+            "Expected long stream tail token to appear"
+        )
+        XCTAssertTrue(
+            tailText.isHittable,
+            "Expected long stream tail token to remain visible near bottom"
+        )
+
+        let thinking = longApp.staticTexts["Thinking..."]
+        XCTAssertFalse(
+            thinking.exists,
+            "Thinking indicator should disappear after long stream completes"
+        )
+    }
+
     // MARK: - Integration Tests (requires cp32 server)
 
     func testIntegrationSendMessage() throws {
@@ -240,7 +302,7 @@ final class OpenCANUITests: XCTestCase {
             throw XCTSkip("Could not connect to cp32 — server may be unreachable")
         }
 
-        newSessionButton.tap()
+        tapNewSession(in: integrationApp)
 
         let systemMessage = integrationApp.staticTexts["New session on home"]
         guard systemMessage.waitForExistence(timeout: 15) else {
