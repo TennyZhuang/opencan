@@ -206,6 +206,12 @@ extension ChatMessageListView {
                 return
             }
 
+            if let flowRow = rowView as? FlowMessageRowView {
+                flowRow.menuProvider = { [weak self] in
+                    self?.contextMenu(for: entry)
+                }
+            }
+
             if let rowView = rowView as? FlowUserMessageRowView {
                 rowView.text = entry.text
                 return
@@ -309,6 +315,81 @@ extension ChatMessageListView {
             labelForSizing.preferredMaxLayoutWidth = width
             labelForSizing.attributedText = attributedText
             return ceil(labelForSizing.intrinsicContentSize.height)
+        }
+
+        private func contextMenu(for entry: ChatListEntry) -> UIMenu? {
+            var actions: [UIAction] = []
+
+            switch entry.kind {
+            case .assistantMessage, .userMessage, .systemHint:
+                guard !entry.text.isEmpty else { return nil }
+                let text = entry.text
+                actions.append(
+                    UIAction(title: "Copy", image: UIImage(systemName: "doc.on.doc")) { _ in
+                        UIPasteboard.general.string = text
+                    }
+                )
+                actions.append(
+                    UIAction(title: "View Raw", image: UIImage(systemName: "eye")) { [weak self] _ in
+                        self?.presentRawText(text)
+                    }
+                )
+
+            case .toolHint:
+                guard let toolCall = entry.toolCall else { return nil }
+                let raw = Self.toolCallRawText(toolCall)
+                actions.append(
+                    UIAction(title: "Copy", image: UIImage(systemName: "doc.on.doc")) { _ in
+                        UIPasteboard.general.string = raw
+                    }
+                )
+                actions.append(
+                    UIAction(title: "View Raw", image: UIImage(systemName: "eye")) { [weak self] _ in
+                        self?.presentRawText(raw)
+                    }
+                )
+
+            case .activity:
+                return nil
+            }
+
+            return actions.isEmpty ? nil : UIMenu(children: actions)
+        }
+
+        private func presentRawText(_ text: String) {
+            guard let listView,
+                  let presenter = listView.closestViewController else {
+                return
+            }
+
+            let viewer = RawTextViewController(text: text)
+            let nav = UINavigationController(rootViewController: viewer)
+            nav.modalPresentationStyle = .formSheet
+            presenter.present(nav, animated: true)
+        }
+
+        private static func toolCallRawText(_ toolCall: ToolCallInfo) -> String {
+            var lines: [String] = []
+            lines.append("Tool: \(toolCall.name)")
+            if let input = toolCall.input {
+                lines.append("")
+                lines.append("Input:")
+                lines.append(ToolCallView.formatJSON(input))
+            }
+            if let output = toolCall.output, !output.isEmpty {
+                lines.append("")
+                lines.append("Output:")
+                lines.append(output)
+            }
+            lines.append("")
+            if toolCall.isFailed {
+                lines.append("Status: failed")
+            } else if toolCall.isComplete {
+                lines.append("Status: completed")
+            } else {
+                lines.append("Status: running")
+            }
+            return lines.joined(separator: "\n")
         }
 
         private func scrollToBottom(animated: Bool) {
@@ -449,13 +530,16 @@ struct ChatListEntry: Identifiable, Hashable {
     }
 }
 
-class FlowMessageRowView: ListRowView {
+class FlowMessageRowView: ListRowView, UIContextMenuInteractionDelegate {
     let containerView = UIView()
+    var menuProvider: (() -> UIMenu?)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         clipsToBounds = false
         addSubview(containerView)
+        containerView.isUserInteractionEnabled = true
+        containerView.addInteraction(UIContextMenuInteraction(delegate: self))
     }
 
     @available(*, unavailable)
@@ -480,6 +564,19 @@ class FlowMessageRowView: ListRowView {
     override func prepareForReuse() {
         super.prepareForReuse()
         accessibilityLabel = nil
+        menuProvider = nil
+    }
+
+    // MARK: - UIContextMenuInteractionDelegate
+
+    func contextMenuInteraction(
+        _: UIContextMenuInteraction,
+        configurationForMenuAtLocation _: CGPoint
+    ) -> UIContextMenuConfiguration? {
+        guard let menu = menuProvider?() else { return nil }
+        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { _ in
+            menu
+        }
     }
 }
 
@@ -786,5 +883,72 @@ final class FlowActivityRowView: FlowMessageRowView {
             width: min(labelSize.width, containerView.bounds.width - spinner.frame.maxX - 8),
             height: labelSize.height
         )
+    }
+}
+
+final class RawTextViewController: UIViewController {
+    private let content: String
+    private let textView = UITextView()
+
+    init(text: String) {
+        content = text
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        view.backgroundColor = .systemBackground
+        title = "Raw Content"
+
+        textView.text = content
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        textView.backgroundColor = .clear
+        textView.textContainerInset = .init(top: 16, left: 16, bottom: 16, right: 16)
+        textView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        textView.frame = view.bounds
+        view.addSubview(textView)
+
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            title: "Copy",
+            style: .plain,
+            target: self,
+            action: #selector(copyText)
+        )
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            barButtonSystemItem: .done,
+            target: self,
+            action: #selector(close)
+        )
+    }
+
+    @objc
+    private func copyText() {
+        UIPasteboard.general.string = content
+    }
+
+    @objc
+    private func close() {
+        dismiss(animated: true)
+    }
+}
+
+private extension UIView {
+    var closestViewController: UIViewController? {
+        var responder: UIResponder? = self
+        while let current = responder {
+            if let viewController = current as? UIViewController {
+                return viewController
+            }
+            responder = current.next
+        }
+        return nil
     }
 }

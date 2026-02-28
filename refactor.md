@@ -203,6 +203,7 @@ iOS:
 - Notes:
   - Added `MockScenario.longStream` and `--uitesting-long-stream` launch arg for repeatable long-stream scroll-follow regression checks.
   - Kept `SessionPickerView` in button mode for UI tests (no menu interaction) to preserve deterministic automation.
+  - Added FlowDown-style message context actions back to the UIKit rows: `Copy` + `View Raw` (raw text viewer with selectable text and copy button).
   - Trial judged acceptable: less hacky than hosted rows, better measurement predictability, and testable tail-follow behavior.
 
 ### UI candidate: `ListViewKit` (high priority for scroll stability)
