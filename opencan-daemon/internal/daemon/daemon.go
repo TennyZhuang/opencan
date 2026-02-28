@@ -6,21 +6,23 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
+
+	"github.com/nightlyone/lockfile"
 )
 
 // Daemon is the main daemon process that listens for client connections.
 type Daemon struct {
-	socketPath  string
-	pidFile     string
-	listener    net.Listener
-	sessions    *SessionManager
-	logger      *slog.Logger
+	socketPath string
+	pidFile    string
+	pidLock    *lockfile.Lockfile
+	listener   net.Listener
+	sessions   *SessionManager
+	logger     *slog.Logger
 
-	clientsMu   sync.Mutex
-	clients     map[*ClientHandler]struct{}
+	clientsMu sync.Mutex
+	clients   map[*ClientHandler]struct{}
 
 	idleTimeout time.Duration
 	timerMu     sync.Mutex
@@ -69,23 +71,31 @@ func (d *Daemon) Run() error {
 		return fmt.Errorf("create dir %s: %w", dir, err)
 	}
 
+	pidLock, err := lockfile.New(d.pidFile)
+	if err != nil {
+		return fmt.Errorf("create pid lock: %w", err)
+	}
+	if err := pidLock.TryLock(); err != nil {
+		return fmt.Errorf("acquire pid lock: %w", err)
+	}
+	d.pidLock = &pidLock
+
 	// Remove stale socket
 	os.Remove(d.socketPath)
 
 	// Listen
 	listener, err := net.Listen("unix", d.socketPath)
 	if err != nil {
+		if unlockErr := d.pidLock.Unlock(); unlockErr != nil {
+			d.logger.Warn("failed to release PID lock", "error", unlockErr)
+		}
+		d.pidLock = nil
 		return fmt.Errorf("listen %s: %w", d.socketPath, err)
 	}
 	d.listener = listener
 
 	// Set socket permissions
 	os.Chmod(d.socketPath, 0600)
-
-	// Write PID file
-	if err := os.WriteFile(d.pidFile, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
-		d.logger.Warn("failed to write PID file", "error", err)
-	}
 
 	d.logger.Info("daemon started", "socket", d.socketPath, "pid", os.Getpid())
 
@@ -191,7 +201,12 @@ func (d *Daemon) cleanup() {
 	}
 	d.timerMu.Unlock()
 	os.Remove(d.socketPath)
-	os.Remove(d.pidFile)
+	if d.pidLock != nil {
+		if err := d.pidLock.Unlock(); err != nil {
+			d.logger.Warn("failed to release PID lock", "error", err)
+		}
+		d.pidLock = nil
+	}
 }
 
 // Status returns a summary of the daemon state.

@@ -8,10 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
+
+	"github.com/nightlyone/lockfile"
 )
 
 // Run connects to the daemon socket, bridging stdin/stdout.
@@ -99,18 +99,12 @@ func IsDaemonRunning() (bool, int) {
 	home, _ := os.UserHomeDir()
 	pidFile := filepath.Join(home, ".opencan", "daemon.pid")
 
-	data, err := os.ReadFile(pidFile)
+	lock, err := lockfile.New(pidFile)
 	if err != nil {
 		return false, 0
 	}
 
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return false, 0
-	}
-
-	// Check if process exists
-	process, err := os.FindProcess(pid)
+	process, err := lock.GetOwner()
 	if err != nil {
 		return false, 0
 	}
@@ -121,19 +115,25 @@ func IsDaemonRunning() (bool, int) {
 		return false, 0
 	}
 
-	return true, pid
+	return true, process.Pid
 }
 
 // StopDaemon sends SIGTERM to the daemon process.
 func StopDaemon() error {
-	running, pid := IsDaemonRunning()
-	if !running {
+	home, _ := os.UserHomeDir()
+	pidFile := filepath.Join(home, ".opencan", "daemon.pid")
+
+	lock, err := lockfile.New(pidFile)
+	if err != nil {
 		return fmt.Errorf("daemon is not running")
 	}
 
-	process, err := os.FindProcess(pid)
+	process, err := lock.GetOwner()
 	if err != nil {
+		return fmt.Errorf("daemon is not running")
+	}
+	if err := process.Signal(syscall.SIGTERM); err != nil {
 		return err
 	}
-	return process.Signal(syscall.SIGTERM)
+	return nil
 }
