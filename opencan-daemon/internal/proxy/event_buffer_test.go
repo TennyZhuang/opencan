@@ -151,3 +151,66 @@ func TestEventBuffer_ConcurrentAccess(t *testing.T) {
 		t.Fatalf("expected 1000 events, got %d", buf.Len())
 	}
 }
+
+func TestEventBuffer_DefaultMaxSizeWhenInvalid(t *testing.T) {
+	buf := NewEventBuffer(0)
+
+	for i := 0; i < 10005; i++ {
+		buf.Append(json.RawMessage(`{}`))
+	}
+
+	if buf.Len() != 10000 {
+		t.Fatalf("expected default max size 10000, got %d", buf.Len())
+	}
+
+	events := buf.Since(0)
+	if len(events) != 10000 {
+		t.Fatalf("expected 10000 events in replay, got %d", len(events))
+	}
+	// 5 events should be evicted from the front.
+	if events[0].Seq != 6 {
+		t.Fatalf("expected oldest seq 6 after default overflow, got %d", events[0].Seq)
+	}
+	if buf.LastSeq() != 10005 {
+		t.Fatalf("expected last seq 10005, got %d", buf.LastSeq())
+	}
+}
+
+func TestEventBuffer_SequenceMonotonicAfterHeavyOverflow(t *testing.T) {
+	buf := NewEventBuffer(2)
+
+	for i := 0; i < 10; i++ {
+		buf.Append(json.RawMessage(`{}`))
+	}
+
+	if got := buf.LastSeq(); got != 10 {
+		t.Fatalf("expected last seq 10, got %d", got)
+	}
+
+	events := buf.Since(0)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Seq != 9 || events[1].Seq != 10 {
+		t.Fatalf("expected seqs [9,10], got [%d,%d]", events[0].Seq, events[1].Seq)
+	}
+}
+
+func TestEventBuffer_SinceReturnsSnapshotCopy(t *testing.T) {
+	buf := NewEventBuffer(10)
+	buf.Append(json.RawMessage(`{"event":1}`))
+	buf.Append(json.RawMessage(`{"event":2}`))
+
+	snapshot := buf.Since(0)
+	if len(snapshot) != 2 {
+		t.Fatalf("expected snapshot len 2, got %d", len(snapshot))
+	}
+
+	buf.Append(json.RawMessage(`{"event":3}`))
+	if len(snapshot) != 2 {
+		t.Fatalf("snapshot should stay unchanged after append, got len %d", len(snapshot))
+	}
+	if snapshot[0].Seq != 1 || snapshot[1].Seq != 2 {
+		t.Fatalf("snapshot sequence changed unexpectedly: %+v", snapshot)
+	}
+}
