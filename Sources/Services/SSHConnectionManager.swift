@@ -344,9 +344,8 @@ actor SSHConnectionManager {
         guard let client = targetClient else {
             throw SSHError.notConnected
         }
-        let normalizedPath = try normalizeRemotePath(path)
         let command = try tildeResolvedCommand(
-            path: normalizedPath,
+            path: path,
             body: """
         if mkdir -p "$resolved_path"; then
           echo "__opencan_mkdir_ok__"
@@ -358,7 +357,7 @@ actor SSHConnectionManager {
         let output = try await client.executeCommand(command)
         let outputString = String(buffer: output)
         guard outputString.contains("__opencan_mkdir_ok__") else {
-            throw SSHError.remoteCommandFailed("Failed to create remote directory '\(normalizedPath)'")
+            throw SSHError.remoteCommandFailed("Failed to create remote directory '\(path)'")
         }
     }
 
