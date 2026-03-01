@@ -117,8 +117,11 @@ struct OpenCANApp: App {
 
             if let jumpHost = envValue("OPENCAN_TEST_JUMP_HOST", in: env) {
                 guard let jumpUsername = envValue("OPENCAN_TEST_JUMP_USERNAME", in: env) else {
-                    Log.toFile("[Seed] Integration seed skipped: OPENCAN_TEST_JUMP_USERNAME is missing")
-                    return
+                    throw NSError(
+                        domain: "OpenCANApp.Seed",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "OPENCAN_TEST_JUMP_USERNAME is missing"]
+                    )
                 }
                 let jumpPort = Int(envValue("OPENCAN_TEST_JUMP_PORT", in: env) ?? "") ?? 22
                 let jumpKeyPEMRaw = envValue("OPENCAN_TEST_JUMP_PRIVATE_KEY_PEM", in: env) ?? nodeKeyPEMRaw

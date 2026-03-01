@@ -23,7 +23,18 @@ enum SSHKeyPairError: LocalizedError {
 }
 
 private enum SSHPrivateKeyKeychain {
-    private static let service = "com.tianyizhuang.OpenCAN.ssh-private-keys"
+    private static var service: String {
+        #if DEBUG
+        if let override = ProcessInfo.processInfo.environment["OPENCAN_KEYCHAIN_SERVICE"], !override.isEmpty {
+            return override
+        }
+        // Keep unit tests isolated from the app's real keychain service namespace.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return "com.tianyizhuang.OpenCAN.ssh-private-keys.tests.\(ProcessInfo.processInfo.processIdentifier)"
+        }
+        #endif
+        return "com.tianyizhuang.OpenCAN.ssh-private-keys"
+    }
 
     static func load(identifier: String) throws -> Data? {
         var query = baseQuery(identifier: identifier)

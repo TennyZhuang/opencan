@@ -69,5 +69,16 @@ struct NodeListView: View {
         for index in offsets {
             modelContext.delete(nodes[index])
         }
+        do {
+            try modelContext.save()
+            let remainingKeys = try modelContext.fetch(FetchDescriptor<SSHKeyPair>())
+            let validIdentifiers = SSHKeyPair.keychainIdentifiers(in: remainingKeys)
+            let removed = try SSHKeyPair.cleanupOrphanedKeychainEntries(validIdentifiers: validIdentifiers)
+            if removed > 0 {
+                Log.toFile("[Security] Removed \(removed) orphaned SSH keychain entr\(removed == 1 ? "y" : "ies") after node deletion")
+            }
+        } catch {
+            Log.toFile("[Security] Failed to clean up SSH keychain entries after node deletion: \(error)")
+        }
     }
 }
