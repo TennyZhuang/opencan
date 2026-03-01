@@ -112,16 +112,40 @@ actor DaemonClient {
         guard let arr = value?.arrayValue else { return [] }
         return arr.compactMap { item in
             guard let id = item["sessionId"]?.stringValue else { return nil }
+            let updatedAt = parseDaemonDate(item["updatedAt"]?.stringValue)
             return DaemonSessionInfo(
                 sessionId: id,
                 cwd: item["cwd"]?.stringValue ?? "",
                 state: item["state"]?.stringValue ?? "unknown",
                 lastEventSeq: UInt64(item["lastEventSeq"]?.intValue ?? 0),
                 command: item["command"]?.stringValue,
-                title: item["title"]?.stringValue
+                title: item["title"]?.stringValue,
+                updatedAt: updatedAt
             )
         }
     }
+
+    private func parseDaemonDate(_ raw: String?) -> Date? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        if let date = Self.iso8601WithFractional.date(from: raw) {
+            return date
+        }
+        return Self.iso8601.date(from: raw)
+    }
+
+    private static let iso8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private static let iso8601WithFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 
     private func parseAgentAvailability(_ value: JSONValue?) -> [DaemonAgentAvailability] {
         guard let arr = value?.arrayValue else { return [] }

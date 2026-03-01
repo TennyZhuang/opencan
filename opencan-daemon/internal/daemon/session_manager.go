@@ -17,6 +17,7 @@ type SessionInfo struct {
 	LastEventSeq uint64             `json:"lastEventSeq"`
 	Command      string             `json:"command,omitempty"`
 	Title        string             `json:"title,omitempty"`
+	UpdatedAt    string             `json:"updatedAt,omitempty"`
 }
 
 // SessionManager manages all ACPProxy instances.
@@ -141,6 +142,7 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 				CWD:       ls.CWD,
 				State:     proxy.StateExternal,
 				Title:     ls.Title,
+				UpdatedAt: ls.UpdatedAt,
 			})
 			externalCount++
 		}

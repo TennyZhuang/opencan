@@ -496,6 +496,7 @@ type LoadableSession struct {
 	SessionID string
 	CWD       string
 	Title     string
+	UpdatedAt string
 }
 
 // LoadableSessions queries ACP session/list and returns full metadata
@@ -524,6 +525,7 @@ func (p *ACPProxy) LoadableSessionsForCWD(timeout time.Duration, cwd string) ([]
 			SessionID string `json:"sessionId"`
 			CWD       string `json:"cwd"`
 			Title     string `json:"title"`
+			UpdatedAt string `json:"updatedAt"`
 		} `json:"sessions"`
 	}
 	if resp.Result != nil {
@@ -541,6 +543,7 @@ func (p *ACPProxy) LoadableSessionsForCWD(timeout time.Duration, cwd string) ([]
 			SessionID: s.SessionID,
 			CWD:       s.CWD,
 			Title:     s.Title,
+			UpdatedAt: s.UpdatedAt,
 		})
 	}
 	return sessions, nil

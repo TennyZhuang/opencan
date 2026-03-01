@@ -21,6 +21,25 @@ struct DaemonSessionInfo: Identifiable {
     let lastEventSeq: UInt64
     let command: String?
     let title: String?
+    let updatedAt: Date?
+
+    init(
+        sessionId: String,
+        cwd: String,
+        state: String,
+        lastEventSeq: UInt64,
+        command: String?,
+        title: String?,
+        updatedAt: Date? = nil
+    ) {
+        self.sessionId = sessionId
+        self.cwd = cwd
+        self.state = state
+        self.lastEventSeq = lastEventSeq
+        self.command = command
+        self.title = title
+        self.updatedAt = updatedAt
+    }
 
     var id: String { sessionId }
 }
@@ -46,9 +65,36 @@ struct UnifiedSession: Identifiable {
     let title: String?
     let daemonTitle: String?   // title from daemon (e.g., ACP session/list for external sessions)
     let lastUsedAt: Date?
+    let daemonUpdatedAt: Date?
     let agentID: String?
     let agentCommand: String?
     var id: String { sessionId }
+
+    var effectiveLastUsedAt: Date? { lastUsedAt ?? daemonUpdatedAt }
+
+    init(
+        sessionId: String,
+        daemonState: String?,
+        cwd: String?,
+        lastEventSeq: UInt64?,
+        title: String?,
+        daemonTitle: String?,
+        lastUsedAt: Date?,
+        daemonUpdatedAt: Date? = nil,
+        agentID: String?,
+        agentCommand: String?
+    ) {
+        self.sessionId = sessionId
+        self.daemonState = daemonState
+        self.cwd = cwd
+        self.lastEventSeq = lastEventSeq
+        self.title = title
+        self.daemonTitle = daemonTitle
+        self.lastUsedAt = lastUsedAt
+        self.daemonUpdatedAt = daemonUpdatedAt
+        self.agentID = agentID
+        self.agentCommand = agentCommand
+    }
 
     var displayState: String { daemonState ?? "history" }
     /// Even dead daemon sessions are resumable via history recovery.

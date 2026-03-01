@@ -127,6 +127,7 @@ struct SessionPickerView: View {
                 title: local?.title,
                 daemonTitle: daemon?.title,
                 lastUsedAt: local?.lastUsedAt,
+                daemonUpdatedAt: daemon?.updatedAt,
                 agentID: local?.agentID,
                 agentCommand: local?.agentCommand ?? daemon?.command
             )
@@ -140,8 +141,8 @@ struct SessionPickerView: View {
             let bActive = b.daemonState == "prompting" || b.daemonState == "draining"
             if aActive != bActive { return aActive }
 
-            let aDate = a.lastUsedAt ?? .distantPast
-            let bDate = b.lastUsedAt ?? .distantPast
+            let aDate = a.effectiveLastUsedAt ?? .distantPast
+            let bDate = b.effectiveLastUsedAt ?? .distantPast
             return aDate > bDate
         }
     }
@@ -237,7 +238,12 @@ struct SessionPickerView: View {
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
-                                    if let date = session.lastUsedAt {
+                                    Text(session.sessionId)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .textSelection(.enabled)
+                                    if let date = session.effectiveLastUsedAt {
                                         Text(date.formatted(.relative(presentation: .named)))
                                             .font(.caption)
                                             .foregroundStyle(.secondary)

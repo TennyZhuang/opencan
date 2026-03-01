@@ -1165,6 +1165,7 @@ final class AppStateTests: XCTestCase {
                 "cwd": .string("/test/path"),
                 "state": .string("prompting"),
                 "lastEventSeq": .int(42),
+                "updatedAt": .string("2026-02-25T10:30:00Z"),
             ]
         ])
 
@@ -1174,6 +1175,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.daemonSessions.first?.sessionId, "daemon-s-1")
         XCTAssertEqual(appState.daemonSessions.first?.state, "prompting")
         XCTAssertEqual(appState.daemonSessions.first?.lastEventSeq, 42)
+        XCTAssertNotNil(appState.daemonSessions.first?.updatedAt)
     }
 
     // MARK: - UnifiedSession Tests
@@ -1239,6 +1241,23 @@ final class AppStateTests: XCTestCase {
         )
         XCTAssertTrue(unified.isResumable)
         XCTAssertEqual(unified.displayState, "dead")
+    }
+
+    func testUnifiedSessionUsesDaemonUpdatedAtWhenNoLocalTimestamp() {
+        let daemonDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let unified = UnifiedSession(
+            sessionId: "external-no-local-date",
+            daemonState: "external",
+            cwd: "/test",
+            lastEventSeq: 0,
+            title: nil,
+            daemonTitle: "External Session",
+            lastUsedAt: nil,
+            daemonUpdatedAt: daemonDate,
+            agentID: nil,
+            agentCommand: nil
+        )
+        XCTAssertEqual(unified.effectiveLastUsedAt, daemonDate)
     }
 
     func testUnifiedSessionUnknownAgentIDFallsBackToRawValue() {
