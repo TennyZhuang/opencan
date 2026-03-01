@@ -2,11 +2,128 @@ import XCTest
 
 final class OpenCANUITests: XCTestCase {
     let app = XCUIApplication()
+    private let integrationEnvKeys = [
+        "OPENCAN_TEST_NODE_NAME",
+        "OPENCAN_TEST_NODE_HOST",
+        "OPENCAN_TEST_NODE_PORT",
+        "OPENCAN_TEST_NODE_USERNAME",
+        "OPENCAN_TEST_WORKSPACE_NAME",
+        "OPENCAN_TEST_WORKSPACE_PATH",
+        "OPENCAN_TEST_SSH_PRIVATE_KEY_PEM",
+        "OPENCAN_TEST_SSH_KEY_PATH",
+        "OPENCAN_TEST_JUMP_NODE_NAME",
+        "OPENCAN_TEST_JUMP_HOST",
+        "OPENCAN_TEST_JUMP_PORT",
+        "OPENCAN_TEST_JUMP_USERNAME",
+        "OPENCAN_TEST_JUMP_PRIVATE_KEY_PEM",
+        "OPENCAN_TEST_JUMP_KEY_PATH"
+    ]
 
     override func setUpWithError() throws {
         continueAfterFailure = false
         app.launchArguments = ["--uitesting"]
         app.launch()
+    }
+
+    private func repoRootURL() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // UITests/
+            .deletingLastPathComponent() // repo root
+    }
+
+    private func loadDotEnvIfPresent() -> [String: String] {
+        let dotenvURL = repoRootURL().appendingPathComponent(".env")
+        guard let data = try? Data(contentsOf: dotenvURL), let raw = String(data: data, encoding: .utf8) else {
+            return [:]
+        }
+
+        var env: [String: String] = [:]
+        for rawLine in raw.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") {
+                continue
+            }
+
+            let withoutExport: String
+            if line.hasPrefix("export ") {
+                withoutExport = String(line.dropFirst("export ".count))
+            } else {
+                withoutExport = line
+            }
+
+            guard let equalIndex = withoutExport.firstIndex(of: "=") else {
+                continue
+            }
+            let key = withoutExport[..<equalIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+            var value = withoutExport[withoutExport.index(after: equalIndex)...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+                value = String(value.dropFirst().dropLast())
+            } else if value.hasPrefix("'"), value.hasSuffix("'"), value.count >= 2 {
+                value = String(value.dropFirst().dropLast())
+            }
+
+            env[key] = value
+        }
+
+        return env
+    }
+
+    private func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private func expandTilde(_ path: String) -> String {
+        NSString(string: path).expandingTildeInPath
+    }
+
+    private func integrationLaunchEnvironment() throws -> [String: String] {
+        var env: [String: String] = [:]
+        let processEnv = ProcessInfo.processInfo.environment
+
+        for key in integrationEnvKeys {
+            if let value = processEnv[key] {
+                env[key] = value
+            }
+        }
+        for (key, value) in loadDotEnvIfPresent() where integrationEnvKeys.contains(key) {
+            env[key] = value
+        }
+
+        if nonEmpty(env["OPENCAN_TEST_SSH_PRIVATE_KEY_PEM"]) == nil,
+           let keyPath = nonEmpty(env["OPENCAN_TEST_SSH_KEY_PATH"]) {
+            let resolvedKeyPath = expandTilde(keyPath)
+            do {
+                env["OPENCAN_TEST_SSH_PRIVATE_KEY_PEM"] = try String(contentsOfFile: resolvedKeyPath, encoding: .utf8)
+            } catch {
+                throw XCTSkip("Cannot read OPENCAN_TEST_SSH_KEY_PATH at \(resolvedKeyPath): \(error)")
+            }
+        }
+
+        if nonEmpty(env["OPENCAN_TEST_JUMP_PRIVATE_KEY_PEM"]) == nil,
+           let jumpKeyPath = nonEmpty(env["OPENCAN_TEST_JUMP_KEY_PATH"]) {
+            let resolvedJumpKeyPath = expandTilde(jumpKeyPath)
+            do {
+                env["OPENCAN_TEST_JUMP_PRIVATE_KEY_PEM"] = try String(contentsOfFile: resolvedJumpKeyPath, encoding: .utf8)
+            } catch {
+                throw XCTSkip("Cannot read OPENCAN_TEST_JUMP_KEY_PATH at \(resolvedJumpKeyPath): \(error)")
+            }
+        }
+
+        if nonEmpty(env["OPENCAN_TEST_JUMP_PRIVATE_KEY_PEM"]) == nil {
+            env["OPENCAN_TEST_JUMP_PRIVATE_KEY_PEM"] = env["OPENCAN_TEST_SSH_PRIVATE_KEY_PEM"]
+        }
+
+        if nonEmpty(env["OPENCAN_TEST_JUMP_HOST"]) != nil,
+           nonEmpty(env["OPENCAN_TEST_JUMP_USERNAME"]) == nil {
+            throw XCTSkip("OPENCAN_TEST_JUMP_HOST is set but OPENCAN_TEST_JUMP_USERNAME is missing")
+        }
+
+        return env
     }
 
     // MARK: - Node Management
@@ -281,25 +398,45 @@ final class OpenCANUITests: XCTestCase {
         )
     }
 
-    // MARK: - Integration Tests (requires cp32 server)
+    // MARK: - Integration Tests (requires environment-configured server)
 
     func testIntegrationSendMessage() throws {
-        // Re-launch without --uitesting to use real server
+        // Re-launch in integration mode using environment-driven target config.
         app.terminate()
         let integrationApp = XCUIApplication()
+        let integrationEnv = try integrationLaunchEnvironment()
+
+        guard
+            nonEmpty(integrationEnv["OPENCAN_TEST_NODE_HOST"]) != nil,
+            nonEmpty(integrationEnv["OPENCAN_TEST_NODE_USERNAME"]) != nil,
+            nonEmpty(integrationEnv["OPENCAN_TEST_WORKSPACE_PATH"]) != nil,
+            nonEmpty(integrationEnv["OPENCAN_TEST_SSH_PRIVATE_KEY_PEM"]) != nil
+        else {
+            throw XCTSkip(
+                "Integration target is not configured. Set OPENCAN_TEST_NODE_HOST, OPENCAN_TEST_NODE_USERNAME, " +
+                "OPENCAN_TEST_WORKSPACE_PATH, and OPENCAN_TEST_SSH_PRIVATE_KEY_PEM (or OPENCAN_TEST_SSH_KEY_PATH) " +
+                "in environment or .env"
+            )
+        }
+
+        let nodeName = nonEmpty(integrationEnv["OPENCAN_TEST_NODE_NAME"]) ?? "integration-target"
+        let workspaceName = nonEmpty(integrationEnv["OPENCAN_TEST_WORKSPACE_NAME"]) ?? "home"
+
+        integrationApp.launchArguments = ["--uitesting-integration"]
+        integrationApp.launchEnvironment = integrationEnv
         integrationApp.launch()
 
-        let cp32 = integrationApp.staticTexts["cp32"]
-        XCTAssertTrue(cp32.waitForExistence(timeout: 5))
-        cp32.tap()
+        let targetNode = integrationApp.staticTexts[nodeName]
+        XCTAssertTrue(targetNode.waitForExistence(timeout: 5))
+        targetNode.tap()
 
-        let home = integrationApp.staticTexts["home"]
-        XCTAssertTrue(home.waitForExistence(timeout: 3))
-        home.tap()
+        let workspace = integrationApp.staticTexts[workspaceName]
+        XCTAssertTrue(workspace.waitForExistence(timeout: 3))
+        workspace.tap()
 
         let newSessionButton = integrationApp.buttons["New Session"]
         guard newSessionButton.waitForExistence(timeout: 30) else {
-            throw XCTSkip("Could not connect to cp32 — server may be unreachable")
+            throw XCTSkip("Could not connect to integration target '\(nodeName)' — server may be unreachable")
         }
 
         tapNewSession(in: integrationApp)

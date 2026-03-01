@@ -4,6 +4,7 @@ import SwiftData
 @main
 struct OpenCANApp: App {
     static let isUITesting = CommandLine.arguments.contains("--uitesting")
+    static let isUIIntegrationTesting = CommandLine.arguments.contains("--uitesting-integration")
     static let uiTestMockScenario: MockScenario = {
         if CommandLine.arguments.contains("--uitesting-long-stream") {
             return .longStream
@@ -30,42 +31,121 @@ struct OpenCANApp: App {
             ContentView()
                 .environment(appState)
                 .onAppear {
-                    seedDemoDataIfNeeded()
+                    seedUITestDataIfNeeded()
+                    seedUIIntegrationDataIfNeeded()
                 }
         }
         .modelContainer(modelContainer)
     }
 
-    /// On first launch, seed the database with the demo cp32 config.
-    private func seedDemoDataIfNeeded() {
-        guard !UserDefaults.standard.bool(forKey: "demoDataSeeded") else { return }
+    /// UI tests rely on a pre-seeded node/workspace so they can run deterministically.
+    /// Seed only placeholder values and only in UI testing mode.
+    private func seedUITestDataIfNeeded() {
+        guard OpenCANApp.isUITesting else { return }
+        guard !UserDefaults.standard.bool(forKey: "uiTestDataSeeded") else { return }
 
         let context = ModelContext(modelContainer)
 
-        // Import the bundled SSH key
-        guard let keyURL = Bundle.main.url(forResource: "id_rsa_zd", withExtension: nil),
-              let keyData = try? Data(contentsOf: keyURL) else {
-            Log.toFile("[Seed] Demo SSH key not found in bundle, skipping seed")
-            return
-        }
+        let node = Node(name: "cp32", host: "example.com", port: 22, username: "demo-user")
+        context.insert(node)
 
-        let key = SSHKeyPair(name: "id_rsa_zd", privateKeyPEM: keyData)
-        context.insert(key)
-
-        let jumpNode = Node(name: "cp01", host: "42.62.6.84", port: 22, username: "tyzhuang")
-        jumpNode.sshKey = key
-        context.insert(jumpNode)
-
-        let targetNode = Node(name: "cp32", host: "192.168.2.29", port: 22, username: "tyzhuang")
-        targetNode.sshKey = key
-        targetNode.jumpServer = jumpNode
-        context.insert(targetNode)
-
-        let workspace = Workspace(name: "home", path: "/home/tyzhuang")
-        workspace.node = targetNode
+        let workspace = Workspace(name: "home", path: "/home/demo-user")
+        workspace.node = node
         context.insert(workspace)
 
         try? context.save()
-        UserDefaults.standard.set(true, forKey: "demoDataSeeded")
+        UserDefaults.standard.set(true, forKey: "uiTestDataSeeded")
+    }
+
+    /// Integration UI tests use environment-driven seed data so no sensitive
+    /// infrastructure values are hardcoded in source.
+    private func seedUIIntegrationDataIfNeeded() {
+        guard OpenCANApp.isUIIntegrationTesting else { return }
+
+        let env = ProcessInfo.processInfo.environment
+        guard
+            let nodeHost = envValue("OPENCAN_TEST_NODE_HOST", in: env),
+            let nodeUsername = envValue("OPENCAN_TEST_NODE_USERNAME", in: env),
+            let workspacePath = envValue("OPENCAN_TEST_WORKSPACE_PATH", in: env),
+            let nodeKeyPEMRaw = envValue("OPENCAN_TEST_SSH_PRIVATE_KEY_PEM", in: env)
+        else {
+            Log.toFile("[Seed] Integration seed skipped: required environment variables are missing")
+            return
+        }
+
+        let nodeName = envValue("OPENCAN_TEST_NODE_NAME", in: env) ?? "integration-target"
+        let workspaceName = envValue("OPENCAN_TEST_WORKSPACE_NAME", in: env) ?? "home"
+        let nodePort = Int(envValue("OPENCAN_TEST_NODE_PORT", in: env) ?? "") ?? 22
+        let nodeKeyPEM = nodeKeyPEMRaw.replacingOccurrences(of: "\\n", with: "\n")
+
+        let context = ModelContext(modelContainer)
+
+        do {
+            // Keep integration runs deterministic by resetting persisted connection data.
+            let existingSessions = try context.fetch(FetchDescriptor<Session>())
+            for session in existingSessions {
+                context.delete(session)
+            }
+
+            let existingWorkspaces = try context.fetch(FetchDescriptor<Workspace>())
+            for workspace in existingWorkspaces {
+                context.delete(workspace)
+            }
+
+            let existingNodes = try context.fetch(FetchDescriptor<Node>())
+            for node in existingNodes {
+                context.delete(node)
+            }
+
+            let existingKeys = try context.fetch(FetchDescriptor<SSHKeyPair>())
+            for key in existingKeys {
+                context.delete(key)
+            }
+
+            let nodeKey = SSHKeyPair(name: "\(nodeName)-key", privateKeyPEM: Data(nodeKeyPEM.utf8))
+            context.insert(nodeKey)
+
+            let node = Node(name: nodeName, host: nodeHost, port: nodePort, username: nodeUsername)
+            node.sshKey = nodeKey
+            context.insert(node)
+
+            if let jumpHost = envValue("OPENCAN_TEST_JUMP_HOST", in: env) {
+                guard let jumpUsername = envValue("OPENCAN_TEST_JUMP_USERNAME", in: env) else {
+                    Log.toFile("[Seed] Integration seed skipped: OPENCAN_TEST_JUMP_USERNAME is missing")
+                    return
+                }
+                let jumpPort = Int(envValue("OPENCAN_TEST_JUMP_PORT", in: env) ?? "") ?? 22
+                let jumpKeyPEMRaw = envValue("OPENCAN_TEST_JUMP_PRIVATE_KEY_PEM", in: env) ?? nodeKeyPEMRaw
+                let jumpKeyPEM = jumpKeyPEMRaw.replacingOccurrences(of: "\\n", with: "\n")
+
+                let jumpKey = SSHKeyPair(name: "\(nodeName)-jump-key", privateKeyPEM: Data(jumpKeyPEM.utf8))
+                context.insert(jumpKey)
+
+                let jumpNode = Node(
+                    name: envValue("OPENCAN_TEST_JUMP_NODE_NAME", in: env) ?? "jump",
+                    host: jumpHost,
+                    port: jumpPort,
+                    username: jumpUsername
+                )
+                jumpNode.sshKey = jumpKey
+                context.insert(jumpNode)
+                node.jumpServer = jumpNode
+            }
+
+            let workspace = Workspace(name: workspaceName, path: workspacePath)
+            workspace.node = node
+            context.insert(workspace)
+
+            try context.save()
+        } catch {
+            Log.toFile("[Seed] Integration seed failed: \(error)")
+        }
+    }
+
+    private func envValue(_ key: String, in env: [String: String]) -> String? {
+        guard let value = env[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return value
     }
 }

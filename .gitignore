@@ -24,7 +24,8 @@ opencan-daemon/dist/
 opencan-daemon/coverage.out
 Resources/opencan-daemon-linux-amd64
 
-# SSH keys (safety net — demo key is intentionally bundled in Resources/)
+# Local environment and SSH keys
+.env
+.env.local
 *.pem
 id_rsa*
-!Resources/id_rsa_zd
