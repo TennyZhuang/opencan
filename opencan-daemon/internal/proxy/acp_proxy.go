@@ -520,6 +520,10 @@ func (p *ACPProxy) LoadableSessionsForCWD(timeout time.Duration, cwd string) ([]
 		return nil, fmt.Errorf("session/list error: %s", resp.Error.Message)
 	}
 
+	return parseLoadableSessionsResult(resp.Result)
+}
+
+func parseLoadableSessionsResult(result *json.RawMessage) ([]LoadableSession, error) {
 	var payload struct {
 		Sessions []struct {
 			SessionID string `json:"sessionId"`
@@ -528,8 +532,8 @@ func (p *ACPProxy) LoadableSessionsForCWD(timeout time.Duration, cwd string) ([]
 			UpdatedAt string `json:"updatedAt"`
 		} `json:"sessions"`
 	}
-	if resp.Result != nil {
-		if err := json.Unmarshal(*resp.Result, &payload); err != nil {
+	if result != nil {
+		if err := json.Unmarshal(*result, &payload); err != nil {
 			return nil, fmt.Errorf("decode session/list result: %w", err)
 		}
 	}

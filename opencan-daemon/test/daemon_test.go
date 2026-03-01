@@ -279,6 +279,60 @@ func TestDaemon_SessionList_Empty(t *testing.T) {
 	}
 }
 
+func TestDaemon_SessionList_DiscoversExternalWithoutManagedSessions(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found, run 'make mock-acp' first")
+	}
+
+	t.Setenv("OPENCAN_DISCOVERY_COMMANDS", mockBin)
+	t.Setenv("MOCK_LIST_SESSIONS", "external-a,external-b")
+	t.Setenv("MOCK_LIST_OMIT_CREATED", "1")
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.list",
+		"params":  map[string]interface{}{},
+	})
+
+	resp := readJSON(t, conn)
+	if resp["error"] != nil {
+		t.Fatalf("session.list error: %v", resp["error"])
+	}
+
+	result := resp["result"].(map[string]interface{})
+	sessions := result["sessions"].([]interface{})
+	if len(sessions) != 2 {
+		t.Fatalf("expected 2 discovered sessions, got %d", len(sessions))
+	}
+
+	ids := make(map[string]bool, len(sessions))
+	for _, raw := range sessions {
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("unexpected session entry: %#v", raw)
+		}
+		id, ok := item["sessionId"].(string)
+		if !ok || id == "" {
+			t.Fatalf("missing sessionId in entry: %#v", item)
+		}
+		ids[id] = true
+		if state, _ := item["state"].(string); state != "external" {
+			t.Fatalf("expected state=external for %s, got %q", id, state)
+		}
+	}
+	if !ids["external-a"] || !ids["external-b"] {
+		t.Fatalf("missing expected discovered sessions, got ids=%v", ids)
+	}
+}
+
 func TestDaemon_SessionCreate(t *testing.T) {
 	// This test requires the mock-acp-server binary
 	mockBin := findMockBin(t)

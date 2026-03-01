@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,6 +25,7 @@ var includeToolCall = false
 var omitPromptComplete = false
 var omitCreatedFromList = false
 var sessions []string
+var configuredListSessions []string
 
 func init() {
 	if v := os.Getenv("MOCK_PROMPT_DELAY"); v != "" {
@@ -44,6 +46,15 @@ func init() {
 	}
 	if os.Getenv("MOCK_LIST_OMIT_CREATED") == "1" {
 		omitCreatedFromList = true
+	}
+	if v := os.Getenv("MOCK_LIST_SESSIONS"); v != "" {
+		for _, token := range strings.Split(v, ",") {
+			id := strings.TrimSpace(token)
+			if id == "" {
+				continue
+			}
+			configuredListSessions = append(configuredListSessions, id)
+		}
 	}
 }
 
@@ -228,13 +239,18 @@ func handleSessionPrompt(id *json.RawMessage, params json.RawMessage) {
 }
 
 func handleSessionList(id *json.RawMessage) {
-	items := make([]map[string]interface{}, 0, len(sessions))
+	items := make([]map[string]interface{}, 0, len(sessions)+len(configuredListSessions))
 	if !omitCreatedFromList {
 		for _, sid := range sessions {
 			items = append(items, map[string]interface{}{
 				"sessionId": sid,
 			})
 		}
+	}
+	for _, sid := range configuredListSessions {
+		items = append(items, map[string]interface{}{
+			"sessionId": sid,
+		})
 	}
 
 	respond(id, map[string]interface{}{

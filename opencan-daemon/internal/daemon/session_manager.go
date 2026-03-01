@@ -3,6 +3,8 @@ package daemon
 import (
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -174,7 +176,16 @@ func (sm *SessionManager) loadableSessions(proxies []*proxy.ACPProxy, discoveryC
 	}
 
 	if probe == nil {
-		return nil, false
+		sessions, err := sm.discoverExternalSessionsWithoutProxy(discoveryCWD)
+		if err != nil {
+			sm.logger.Warn(
+				"session/loadability probe failed without managed sessions; returning managed list only",
+				"error", err,
+				"cwd", discoveryCWD,
+			)
+			return nil, false
+		}
+		return sessions, true
 	}
 
 	sessions, err := probe.LoadableSessionsForCWD(1200*time.Millisecond, discoveryCWD)
@@ -187,6 +198,76 @@ func (sm *SessionManager) loadableSessions(proxies []*proxy.ACPProxy, discoveryC
 		return nil, false
 	}
 	return sessions, true
+}
+
+func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD string) ([]proxy.LoadableSession, error) {
+	commands := discoveryProbeCommands()
+	seen := make(map[string]struct{})
+	merged := make([]proxy.LoadableSession, 0, maxExternalSessions)
+
+	var lastErr error
+	succeeded := false
+	for _, command := range commands {
+		sessions, err := proxy.ProbeLoadableSessionsForCWD(command, discoveryCWD, 1200*time.Millisecond, sm.logger)
+		if err != nil {
+			lastErr = err
+			sm.logger.Debug(
+				"external discovery probe command failed",
+				"command", command,
+				"cwd", discoveryCWD,
+				"error", err,
+			)
+			continue
+		}
+
+		succeeded = true
+		for _, s := range sessions {
+			if s.SessionID == "" {
+				continue
+			}
+			if _, ok := seen[s.SessionID]; ok {
+				continue
+			}
+			seen[s.SessionID] = struct{}{}
+			merged = append(merged, s)
+		}
+	}
+
+	if !succeeded {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no probe command succeeded")
+		}
+		return nil, lastErr
+	}
+	return merged, nil
+}
+
+func discoveryProbeCommands() []string {
+	raw := strings.TrimSpace(os.Getenv("OPENCAN_DISCOVERY_COMMANDS"))
+	if raw == "" {
+		return []string{"claude-agent-acp", "codex-acp"}
+	}
+
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';'
+	})
+	commands := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		command := strings.TrimSpace(part)
+		if command == "" {
+			continue
+		}
+		if _, ok := seen[command]; ok {
+			continue
+		}
+		seen[command] = struct{}{}
+		commands = append(commands, command)
+	}
+	if len(commands) == 0 {
+		return []string{"claude-agent-acp", "codex-acp"}
+	}
+	return commands
 }
 
 func shouldFilterSessionFromList(state proxy.SessionState, hasNoAttachedClient bool) bool {
