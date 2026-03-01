@@ -47,7 +47,10 @@ private enum SSHPrivateKeyKeychain {
 
     static func save(privateKeyPEM: Data, identifier: String) throws {
         let query = baseQuery(identifier: identifier)
-        let attributesToUpdate: [String: Any] = [kSecValueData as String: privateKeyPEM]
+        var attributesToUpdate: [String: Any] = [kSecValueData as String: privateKeyPEM]
+        #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+        attributesToUpdate[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        #endif
 
         var status = SecItemUpdate(query as CFDictionary, attributesToUpdate as CFDictionary)
         if status == errSecItemNotFound {
@@ -71,12 +74,50 @@ private enum SSHPrivateKeyKeychain {
         }
     }
 
+    static func deleteOrphanedEntries(validIdentifiers: Set<String>) throws -> Int {
+        let allIdentifiers = try listIdentifiers()
+        var deletedCount = 0
+
+        for identifier in allIdentifiers where !validIdentifiers.contains(identifier) {
+            try delete(identifier: identifier)
+            deletedCount += 1
+        }
+
+        return deletedCount
+    }
+
     private static func baseQuery(identifier: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: identifier,
         ]
+    }
+
+    private static func listIdentifiers() throws -> [String] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            if let items = result as? [[String: Any]] {
+                return items.compactMap { $0[kSecAttrAccount as String] as? String }
+            }
+            if let item = result as? [String: Any] {
+                return (item[kSecAttrAccount as String] as? String).map { [$0] } ?? []
+            }
+            throw SSHKeyPairError.keychainReadFailed(errSecInternalError)
+        case errSecItemNotFound:
+            return []
+        default:
+            throw SSHKeyPairError.keychainReadFailed(status)
+        }
     }
 }
 
@@ -109,11 +150,8 @@ final class SSHKeyPair {
             throw SSHKeyPairError.privateKeyUnavailable
         }
 
-        // Backward compatibility: old versions persisted raw PEM in SwiftData.
-        try storePrivateKeyPEM(privateKeyPEM)
-        let migratedKey = privateKeyPEM
-        privateKeyPEM = Data()
-        return migratedKey
+        // Backward compatibility: startup migration should move this into Keychain.
+        return privateKeyPEM
     }
 
     @discardableResult
@@ -146,6 +184,19 @@ final class SSHKeyPair {
                 "Failed to remove SSH key from Keychain: \(error.localizedDescription)"
             )
         }
+    }
+
+    static func keychainIdentifiers(in keys: [SSHKeyPair]) -> Set<String> {
+        Set(
+            keys
+                .compactMap(\.keychainIdentifier)
+                .filter { !$0.isEmpty }
+        )
+    }
+
+    @discardableResult
+    static func cleanupOrphanedKeychainEntries(validIdentifiers: Set<String>) throws -> Int {
+        try SSHPrivateKeyKeychain.deleteOrphanedEntries(validIdentifiers: validIdentifiers)
     }
 
     private func loadPrivateKeyFromKeychain() throws -> Data? {
