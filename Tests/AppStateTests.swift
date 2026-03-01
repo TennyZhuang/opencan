@@ -719,6 +719,49 @@ final class AppStateTests: XCTestCase {
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
     }
 
+    func testSuspendChatListAnimationsDuringHistoryLoadTail() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        await transport.setMockAttachState("idle")
+        await transport.setMockLoadSteps([
+            .delay(milliseconds: 250),
+            .userMessageChunk("History question"),
+            .textDelta("History answer"),
+            // Intentionally omit prompt_complete so historyLoadSessionIds
+            // stays non-empty until cleanup timeout.
+        ])
+
+        let sessionId = "history-tail-window"
+        let session = Session(sessionId: sessionId, workspace: workspace)
+        modelContext.insert(session)
+        try modelContext.save()
+
+        let resumeTask = Task {
+            try await self.appState.resumeSession(sessionId: sessionId, modelContext: self.modelContext)
+        }
+
+        try await waitFor(timeout: 2) { self.appState.isLoadingHistory }
+        XCTAssertTrue(
+            appState.suspendChatListAnimations,
+            "Animations should be suspended while isLoadingHistory is true"
+        )
+
+        try await resumeTask.value
+
+        XCTAssertFalse(appState.isLoadingHistory, "History load should eventually complete")
+        XCTAssertTrue(
+            appState.suspendChatListAnimations,
+            "Animations should remain suspended during the post-load replay tail"
+        )
+
+        try await waitFor(timeout: 3) { !self.appState.suspendChatListAnimations }
+        XCTAssertFalse(appState.suspendChatListAnimations)
+    }
+
     func testResumeLegacySessionUsesDaemonReportedCommand() async throws {
         try await connectMock()
 

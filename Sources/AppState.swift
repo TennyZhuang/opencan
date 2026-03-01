@@ -34,6 +34,10 @@ final class AppState {
     var isCreatingSession = false
     /// True while replaying history via session/load — suppresses streaming UI.
     var isLoadingHistory = false
+    /// Suspend chat list row animations while history replay may still emit events.
+    var suspendChatListAnimations: Bool {
+        isLoadingHistory || !historyLoadSessionIds.isEmpty
+    }
     /// Incremented (debounced) when chat content changes. The view
     /// auto-scrolls only if the user is already near the bottom.
     var contentVersion = 0

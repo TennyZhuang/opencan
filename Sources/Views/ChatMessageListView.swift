@@ -8,6 +8,7 @@ import MarkdownParser
 struct ChatMessageListView: UIViewRepresentable {
     let messages: [ChatMessage]
     let isPrompting: Bool
+    let suspendAnimations: Bool
     let contentVersion: Int
     let forceScrollToken: Int
 
@@ -26,6 +27,7 @@ struct ChatMessageListView: UIViewRepresentable {
         context.coordinator.apply(
             entries: entries,
             isPrompting: isPrompting,
+            suspendAnimations: suspendAnimations,
             contentVersion: contentVersion,
             forceScrollToken: forceScrollToken
         )
@@ -87,13 +89,15 @@ extension ChatMessageListView {
         func apply(
             entries: [ChatListEntry],
             isPrompting: Bool,
+            suspendAnimations: Bool,
             contentVersion: Int,
             forceScrollToken: Int
         ) {
             guard let dataSource else { return }
 
-            // Keep streaming updates stable by avoiding repeated row animations.
-            let shouldAnimate = hasLoadedData && !isPrompting
+            // Replay bursts can emit many updates in one runloop; disable row
+            // animations to avoid diff/apply races in ListViewKit.
+            let shouldAnimate = hasLoadedData && !isPrompting && !suspendAnimations
             dataSource.applySnapshot(using: entries, animatingDifferences: shouldAnimate)
 
             let validIDs = Set(entries.map(\.id))
