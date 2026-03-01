@@ -311,6 +311,57 @@ actor SSHConnectionManager {
         Log.toFile("[SSH] Cleaned expired chat uploads older than \(safeTTLHours)h")
     }
 
+    /// Check whether a remote directory exists.
+    /// Supports `~` and `~/...` paths.
+    func remoteDirectoryExists(path: String) async throws -> Bool {
+        guard let client = targetClient else {
+            throw SSHError.notConnected
+        }
+        let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPath.isEmpty else {
+            throw SSHError.invalidRemotePath
+        }
+        let escapedPath = shellEscape(normalizedPath)
+        let command = """
+        raw_path=\(escapedPath)
+        case "$raw_path" in
+          "~") resolved_path="$HOME" ;;
+          "~/"*) resolved_path="$HOME/${raw_path#~/}" ;;
+          *) resolved_path="$raw_path" ;;
+        esac
+        if [ -d "$resolved_path" ]; then
+          echo "__opencan_dir_exists__"
+        else
+          echo "__opencan_dir_missing__"
+        fi
+        """
+        let output = try await client.executeCommand(command)
+        return String(buffer: output).contains("__opencan_dir_exists__")
+    }
+
+    /// Create a remote directory with `mkdir -p`.
+    /// Supports `~` and `~/...` paths.
+    func createRemoteDirectory(path: String) async throws {
+        guard let client = targetClient else {
+            throw SSHError.notConnected
+        }
+        let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPath.isEmpty else {
+            throw SSHError.invalidRemotePath
+        }
+        let escapedPath = shellEscape(normalizedPath)
+        let command = """
+        raw_path=\(escapedPath)
+        case "$raw_path" in
+          "~") resolved_path="$HOME" ;;
+          "~/"*) resolved_path="$HOME/${raw_path#~/}" ;;
+          *) resolved_path="$raw_path" ;;
+        esac
+        mkdir -p "$resolved_path"
+        """
+        let _ = try await client.executeCommand(command)
+    }
+
     /// Shell-escape a string by wrapping in single quotes and escaping embedded single quotes.
     private func shellEscape(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -356,6 +407,7 @@ enum SSHError: Error, LocalizedError {
     case notConnected
     case keyNotFound(String)
     case invalidKeyData
+    case invalidRemotePath
     case daemonBinaryNotFound
 
     var errorDescription: String? {
@@ -363,6 +415,7 @@ enum SSHError: Error, LocalizedError {
         case .notConnected: "SSH client not connected"
         case .keyNotFound(let name): "SSH key '\(name)' not found"
         case .invalidKeyData: "Invalid SSH key data"
+        case .invalidRemotePath: "Remote path is empty"
         case .daemonBinaryNotFound: "opencan-daemon binary not found in app bundle"
         }
     }

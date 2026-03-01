@@ -383,6 +383,28 @@ final class AppState {
         }
     }
 
+    /// Check whether a remote workspace directory exists on the active node.
+    func workspaceDirectoryExists(path: String) async throws -> Bool {
+        if mockTransport != nil {
+            return true
+        }
+        guard connectionStatus == .connected else {
+            throw AppStateError.notConnected
+        }
+        return try await sshManager.remoteDirectoryExists(path: path)
+    }
+
+    /// Create a remote workspace directory (`mkdir -p`) on the active node.
+    func createWorkspaceDirectory(path: String) async throws {
+        if mockTransport != nil {
+            return
+        }
+        guard connectionStatus == .connected else {
+            throw AppStateError.notConnected
+        }
+        try await sshManager.createRemoteDirectory(path: path)
+    }
+
     /// Create a new ACP session via the daemon using the app's default agent.
     func createNewSession(modelContext: ModelContext) async throws {
         if !hasReliableAgentAvailability {

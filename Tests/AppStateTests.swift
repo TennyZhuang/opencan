@@ -74,6 +74,33 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.connectionStatus, .connected)
     }
 
+    func testWorkspaceDirectoryExistsThrowsWhenDisconnected() async {
+        do {
+            let _ = try await appState.workspaceDirectoryExists(path: "/tmp/workspace")
+            XCTFail("Expected workspaceDirectoryExists to throw when disconnected")
+        } catch let error as AppStateError {
+            guard case .notConnected = error else {
+                XCTFail("Expected notConnected error, got \(error)")
+                return
+            }
+        } catch {
+            XCTFail("Expected AppStateError.notConnected, got \(error)")
+        }
+    }
+
+    func testWorkspaceDirectoryChecksAreNoOpInMockMode() async throws {
+        try await connectMock()
+
+        let exists = try await appState.workspaceDirectoryExists(path: "/tmp/workspace")
+        XCTAssertTrue(exists)
+
+        do {
+            try await appState.createWorkspaceDirectory(path: "/tmp/workspace")
+        } catch {
+            XCTFail("createWorkspaceDirectory should not throw in mock mode: \(error)")
+        }
+    }
+
     // MARK: - New Session Tests
 
     func testCreateNewSession() async throws {

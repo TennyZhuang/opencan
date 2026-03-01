@@ -8,6 +8,9 @@ struct WorkspaceListView: View {
     @State private var showAddWorkspace = false
     @State private var newName = ""
     @State private var newPath = ""
+    @State private var pendingWorkspace: PendingWorkspace?
+    @State private var showCreateDirectoryDialog = false
+    @State private var workspaceCreationError: String?
 
     var body: some View {
         Group {
@@ -51,9 +54,39 @@ struct WorkspaceListView: View {
             TextField("Remote Path", text: $newPath)
             Button("Add") { addWorkspace() }
             Button("Cancel", role: .cancel) {
-                newName = ""
-                newPath = ""
+                clearWorkspaceForm()
             }
+        }
+        .confirmationDialog(
+            "Create Remote Directory?",
+            isPresented: $showCreateDirectoryDialog,
+            titleVisibility: .visible,
+            presenting: pendingWorkspace
+        ) { pending in
+            Button("Create Directory and Add Workspace") {
+                Task {
+                    await createDirectoryAndAddWorkspace(pending)
+                }
+            }
+            Button("Add Workspace Without Creating Directory") {
+                addWorkspaceRecord(name: pending.name, path: pending.path)
+                self.pendingWorkspace = nil
+            }
+            Button("Cancel", role: .cancel) {
+                self.pendingWorkspace = nil
+            }
+        } message: { pending in
+            Text("Remote path '\(pending.path)' does not exist on \(node.name). Create it now?")
+        }
+        .alert(
+            "Unable to Create Workspace",
+            isPresented: workspaceCreationErrorBinding
+        ) {
+            Button("OK", role: .cancel) {
+                workspaceCreationError = nil
+            }
+        } message: {
+            Text(workspaceCreationError ?? "Unknown error")
         }
         .onAppear {
             let isSameNode = appState.activeNode?.persistentModelID == node.persistentModelID
@@ -133,13 +166,75 @@ struct WorkspaceListView: View {
         }
     }
 
+    @MainActor
     private func addWorkspace() {
-        guard !newName.isEmpty, !newPath.isEmpty else { return }
-        let ws = Workspace(name: newName, path: newPath)
+        let trimmedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPath = newPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, !trimmedPath.isEmpty else { return }
+        Task {
+            await validateWorkspacePathAndAdd(name: trimmedName, path: trimmedPath)
+        }
+    }
+
+    @MainActor
+    private func validateWorkspacePathAndAdd(name: String, path: String) async {
+        // Only verify/create directories on the active connected node.
+        let shouldVerifyRemotePath = appState.connectionStatus == .connected
+            && appState.activeNode?.persistentModelID == node.persistentModelID
+
+        guard shouldVerifyRemotePath else {
+            addWorkspaceRecord(name: name, path: path)
+            clearWorkspaceForm()
+            return
+        }
+
+        do {
+            let exists = try await appState.workspaceDirectoryExists(path: path)
+            if exists {
+                addWorkspaceRecord(name: name, path: path)
+            } else {
+                pendingWorkspace = PendingWorkspace(name: name, path: path)
+                showCreateDirectoryDialog = true
+            }
+            clearWorkspaceForm()
+        } catch {
+            workspaceCreationError = "Failed to validate remote path: \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    private func createDirectoryAndAddWorkspace(_ pending: PendingWorkspace) async {
+        do {
+            try await appState.createWorkspaceDirectory(path: pending.path)
+            addWorkspaceRecord(name: pending.name, path: pending.path)
+            pendingWorkspace = nil
+        } catch {
+            workspaceCreationError = "Failed to create remote directory '\(pending.path)': \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    private func addWorkspaceRecord(name: String, path: String) {
+        let ws = Workspace(name: name, path: path)
         ws.node = node
         modelContext.insert(ws)
+    }
+
+    @MainActor
+    private func clearWorkspaceForm() {
         newName = ""
         newPath = ""
+    }
+
+    private var workspaceCreationErrorBinding: Binding<Bool> {
+        Binding(
+            get: { workspaceCreationError != nil },
+            set: { isPresented in
+                if !isPresented {
+                    workspaceCreationError = nil
+                }
+            }
+        )
     }
 
     private func deleteWorkspaces(at offsets: IndexSet) {
@@ -147,6 +242,11 @@ struct WorkspaceListView: View {
         for index in offsets {
             modelContext.delete(workspaces[index])
         }
+    }
+
+    private struct PendingWorkspace {
+        let name: String
+        let path: String
     }
 }
 
