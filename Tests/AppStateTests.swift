@@ -601,6 +601,23 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(userMessages.count, 1, "Only first message should go through")
     }
 
+    func testSendMessageReturnsFalseWhenPrompting() async throws {
+        try await connectMock(scenario: .complex)
+        try await appState.createNewSession(modelContext: modelContext)
+
+        let firstAccepted = appState.sendMessage("First")
+        XCTAssertTrue(firstAccepted, "First send should be accepted")
+        XCTAssertTrue(appState.isPrompting)
+
+        let secondAccepted = appState.sendMessage("Second")
+        XCTAssertFalse(secondAccepted, "Second send should be rejected while prompting")
+    }
+
+    func testSendMessageReturnsFalseWhenDisconnected() async {
+        let accepted = appState.sendMessage("Hello")
+        XCTAssertFalse(accepted, "Send should fail when no session/transport is active")
+    }
+
     func testDisconnectWhilePromptingResetsPromptingState() async throws {
         try await connectMock(scenario: .complex)
         try await appState.createNewSession(modelContext: modelContext)

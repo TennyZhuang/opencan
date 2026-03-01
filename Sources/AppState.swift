@@ -1104,17 +1104,18 @@ final class AppState {
         }
     }
 
-    func sendMessage(_ text: String) {
-        guard !text.isEmpty else { return }
+    @discardableResult
+    func sendMessage(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
         guard !isPrompting else {
             Log.toFile("[AppState] sendMessage blocked — isPrompting=true, currentSessionId=\(currentSessionId ?? "nil")")
             addSystemMessage("Still waiting for response...")
-            return
+            return false
         }
         guard let service = acpService,
               let sessionId = currentSessionId else {
             addSystemMessage("Not connected — please reconnect")
-            return
+            return false
         }
         let promptTarget = resolvePromptTargetSession(daemonSessionId: sessionId)
 
@@ -1187,6 +1188,7 @@ final class AppState {
                 self.isPrompting = false
             }
         }
+        return true
     }
 
     /// Resolve ACP prompt routing for recovered sessions.
