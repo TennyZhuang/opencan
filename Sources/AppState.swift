@@ -78,6 +78,14 @@ final class AppState {
     private var imageMentionsBySession: [String: [UploadedImageMention]] = [:]
     /// Last time we ran remote upload cleanup.
     private var lastChatUploadCleanupAt: Date?
+    /// True when an unexpected transport drop should trigger auto reconnect on chat reopen.
+    private var shouldAutoReconnectInterruptedSession = false
+    /// Guards against overlapping reconnect+resume recovery attempts.
+    private var isAutoReconnectInProgress = false
+    /// Test hook for mocking the auto-reconnect connect step.
+    var autoReconnectConnectHandler: ((Node) async -> Void)?
+    /// Test hook for mocking the auto-reconnect resume step.
+    var autoReconnectResumeHandler: ((String, ModelContext) async throws -> Void)?
 
     /// Uploaded image mentions available to the active chat session.
     var availableImageMentions: [UploadedImageMention] {
@@ -119,7 +127,7 @@ final class AppState {
     /// Connect to a node via SSH and the daemon.
     /// After this, set activeWorkspace and call createNewSession() or resumeSession() to start chatting.
     /// If already connected, tears down the old connection first.
-    func connect(node: Node) {
+    func connect(node: Node, isAutoReconnect: Bool = false) {
         if connectionStatus == .connected || connectionStatus == .connecting {
             cleanupConnection()
         }
@@ -131,6 +139,9 @@ final class AppState {
 
         connectionStatus = .connecting
         connectionError = nil
+        if !isAutoReconnect {
+            shouldAutoReconnectInterruptedSession = false
+        }
         activeNode = node
         availableNodeAgents = []
         hasReliableAgentAvailability = false
@@ -184,21 +195,28 @@ final class AppState {
 
                 await performUploadCleanupIfNeeded()
 
-                ptyTask = Task.detached { [sshManager] in
+                ptyTask = Task.detached { [weak self, sshManager] in
                     do {
                         if #available(macOS 15.0, iOS 18.0, *) {
                             try await sshManager.startPTY(
                                 transport: t,
                                 command: params.command
                             )
+                        } else {
+                            return
+                        }
+                        guard !Task.isCancelled else { return }
+                        await t.close()
+                        await MainActor.run {
+                            self?.markTransportInterrupted("SSH channel closed")
                         }
                     } catch {
+                        guard !Task.isCancelled else { return }
                         // PTY died — close the transport so the ACP client's
                         // message stream ends and pending requests are cancelled.
                         await t.close()
                         await MainActor.run {
-                            self.connectionError = "PTY closed: \(error.localizedDescription)"
-                            self.connectionStatus = .disconnected
+                            self?.markTransportInterrupted("PTY closed: \(error.localizedDescription)")
                         }
                     }
                 }
@@ -260,7 +278,9 @@ final class AppState {
                 )
                 self.connectionError = error.localizedDescription
                 self.connectionStatus = .failed
-                self.cleanupConnection()
+                // Keep active node/session context on failure so retries and
+                // interrupted-session recovery can reuse the current page state.
+                self.clearRuntimeConnectionState()
             }
         }
     }
@@ -274,6 +294,7 @@ final class AppState {
 
         connectionStatus = .connecting
         connectionError = nil
+        shouldAutoReconnectInterruptedSession = false
         activeWorkspace = workspace
         activeNode = workspace.node
         availableNodeAgents = []
@@ -306,7 +327,7 @@ final class AppState {
                 Log.toFile("[AppState] Mock connection error: \(error)")
                 self.connectionError = error.localizedDescription
                 self.connectionStatus = .failed
-                self.cleanupConnection()
+                self.clearRuntimeConnectionState()
             }
         }
     }
@@ -793,18 +814,99 @@ final class AppState {
         }
     }
 
-    func disconnect() {
-        cleanupConnection()
-        shouldPopToRoot = true
-        Task { await sshManager.disconnect() }
+    /// Reconnect and restore the active chat after an unexpected transport drop.
+    /// Intended to be called when ChatView reappears (for example, app foreground).
+    func recoverInterruptedSessionIfNeeded(modelContext: ModelContext) async {
+        guard shouldAutoReconnectInterruptedSession else { return }
+        guard !isAutoReconnectInProgress else { return }
+        guard connectionStatus == .disconnected || connectionStatus == .failed else { return }
+        guard let node = activeNode else { return }
+        guard let sessionId = currentSessionId ?? activeSession?.sessionId else { return }
+        guard let workspace = activeWorkspace ?? activeSession?.workspace else { return }
+
+        isAutoReconnectInProgress = true
+        defer { isAutoReconnectInProgress = false }
+
+        Log.log(
+            component: "AppState",
+            "attempting interrupted-session recovery",
+            sessionId: sessionId
+        )
+
+        if let connectHandler = autoReconnectConnectHandler {
+            await connectHandler(node)
+        } else {
+            connect(node: node, isAutoReconnect: true)
+        }
+
+        let connected: Bool
+        if autoReconnectConnectHandler != nil {
+            connected = connectionStatus == .connected
+        } else {
+            connected = await waitForConnectionResult(timeoutSeconds: 30)
+        }
+        guard connected else {
+            shouldAutoReconnectInterruptedSession = true
+            Log.log(
+                level: "warning",
+                component: "AppState",
+                "interrupted-session recovery connect phase failed",
+                sessionId: sessionId
+            )
+            return
+        }
+
+        // Session resume requires a workspace context.
+        activeWorkspace = workspace
+        do {
+            if let resumeHandler = autoReconnectResumeHandler {
+                try await resumeHandler(sessionId, modelContext)
+            } else {
+                try await resumeSession(sessionId: sessionId, modelContext: modelContext)
+            }
+            connectionError = nil
+            shouldAutoReconnectInterruptedSession = false
+        } catch {
+            connectionError = error.localizedDescription
+            connectionStatus = .failed
+            shouldAutoReconnectInterruptedSession = true
+            Log.log(
+                level: "error",
+                component: "AppState",
+                "interrupted-session recovery failed: \(error.localizedDescription)",
+                sessionId: sessionId
+            )
+        }
     }
 
-    /// Tear down the current connection state without triggering navigation.
-    /// Does not close the SSH session — caller is responsible for that.
-    private func cleanupConnection() {
+    /// Mark the current chat transport as unexpectedly interrupted and preserve
+    /// enough UI/session context for automatic reconnect on next page reopen.
+    func markTransportInterrupted(_ errorMessage: String) {
+        let hasLiveConnection = acpClient != nil || daemonClient != nil || transport != nil || mockTransport != nil
+        guard hasLiveConnection || connectionStatus == .connected || connectionStatus == .connecting else {
+            return
+        }
+
+        if activeWorkspace == nil {
+            activeWorkspace = activeSession?.workspace
+        }
+        if currentSessionId == nil {
+            currentSessionId = activeSession?.sessionId
+        }
+
+        connectionError = errorMessage
+        connectionStatus = .disconnected
+        shouldAutoReconnectInterruptedSession = activeNode != nil && currentSessionId != nil
+        isAutoReconnectInProgress = false
+        clearRuntimeConnectionState()
+    }
+
+    private func clearRuntimeConnectionState() {
         let client = acpClient
         let t = transport
         let mt = mockTransport
+        let sshManager = self.sshManager
+
         notificationTask?.cancel()
         ptyTask?.cancel()
         historyLoadCleanupTask?.cancel()
@@ -814,15 +916,9 @@ final class AppState {
         daemonClient = nil
         transport = nil
         mockTransport = nil
-        connectionStatus = .disconnected
-        currentSessionId = nil
-        currentTraceId = nil
-        activeSession = nil
-        activeNode = nil
-        activeWorkspace = nil
         daemonSessions = []
         daemonUploadProgress = nil
-        messages = []
+        currentTraceId = nil
         isPrompting = false
         isCreatingSession = false
         isLoadingHistory = false
@@ -836,15 +932,53 @@ final class AppState {
         historySystemPromptStreamingSessionIds = []
         historyReplayUserMessageCount = [:]
         historySystemPromptMessageIdBySession = [:]
-        imageMentionsBySession = [:]
-        lastChatUploadCleanupAt = nil
-        // lastEventSeq intentionally kept — needed for reconnect replay
-        // Stop ACP client and close transport asynchronously
+        for msg in messages where msg.isStreaming {
+            msg.isStreaming = false
+        }
+
         Task.detached {
             if let client { await client.stop() }
             if let t { await t.close() }
             if let mt { await mt.close() }
+            await sshManager.disconnect()
         }
+    }
+
+    private func waitForConnectionResult(timeoutSeconds: TimeInterval) async -> Bool {
+        let timeout = max(timeoutSeconds, 1)
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            switch connectionStatus {
+            case .connected:
+                return true
+            case .failed:
+                return false
+            case .connecting, .disconnected:
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return connectionStatus == .connected
+    }
+
+    func disconnect() {
+        cleanupConnection()
+        shouldPopToRoot = true
+    }
+
+    /// Tear down the current connection and reset navigation/chat context.
+    private func cleanupConnection() {
+        shouldAutoReconnectInterruptedSession = false
+        isAutoReconnectInProgress = false
+        clearRuntimeConnectionState()
+        connectionStatus = .disconnected
+        currentSessionId = nil
+        activeSession = nil
+        activeNode = nil
+        activeWorkspace = nil
+        messages = []
+        imageMentionsBySession = [:]
+        lastChatUploadCleanupAt = nil
     }
 
     // MARK: - Chat
@@ -1167,6 +1301,9 @@ final class AppState {
                 }
             }
             Log.toFile("[AppState] Notification listener ended")
+            if !Task.isCancelled {
+                self.markTransportInterrupted(self.connectionError ?? "SSH connection interrupted")
+            }
         }
     }
 

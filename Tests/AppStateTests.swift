@@ -887,14 +887,21 @@ final class AppStateTests: XCTestCase {
         appState.sendMessage("New question")
         XCTAssertTrue(appState.isPrompting)
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
+        try await waitFor(timeout: 2) {
+            self.appState.messages.contains { $0.role == .assistant && $0.content.contains("mock assistant") }
+        }
 
         let lastPromptSessionId = await transport.getLastPromptSessionId()
         let lastPromptRoute = await transport.getLastPromptRouteToSessionId()
         XCTAssertEqual(lastPromptSessionId, oldSessionId, "Recovered prompt should target original history session")
         XCTAssertEqual(lastPromptRoute, recoveredSessionId, "Recovered prompt should route via attached daemon session")
+        let assistantContents = appState.messages
+            .filter { $0.role == .assistant }
+            .map(\.content)
+            .joined(separator: " | ")
         XCTAssertTrue(
             appState.messages.contains { $0.role == .assistant && $0.content.contains("mock assistant") },
-            "Prompt updates from history session should still render in the active chat"
+            "Prompt updates from history session should still render in the active chat. assistant=\(assistantContents)"
         )
     }
 
@@ -1429,6 +1436,108 @@ final class AppStateTests: XCTestCase {
         // Refresh after disconnect should not crash or populate sessions
         await appState.refreshDaemonSessions()
         XCTAssertTrue(appState.daemonSessions.isEmpty, "refresh after disconnect should be a no-op")
+    }
+
+    func testUnexpectedTransportClosePreservesActiveSessionContext() async throws {
+        try await connectMock(scenario: .complex)
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.sendMessage("still-streaming")
+        let sessionId = try XCTUnwrap(appState.currentSessionId)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        await transport.close()
+
+        try await waitFor(timeout: 5) { self.appState.connectionStatus == .disconnected }
+
+        XCTAssertEqual(appState.currentSessionId, sessionId)
+        XCTAssertNotNil(appState.activeSession, "Active session should be kept for reconnect recovery")
+        XCTAssertFalse(appState.isPrompting, "Prompting state should clear after interruption")
+        XCTAssertFalse(
+            appState.messages.contains(where: \.isStreaming),
+            "Streaming message flags should be cleared after interruption"
+        )
+        XCTAssertTrue(appState.daemonSessions.isEmpty, "Daemon sessions should reset after interruption")
+    }
+
+    func testMarkTransportInterruptedBackfillsWorkspaceFromActiveSession() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.activeWorkspace = nil
+        appState.markTransportInterrupted("mock interruption")
+
+        XCTAssertEqual(appState.connectionStatus, .disconnected)
+        XCTAssertEqual(appState.connectionError, "mock interruption")
+        XCTAssertEqual(
+            appState.activeWorkspace?.persistentModelID,
+            workspace.persistentModelID,
+            "Workspace should be restored from activeSession for resumeSession()"
+        )
+    }
+
+    func testRecoverInterruptedSessionRoundTripCallsReconnectAndResume() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let sessionId = try XCTUnwrap(appState.currentSessionId)
+
+        appState.markTransportInterrupted("mock interruption")
+        XCTAssertEqual(appState.connectionStatus, .disconnected)
+
+        var connectCalls = 0
+        var resumedSessionIDs: [String] = []
+        appState.autoReconnectConnectHandler = { _ in
+            connectCalls += 1
+            self.appState.connectionStatus = .connected
+        }
+        appState.autoReconnectResumeHandler = { resumedSessionId, _ in
+            resumedSessionIDs.append(resumedSessionId)
+            self.appState.currentSessionId = resumedSessionId
+        }
+
+        await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
+
+        XCTAssertEqual(connectCalls, 1)
+        XCTAssertEqual(resumedSessionIDs, [sessionId])
+        XCTAssertEqual(appState.connectionStatus, .connected)
+        XCTAssertNil(appState.connectionError)
+
+        // Recovery flag should be cleared after success (no second attempt).
+        await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
+        XCTAssertEqual(connectCalls, 1)
+        XCTAssertEqual(resumedSessionIDs, [sessionId])
+    }
+
+    func testRecoverInterruptedSessionReconnectFailureAllowsRetry() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.markTransportInterrupted("mock interruption")
+        XCTAssertNotNil(appState.activeNode, "Failed recovery should preserve active node for retry")
+
+        var connectCalls = 0
+        var resumeCalls = 0
+        appState.autoReconnectConnectHandler = { _ in
+            connectCalls += 1
+            self.appState.connectionStatus = .failed
+            self.appState.connectionError = "mock connect failure"
+        }
+        appState.autoReconnectResumeHandler = { _, _ in
+            resumeCalls += 1
+        }
+
+        await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
+        XCTAssertEqual(connectCalls, 1)
+        XCTAssertEqual(resumeCalls, 0)
+        XCTAssertEqual(appState.connectionStatus, .failed)
+
+        // Retry should run again because auto-reconnect intent remains enabled.
+        await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
+        XCTAssertEqual(connectCalls, 2)
+        XCTAssertEqual(resumeCalls, 0)
     }
 
     // MARK: - Helpers
