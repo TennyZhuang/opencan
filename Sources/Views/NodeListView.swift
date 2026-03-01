@@ -11,6 +11,8 @@ struct NodeListView: View {
 
     var body: some View {
         List {
+            brandingRow
+
             ForEach(nodes) { node in
                 NavigationLink {
                     WorkspaceListView(node: node)
@@ -63,6 +65,36 @@ struct NodeListView: View {
         .sheet(isPresented: $showDiagnostics) {
             DiagnosticView()
         }
+    }
+
+    private var brandingRow: some View {
+        HStack {
+            Spacer()
+            VStack(spacing: 8) {
+                Image("LogoMark")
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(width: 96, height: 96)
+
+                Image("LogoWordmark")
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(height: 36)
+
+                Image("LogoTagline")
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(height: 20)
+            }
+            Spacer()
+        }
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("OpenCAN logo")
     }
 
     private func deleteNodes(at offsets: IndexSet) {
