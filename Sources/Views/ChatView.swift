@@ -4,6 +4,7 @@ import SwiftData
 struct ChatView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
     @State private var forceScrollToken = 0
 
     var body: some View {
@@ -34,10 +35,23 @@ struct ChatView: View {
                 }
             }
         }
+        .onAppear {
+            triggerInterruptedSessionRecovery()
+        }
+        .onChange(of: scenePhase) {
+            guard scenePhase == .active else { return }
+            triggerInterruptedSessionRecovery()
+        }
         .onDisappear {
             Task {
                 await appState.discardEmptyActiveSessionIfNeeded(modelContext: modelContext)
             }
+        }
+    }
+
+    private func triggerInterruptedSessionRecovery() {
+        Task {
+            await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
         }
     }
 }
