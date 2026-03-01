@@ -77,6 +77,11 @@ const maxExternalSessions = 50
 // ListSessions returns info about all sessions, including external sessions
 // discovered via ACP session/list that are not managed by this daemon.
 func (sm *SessionManager) ListSessions() []SessionInfo {
+	return sm.ListSessionsForCWD("")
+}
+
+// ListSessionsForCWD optionally scopes external discovery to a specific cwd.
+func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 	sm.mu.RLock()
 	proxies := make([]*proxy.ACPProxy, 0, len(sm.sessions))
 	for _, p := range sm.sessions {
@@ -94,7 +99,7 @@ func (sm *SessionManager) ListSessions() []SessionInfo {
 	// The result serves two purposes:
 	//   1. Filter idle/completed daemon sessions that are no longer loadable.
 	//   2. Discover external sessions not managed by this daemon.
-	loadableSessions, hasLoadableSet := sm.loadableSessions(proxies)
+	loadableSessions, hasLoadableSet := sm.loadableSessions(proxies, cwd)
 
 	loadableIDs := make(map[string]struct{}, len(loadableSessions))
 	for _, s := range loadableSessions {
@@ -144,7 +149,7 @@ func (sm *SessionManager) ListSessions() []SessionInfo {
 	return infos
 }
 
-func (sm *SessionManager) loadableSessions(proxies []*proxy.ACPProxy) ([]proxy.LoadableSession, bool) {
+func (sm *SessionManager) loadableSessions(proxies []*proxy.ACPProxy, discoveryCWD string) ([]proxy.LoadableSession, bool) {
 	var probe *proxy.ACPProxy
 	for _, p := range proxies {
 		state := p.State()
@@ -170,9 +175,13 @@ func (sm *SessionManager) loadableSessions(proxies []*proxy.ACPProxy) ([]proxy.L
 		return nil, false
 	}
 
-	sessions, err := probe.LoadableSessions(1200 * time.Millisecond)
+	sessions, err := probe.LoadableSessionsForCWD(1200*time.Millisecond, discoveryCWD)
 	if err != nil {
-		sm.logger.Warn("session/loadability probe failed; returning unfiltered list", "error", err)
+		sm.logger.Warn(
+			"session/loadability probe failed; returning unfiltered list",
+			"error", err,
+			"cwd", discoveryCWD,
+		)
 		return nil, false
 	}
 	return sessions, true

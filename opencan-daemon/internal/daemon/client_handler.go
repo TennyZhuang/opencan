@@ -253,7 +253,14 @@ func (h *ClientHandler) handleSessionDetach(msg *protocol.Message) {
 }
 
 func (h *ClientHandler) handleSessionList(msg *protocol.Message) {
-	sessions := h.daemon.sessions.ListSessions()
+	var params struct {
+		CWD string `json:"cwd"`
+	}
+	if msg.Params != nil {
+		json.Unmarshal(*msg.Params, &params)
+	}
+
+	sessions := h.daemon.sessions.ListSessionsForCWD(params.CWD)
 	result, _ := json.Marshal(map[string]interface{}{
 		"sessions": sessions,
 	})

@@ -501,7 +501,17 @@ type LoadableSession struct {
 // LoadableSessions queries ACP session/list and returns full metadata
 // for all sessions that session/load can resolve.
 func (p *ACPProxy) LoadableSessions(timeout time.Duration) ([]LoadableSession, error) {
-	resp, err := p.callACPRequest(protocol.MethodSessionList, map[string]interface{}{}, timeout)
+	return p.LoadableSessionsForCWD(timeout, "")
+}
+
+// LoadableSessionsForCWD queries ACP session/list scoped to a specific cwd when provided.
+func (p *ACPProxy) LoadableSessionsForCWD(timeout time.Duration, cwd string) ([]LoadableSession, error) {
+	params := map[string]interface{}{}
+	if cwd != "" {
+		params["cwd"] = cwd
+	}
+
+	resp, err := p.callACPRequest(protocol.MethodSessionList, params, timeout)
 	if err != nil {
 		return nil, err
 	}

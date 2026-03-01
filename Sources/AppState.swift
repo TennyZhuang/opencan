@@ -274,7 +274,8 @@ final class AppState {
                 self.isRefreshingDaemonSessions = false
             }
         }
-        if let updated = try? await daemon.listSessions() {
+        let workspaceCwd = activeWorkspace?.path
+        if let updated = try? await daemon.listSessions(cwd: workspaceCwd) {
             self.daemonSessions = updated
         }
     }

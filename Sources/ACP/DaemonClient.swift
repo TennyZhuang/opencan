@@ -85,10 +85,15 @@ actor DaemonClient {
     }
 
     /// List all sessions managed by the daemon.
-    func listSessions() async throws -> [DaemonSessionInfo] {
+    /// When `cwd` is provided, daemon external-session discovery is scoped to that path.
+    func listSessions(cwd: String? = nil) async throws -> [DaemonSessionInfo] {
+        var params: [String: JSONValue] = [:]
+        if let cwd = cwd?.trimmingCharacters(in: .whitespacesAndNewlines), !cwd.isEmpty {
+            params["cwd"] = .string(cwd)
+        }
         let result = try await client.sendRequest(
             method: DaemonMethods.sessionList,
-            params: .object([:])
+            params: .object(params)
         )
         return parseDaemonSessions(result["sessions"])
     }
