@@ -31,6 +31,9 @@ struct OpenCANApp: App {
             ContentView()
                 .environment(appState)
                 .onAppear {
+                    Task(priority: .utility) {
+                        migrateSSHKeysToKeychainIfNeeded()
+                    }
                     seedUITestDataIfNeeded()
                     seedUIIntegrationDataIfNeeded()
                 }
@@ -79,6 +82,7 @@ struct OpenCANApp: App {
         let nodeKeyPEM = nodeKeyPEMRaw.replacingOccurrences(of: "\\n", with: "\n")
 
         let context = ModelContext(modelContainer)
+        var createdKeys: [SSHKeyPair] = []
 
         do {
             // Keep integration runs deterministic by resetting persisted connection data.
@@ -99,10 +103,12 @@ struct OpenCANApp: App {
 
             let existingKeys = try context.fetch(FetchDescriptor<SSHKeyPair>())
             for key in existingKeys {
+                key.deletePrivateKeyFromKeychain()
                 context.delete(key)
             }
 
-            let nodeKey = SSHKeyPair(name: "\(nodeName)-key", privateKeyPEM: Data(nodeKeyPEM.utf8))
+            let nodeKey = try SSHKeyPair(name: "\(nodeName)-key", privateKeyPEM: Data(nodeKeyPEM.utf8))
+            createdKeys.append(nodeKey)
             context.insert(nodeKey)
 
             let node = Node(name: nodeName, host: nodeHost, port: nodePort, username: nodeUsername)
@@ -111,14 +117,18 @@ struct OpenCANApp: App {
 
             if let jumpHost = envValue("OPENCAN_TEST_JUMP_HOST", in: env) {
                 guard let jumpUsername = envValue("OPENCAN_TEST_JUMP_USERNAME", in: env) else {
-                    Log.toFile("[Seed] Integration seed skipped: OPENCAN_TEST_JUMP_USERNAME is missing")
-                    return
+                    throw NSError(
+                        domain: "OpenCANApp.Seed",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "OPENCAN_TEST_JUMP_USERNAME is missing"]
+                    )
                 }
                 let jumpPort = Int(envValue("OPENCAN_TEST_JUMP_PORT", in: env) ?? "") ?? 22
                 let jumpKeyPEMRaw = envValue("OPENCAN_TEST_JUMP_PRIVATE_KEY_PEM", in: env) ?? nodeKeyPEMRaw
                 let jumpKeyPEM = jumpKeyPEMRaw.replacingOccurrences(of: "\\n", with: "\n")
 
-                let jumpKey = SSHKeyPair(name: "\(nodeName)-jump-key", privateKeyPEM: Data(jumpKeyPEM.utf8))
+                let jumpKey = try SSHKeyPair(name: "\(nodeName)-jump-key", privateKeyPEM: Data(jumpKeyPEM.utf8))
+                createdKeys.append(jumpKey)
                 context.insert(jumpKey)
 
                 let jumpNode = Node(
@@ -138,7 +148,37 @@ struct OpenCANApp: App {
 
             try context.save()
         } catch {
+            for key in createdKeys {
+                key.deletePrivateKeyFromKeychain()
+            }
             Log.toFile("[Seed] Integration seed failed: \(error)")
+        }
+    }
+
+    private func migrateSSHKeysToKeychainIfNeeded() {
+        let context = ModelContext(modelContainer)
+
+        do {
+            let keys = try context.fetch(FetchDescriptor<SSHKeyPair>())
+            var migratedCount = 0
+            for key in keys {
+                if try key.migrateLegacyPrivateKeyIfNeeded() {
+                    migratedCount += 1
+                }
+            }
+            let validIdentifiers = SSHKeyPair.keychainIdentifiers(in: keys)
+            let orphanedCount = try SSHKeyPair.cleanupOrphanedKeychainEntries(validIdentifiers: validIdentifiers)
+
+            if migratedCount > 0 {
+                try context.save()
+            }
+            if migratedCount > 0 || orphanedCount > 0 {
+                Log.toFile(
+                    "[Security] Migrated \(migratedCount) SSH key(s) to Keychain; removed \(orphanedCount) orphaned Keychain entr\(orphanedCount == 1 ? "y" : "ies")"
+                )
+            }
+        } catch {
+            Log.toFile("[Security] SSH key migration failed: \(error)")
         }
     }
 
