@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/anthropics/opencan-daemon/internal/attach"
@@ -64,10 +66,19 @@ func startCmd() *cobra.Command {
 			if verbose {
 				level = slog.LevelDebug
 			}
-			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+			logWriter, closeWriter, err := openLogWriter(foreground && !godaemon.WasReborn())
+			if err != nil {
+				return err
+			}
+			defer closeWriter()
+
+			logBuffer := daemon.NewLogRingBuffer(2000)
+			innerHandler := slog.NewJSONHandler(logWriter, &slog.HandlerOptions{Level: level})
+			logger := slog.New(daemon.NewBufferingHandler(innerHandler, logBuffer))
 
 			cfg := daemon.DefaultConfig()
 			cfg.Logger = logger
+			cfg.LogBuffer = logBuffer
 
 			d := daemon.New(cfg)
 
@@ -151,4 +162,50 @@ func versionCmd() *cobra.Command {
 			fmt.Printf("opencan-daemon %s\n", version)
 		},
 	}
+}
+
+func openLogWriter(includeStderr bool) (io.Writer, func(), error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve home directory: %w", err)
+	}
+	logDir := filepath.Join(home, ".opencan")
+	if err := os.MkdirAll(logDir, 0700); err != nil {
+		return nil, nil, fmt.Errorf("create log directory: %w", err)
+	}
+
+	logPath := filepath.Join(logDir, "daemon.log")
+	if err := rotateLogIfNeeded(logPath, 10*1024*1024); err != nil {
+		return nil, nil, err
+	}
+
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open daemon log file: %w", err)
+	}
+
+	writer := io.Writer(file)
+	if includeStderr {
+		writer = io.MultiWriter(os.Stderr, file)
+	}
+	return writer, func() { _ = file.Close() }, nil
+}
+
+func rotateLogIfNeeded(path string, maxSize int64) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat daemon log: %w", err)
+	}
+	if info.Size() <= maxSize {
+		return nil
+	}
+	prevPath := path + ".prev"
+	_ = os.Remove(prevPath)
+	if err := os.Rename(path, prevPath); err != nil {
+		return fmt.Errorf("rotate daemon log: %w", err)
+	}
+	return nil
 }

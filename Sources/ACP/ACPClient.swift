@@ -38,11 +38,12 @@ actor ACPClient {
     }
 
     /// Send a request and await the response.
-    func sendRequest(method: String, params: JSONValue?) async throws -> JSONValue {
+    func sendRequest(method: String, params: JSONValue?, traceId: String? = nil) async throws -> JSONValue {
         let id = JSONRPCMessage.JSONRPCID.int(nextId)
         nextId += 1
         sentRequestIds.insert(id)
-        let message = JSONRPCMessage.request(id: id, method: method, params: params)
+        let finalParams = injectTraceId(traceId, into: params)
+        let message = JSONRPCMessage.request(id: id, method: method, params: finalParams)
         // Store continuation BEFORE sending so the response can't arrive first
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
@@ -68,6 +69,37 @@ actor ACPClient {
                 await self.removeSentRequestId(id)
             }
         }
+    }
+
+    private func injectTraceId(_ traceId: String?, into params: JSONValue?) -> JSONValue? {
+        guard let traceId else { return params }
+
+        if case .object(var dict) = params {
+            var meta: [String: JSONValue] = [:]
+            if case .object(let existingMeta)? = dict["_meta"] {
+                meta = existingMeta
+            }
+            meta["traceId"] = .string(traceId)
+            dict["_meta"] = .object(meta)
+            return .object(dict)
+        }
+
+        if params == nil {
+            return .object([
+                "_meta": .object([
+                    "traceId": .string(traceId)
+                ])
+            ])
+        }
+
+        // Keep non-object params untouched to avoid changing wire format.
+        Log.log(
+            level: "warning",
+            component: "ACPClient",
+            "Skipping traceId injection for non-object params",
+            traceId: traceId
+        )
+        return params
     }
 
     private func removePending(_ id: JSONRPCMessage.JSONRPCID) -> CheckedContinuation<JSONValue, Error>? {

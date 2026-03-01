@@ -39,8 +39,16 @@ func NewSessionManager(logger *slog.Logger) *SessionManager {
 
 // CreateSession spawns a new ACP process and registers the proxy.
 func (sm *SessionManager) CreateSession(cwd, command string) (*proxy.ACPProxy, error) {
+	startedAt := time.Now()
 	p, err := proxy.NewACPProxy(cwd, command, sm.logger)
 	if err != nil {
+		sm.logger.Error(
+			"session create failed",
+			"cwd", cwd,
+			"command", command,
+			"durationMs", time.Since(startedAt).Milliseconds(),
+			"error", err,
+		)
 		return nil, fmt.Errorf("create ACP proxy: %w", err)
 	}
 
@@ -48,7 +56,13 @@ func (sm *SessionManager) CreateSession(cwd, command string) (*proxy.ACPProxy, e
 	sm.sessions[p.SessionID] = p
 	sm.mu.Unlock()
 
-	sm.logger.Info("session created", "sessionId", p.SessionID, "cwd", cwd)
+	sm.logger.Info(
+		"session created",
+		"sessionId", p.SessionID,
+		"cwd", cwd,
+		"command", command,
+		"durationMs", time.Since(startedAt).Milliseconds(),
+	)
 	return p, nil
 }
 

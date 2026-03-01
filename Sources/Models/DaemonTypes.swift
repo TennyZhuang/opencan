@@ -1,20 +1,20 @@
 import Foundation
 
 /// Information returned by daemon/hello.
-struct DaemonInfo {
+struct DaemonInfo: Sendable {
     let daemonVersion: String
     let sessions: [DaemonSessionInfo]
 }
 
 /// Agent command availability on the connected node.
-struct DaemonAgentAvailability: Equatable {
+struct DaemonAgentAvailability: Equatable, Sendable {
     let id: String
     let command: String
     let available: Bool
 }
 
 /// Snapshot of a daemon-managed session.
-struct DaemonSessionInfo: Identifiable {
+struct DaemonSessionInfo: Identifiable, Codable, Sendable {
     let sessionId: String
     let cwd: String
     let state: String      // "starting", "idle", "prompting", "draining", "completed", "dead", "external"
@@ -42,6 +42,29 @@ struct DaemonSessionInfo: Identifiable {
     }
 
     var id: String { sessionId }
+}
+
+/// A structured daemon log line returned by daemon/logs.
+struct DaemonLogEntry: Identifiable, Codable, Sendable {
+    let id: UUID
+    let timestamp: String
+    let level: String
+    let message: String
+    let attrs: [String: String]
+
+    init(
+        id: UUID = UUID(),
+        timestamp: String,
+        level: String,
+        message: String,
+        attrs: [String: String] = [:]
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.level = level
+        self.message = message
+        self.attrs = attrs
+    }
 }
 
 /// Result of daemon/session.attach, including buffered events for replay.

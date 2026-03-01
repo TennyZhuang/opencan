@@ -9,4 +9,5 @@ enum DaemonMethods {
     static let sessionDetach = "daemon/session.detach"
     static let sessionList = "daemon/session.list"
     static let sessionKill = "daemon/session.kill"
+    static let logs = "daemon/logs"
 }

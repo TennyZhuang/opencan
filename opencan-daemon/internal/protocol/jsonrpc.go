@@ -222,7 +222,7 @@ func ExtractSessionID(msg *Message) string {
 }
 
 // ExtractRouteToSession extracts the __routeToSession override from params.
-// Used by session/load to route to a different ACP proxy than the sessionId being loaded.
+// Used by daemon request routing for methods that support routing overrides.
 func ExtractRouteToSession(msg *Message) string {
 	if msg.Params == nil {
 		return ""
@@ -234,6 +234,22 @@ func ExtractRouteToSession(msg *Message) string {
 		return ""
 	}
 	return params.RouteToSession
+}
+
+// ExtractTraceID extracts params._meta.traceId from the message.
+func ExtractTraceID(msg *Message) string {
+	if msg.Params == nil {
+		return ""
+	}
+	var params struct {
+		Meta struct {
+			TraceID string `json:"traceId"`
+		} `json:"_meta"`
+	}
+	if err := json.Unmarshal(*msg.Params, &params); err != nil {
+		return ""
+	}
+	return params.Meta.TraceID
 }
 
 // ExtractMethod returns the method name, or empty for responses.

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,13 +31,20 @@ func testDaemonWithTimeout(t *testing.T, idleTimeout time.Duration) (*daemon.Dae
 	sockPath := filepath.Join(tmpDir, "d.sock")
 	pidFile := filepath.Join(tmpDir, "d.pid")
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logBuffer := daemon.NewLogRingBuffer(2000)
+	logger := slog.New(
+		daemon.NewBufferingHandler(
+			slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}),
+			logBuffer,
+		),
+	)
 
 	cfg := daemon.Config{
 		SocketPath:  sockPath,
 		PIDFile:     pidFile,
 		IdleTimeout: idleTimeout,
 		Logger:      logger,
+		LogBuffer:   logBuffer,
 	}
 
 	d := daemon.New(cfg)
@@ -162,6 +170,108 @@ func TestDaemon_Hello_StringRequestIDRoundTrip(t *testing.T) {
 	}
 	if id != "hello-1" {
 		t.Fatalf("expected id hello-1, got %q", id)
+	}
+}
+
+func TestDaemon_LogsEndpointSupportsTraceFiltering(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.list",
+		"params": map[string]interface{}{
+			"_meta": map[string]interface{}{"traceId": "trace-a"},
+		},
+	})
+	_ = readJSON(t, conn)
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/hello",
+		"params": map[string]interface{}{
+			"clientVersion": "0.1.0",
+			"_meta":         map[string]interface{}{"traceId": "trace-b"},
+		},
+	})
+	_ = readJSON(t, conn)
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "daemon/logs",
+		"params": map[string]interface{}{
+			"count": 200,
+		},
+	})
+	resp := readJSON(t, conn)
+	if resp["error"] != nil {
+		t.Fatalf("daemon/logs error: %v", resp["error"])
+	}
+	entries := resp["result"].(map[string]interface{})["entries"].([]interface{})
+	if len(entries) == 0 {
+		t.Fatal("expected daemon/logs to return entries")
+	}
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      4,
+		"method":  "daemon/logs",
+		"params": map[string]interface{}{
+			"count":   200,
+			"traceId": "trace-a",
+		},
+	})
+	filteredResp := readJSON(t, conn)
+	if filteredResp["error"] != nil {
+		t.Fatalf("daemon/logs filtered error: %v", filteredResp["error"])
+	}
+	filtered := filteredResp["result"].(map[string]interface{})["entries"].([]interface{})
+	if len(filtered) == 0 {
+		t.Fatal("expected filtered daemon/logs to return trace-a entries")
+	}
+	for _, raw := range filtered {
+		entry := raw.(map[string]interface{})
+		attrs, ok := entry["attrs"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected attrs map in filtered entry, got %#v", entry)
+		}
+		if attrs["traceId"] != "trace-a" {
+			t.Fatalf("unexpected traceId in filtered result: %v", attrs["traceId"])
+		}
+	}
+
+	// Filter should happen before truncation by count.
+	// Even with count=1, we should still get the most recent trace-a entry.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      5,
+		"method":  "daemon/logs",
+		"params": map[string]interface{}{
+			"count":   1,
+			"traceId": "trace-a",
+		},
+	})
+	filteredLimitedResp := readJSON(t, conn)
+	if filteredLimitedResp["error"] != nil {
+		t.Fatalf("daemon/logs filtered limited error: %v", filteredLimitedResp["error"])
+	}
+	filteredLimited := filteredLimitedResp["result"].(map[string]interface{})["entries"].([]interface{})
+	if len(filteredLimited) != 1 {
+		t.Fatalf("expected 1 filtered entry with count=1, got %d", len(filteredLimited))
+	}
+	entry := filteredLimited[0].(map[string]interface{})
+	attrs, ok := entry["attrs"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected attrs map in filtered limited entry, got %#v", entry)
+	}
+	if attrs["traceId"] != "trace-a" {
+		t.Fatalf("unexpected traceId in filtered limited result: %v", attrs["traceId"])
 	}
 }
 
@@ -937,6 +1047,60 @@ func TestDaemon_SessionLoadRouteToSession(t *testing.T) {
 		t.Fatalf("expected response id 1001, got %v", resp["id"])
 	}
 	t.Logf("session/load with __routeToSession succeeded")
+
+	// session/prompt should support the same routing override so recovered
+	// sessions can continue on their original sessionId.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1003,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId":        oldSessionID,
+			"prompt":           []map[string]interface{}{{"type": "text", "text": "continue history"}},
+			"__routeToSession": newSessionID,
+		},
+	})
+
+	resp = readResponseWithID(t, scanner, 1003)
+	if resp["error"] != nil {
+		t.Fatalf("session/prompt with __routeToSession should succeed, got error: %v", resp["error"])
+	}
+	t.Logf("session/prompt with __routeToSession succeeded")
+
+	// Without routing override, prompts for unknown sessions should still fail.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1004,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": oldSessionID,
+			"prompt":    []map[string]interface{}{{"type": "text", "text": "should fail"}},
+		},
+	})
+
+	resp = readResponseWithID(t, scanner, 1004)
+	if resp["error"] == nil {
+		t.Fatal("session/prompt for unknown session without __routeToSession should fail")
+	}
+	t.Logf("session/prompt without __routeToSession correctly failed: %v", resp["error"])
+
+	// __routeToSession should be ignored for unsupported methods.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1005,
+		"method":  "session/list",
+		"params": map[string]interface{}{
+			"sessionId":        oldSessionID,
+			"__routeToSession": newSessionID,
+		},
+	})
+	resp = readResponseWithID(t, scanner, 1005)
+	if resp["error"] == nil {
+		t.Fatal("session/list with __routeToSession should fail (override not allowed)")
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: "+oldSessionID) {
+		t.Fatalf("expected not-attached error for original session id, got: %v", resp["error"])
+	}
 
 	// Also verify that session/load WITHOUT __routeToSession fails for the old ID
 	sendJSON(conn, map[string]interface{}{

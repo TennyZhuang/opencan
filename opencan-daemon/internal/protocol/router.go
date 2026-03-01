@@ -9,6 +9,7 @@ const (
 	MethodDaemonSessionDetach = "daemon/session.detach"
 	MethodDaemonSessionList   = "daemon/session.list"
 	MethodDaemonSessionKill   = "daemon/session.kill"
+	MethodDaemonLogs          = "daemon/logs"
 )
 
 // ACP method constants (for daemon-internal use during session creation).

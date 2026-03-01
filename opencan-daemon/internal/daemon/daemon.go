@@ -20,6 +20,7 @@ type Daemon struct {
 	listener   net.Listener
 	sessions   *SessionManager
 	logger     *slog.Logger
+	logBuffer  *LogRingBuffer
 
 	clientsMu sync.Mutex
 	clients   map[*ClientHandler]struct{}
@@ -36,6 +37,7 @@ type Config struct {
 	PIDFile     string
 	IdleTimeout time.Duration
 	Logger      *slog.Logger
+	LogBuffer   *LogRingBuffer
 }
 
 // DefaultConfig returns the default daemon configuration.
@@ -52,11 +54,20 @@ func DefaultConfig() Config {
 
 // New creates a new Daemon with the given config.
 func New(cfg Config) *Daemon {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logBuffer := cfg.LogBuffer
+	if logBuffer == nil {
+		logBuffer = NewLogRingBuffer(2000)
+	}
 	return &Daemon{
 		socketPath:  cfg.SocketPath,
 		pidFile:     cfg.PIDFile,
-		sessions:    NewSessionManager(cfg.Logger),
-		logger:      cfg.Logger.With("component", "daemon"),
+		sessions:    NewSessionManager(logger),
+		logger:      logger.With("component", "daemon"),
+		logBuffer:   logBuffer,
 		clients:     make(map[*ClientHandler]struct{}),
 		idleTimeout: cfg.IdleTimeout,
 		stopCh:      make(chan struct{}),
@@ -124,6 +135,11 @@ func (d *Daemon) Stop() {
 // SocketPath returns the daemon's socket path.
 func (d *Daemon) SocketPath() string {
 	return d.socketPath
+}
+
+// LogBuffer exposes recent daemon logs for diagnostics.
+func (d *Daemon) LogBuffer() *LogRingBuffer {
+	return d.logBuffer
 }
 
 func (d *Daemon) acceptLoop() {

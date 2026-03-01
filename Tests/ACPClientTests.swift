@@ -4,6 +4,7 @@ import XCTest
 private actor TestACPTransport: ACPTransport {
     private let continuation: AsyncStream<JSONRPCMessage>.Continuation
     nonisolated let messages: AsyncStream<JSONRPCMessage>
+    private var sentMessages: [JSONRPCMessage] = []
 
     init() {
         let (stream, cont) = AsyncStream<JSONRPCMessage>.makeStream()
@@ -12,6 +13,7 @@ private actor TestACPTransport: ACPTransport {
     }
 
     func send(_ message: JSONRPCMessage) async throws {
+        sentMessages.append(message)
         // Intentionally no-op. Tests drive responses explicitly via `yield`.
     }
 
@@ -21,6 +23,10 @@ private actor TestACPTransport: ACPTransport {
 
     func yield(_ message: JSONRPCMessage) {
         continuation.yield(message)
+    }
+
+    func lastSentMessage() -> JSONRPCMessage? {
+        sentMessages.last
     }
 }
 
@@ -92,5 +98,69 @@ final class ACPClientTests: XCTestCase {
 
         await fulfillment(of: [finished], timeout: 1.0)
     }
-}
 
+    func testSendRequestInjectsTraceId() async throws {
+        let transport = TestACPTransport()
+        let client = ACPClient(transport: transport)
+        await client.start()
+        defer { Task { await client.stop() } }
+
+        let pending = Task {
+            try await client.sendRequest(
+                method: DaemonMethods.sessionAttach,
+                params: .object([
+                    "sessionId": .string("sess-1")
+                ]),
+                traceId: "trace-abc"
+            )
+        }
+
+        try await Task.sleep(for: .milliseconds(20))
+        guard let last = await transport.lastSentMessage() else {
+            XCTFail("Expected a sent request")
+            return
+        }
+
+        guard case .request(let id, _, let params) = last else {
+            XCTFail("Expected request message")
+            return
+        }
+
+        XCTAssertEqual(params?["_meta"]?["traceId"], .string("trace-abc"))
+
+        await transport.yield(.response(id: id, result: .object([:])))
+        _ = try await pending.value
+    }
+
+    func testSendRequestWithArrayParamsKeepsParamsWhenInjectingTraceId() async throws {
+        let transport = TestACPTransport()
+        let client = ACPClient(transport: transport)
+        await client.start()
+        defer { Task { await client.stop() } }
+
+        let arrayParams: JSONValue = .array([.string("a"), .string("b")])
+        let pending = Task {
+            try await client.sendRequest(
+                method: "test/method",
+                params: arrayParams,
+                traceId: "trace-array"
+            )
+        }
+
+        try await Task.sleep(for: .milliseconds(20))
+        guard let last = await transport.lastSentMessage() else {
+            XCTFail("Expected a sent request")
+            return
+        }
+
+        guard case .request(let id, _, let params) = last else {
+            XCTFail("Expected request message")
+            return
+        }
+
+        XCTAssertEqual(params, arrayParams)
+
+        await transport.yield(.response(id: id, result: .object([:])))
+        _ = try await pending.value
+    }
+}

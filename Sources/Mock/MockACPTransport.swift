@@ -36,6 +36,8 @@ actor MockACPTransport: ACPTransport {
     var lastCreateCwd: String?
     var lastCreateCommand: String?
     /// Tracks the most recent session/prompt content blocks.
+    var lastPromptSessionId: String?
+    var lastPromptRouteToSessionId: String?
     var lastPromptBlocks: [JSONValue]?
 
     /// Track last received method for test assertions.
@@ -53,6 +55,8 @@ actor MockACPTransport: ACPTransport {
     var mockAgentAvailabilityByID: [String: Bool] = [:]
     /// If true, daemon/agent.probe returns method not found.
     var mockAgentProbeUnsupported = false
+    /// Configurable daemon/logs payload.
+    var mockDaemonLogs: [[String: JSONValue]] = []
 
     init(scenario: MockScenario = .simple) {
         self.scenario = scenario
@@ -160,9 +164,17 @@ actor MockACPTransport: ACPTransport {
             }
             messageContinuation.yield(.response(id: id, result: .object([:])))
 
+        case DaemonMethods.logs:
+            messageContinuation.yield(.response(id: id, result: .object([
+                "entries": .array(mockDaemonLogs.map { .object($0) })
+            ])))
+
         // ACP passthrough (daemon forwards transparently)
         case ACPMethods.sessionPrompt:
             let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
+            let routeToSessionId = params?["__routeToSession"]?.stringValue
+            lastPromptSessionId = sessionId
+            lastPromptRouteToSessionId = routeToSessionId
             lastPromptBlocks = params?["prompt"]?.arrayValue
             if let promptError = nextPromptError {
                 nextPromptError = nil
@@ -406,6 +418,14 @@ actor MockACPTransport: ACPTransport {
 
     func getLastPromptBlocks() -> [JSONValue]? {
         lastPromptBlocks
+    }
+
+    func getLastPromptSessionId() -> String? {
+        lastPromptSessionId
+    }
+
+    func getLastPromptRouteToSessionId() -> String? {
+        lastPromptRouteToSessionId
     }
 
     func getReceivedMethods() -> [String] {

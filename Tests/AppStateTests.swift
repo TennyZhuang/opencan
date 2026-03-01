@@ -887,6 +887,15 @@ final class AppStateTests: XCTestCase {
         appState.sendMessage("New question")
         XCTAssertTrue(appState.isPrompting)
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        let lastPromptSessionId = await transport.getLastPromptSessionId()
+        let lastPromptRoute = await transport.getLastPromptRouteToSessionId()
+        XCTAssertEqual(lastPromptSessionId, oldSessionId, "Recovered prompt should target original history session")
+        XCTAssertEqual(lastPromptRoute, recoveredSessionId, "Recovered prompt should route via attached daemon session")
+        XCTAssertTrue(
+            appState.messages.contains { $0.role == .assistant && $0.content.contains("mock assistant") },
+            "Prompt updates from history session should still render in the active chat"
+        )
     }
 
     func testResumeHistorySessionReusesStoredAgentCommand() async throws {

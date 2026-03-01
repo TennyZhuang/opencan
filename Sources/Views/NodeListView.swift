@@ -7,6 +7,7 @@ struct NodeListView: View {
     @Query(sort: \Node.name) private var nodes: [Node]
     @State private var showAddNode = false
     @State private var showAgentSettings = false
+    @State private var showDiagnostics = false
 
     var body: some View {
         List {
@@ -34,8 +35,13 @@ struct NodeListView: View {
         .navigationTitle("Nodes")
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
-                Button {
-                    showAgentSettings = true
+                Menu {
+                    Button("Agent Settings") {
+                        showAgentSettings = true
+                    }
+                    Button("Diagnostics") {
+                        showDiagnostics = true
+                    }
                 } label: {
                     Image(systemName: "gearshape")
                 }
@@ -53,6 +59,9 @@ struct NodeListView: View {
         }
         .sheet(isPresented: $showAgentSettings) {
             AgentSettingsView()
+        }
+        .sheet(isPresented: $showDiagnostics) {
+            DiagnosticView()
         }
     }
 

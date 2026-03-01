@@ -42,6 +42,8 @@ final class AppState {
     var forceScrollToBottom = false
     /// True while uploading an image mention to the remote node.
     var isUploadingImage = false
+    /// Trace ID for the most recent user-triggered action.
+    var currentTraceId: String?
 
     // Daemon upload progress (nil = not uploading, 0..1 = uploading)
     var daemonUploadProgress: Double?
@@ -90,6 +92,28 @@ final class AppState {
         case failed
     }
 
+    private func newTraceId() -> String {
+        let traceId = UUID().uuidString.lowercased()
+        currentTraceId = traceId
+        return traceId
+    }
+
+    func fetchDaemonLogs(count: Int = 200, traceId: String? = nil) async throws -> [DaemonLogEntry] {
+        guard let daemonClient else {
+            throw AppStateError.notConnected
+        }
+        return try await daemonClient.fetchLogs(count: count, traceId: traceId)
+    }
+
+    var connectionStatusLabel: String {
+        switch connectionStatus {
+        case .disconnected: return "disconnected"
+        case .connecting: return "connecting"
+        case .connected: return "connected"
+        case .failed: return "failed"
+        }
+    }
+
     // MARK: - Connection
 
     /// Connect to a node via SSH and the daemon.
@@ -110,6 +134,13 @@ final class AppState {
         activeNode = node
         availableNodeAgents = []
         hasReliableAgentAvailability = false
+        let traceId = newTraceId()
+
+        Log.log(
+            component: "AppState",
+            "connect started for \(node.host):\(node.port)",
+            traceId: traceId
+        )
 
         // Build jump server params
         let jumpHost = node.jumpServer?.host
@@ -134,7 +165,13 @@ final class AppState {
             await sshManager.disconnect()
 
             do {
-                let t = try await sshManager.connect(params: params)
+                let t = try await Log.timed(
+                    "ssh.connect",
+                    component: "AppState",
+                    traceId: traceId
+                ) {
+                    try await sshManager.connect(params: params)
+                }
                 self.transport = t
 
                 // Ensure daemon binary is installed on the server
@@ -168,7 +205,11 @@ final class AppState {
 
                 // Wait for PTY to be ready before sending messages
                 await t.waitUntilReady()
-                Log.toFile("[AppState] PTY ready, waiting for daemon/attached signal...")
+                Log.log(
+                    component: "AppState",
+                    "PTY ready, waiting for daemon/attached signal",
+                    traceId: traceId
+                )
 
                 let client = ACPClient(transport: t)
                 await client.start()
@@ -181,7 +222,7 @@ final class AppState {
                 try await withThrowingTimeout(seconds: 30) {
                     await t.waitForFirstJSON()
                 }
-                Log.toFile("[AppState] Daemon attached, sending hello...")
+                Log.log(component: "AppState", "daemon bridge attached", traceId: traceId)
 
                 // ACPService is kept for sendPrompt (daemon forwards transparently)
                 let service = ACPService(client: client)
@@ -190,13 +231,19 @@ final class AppState {
                 // Initialize daemon connection with timeout
                 let daemon = DaemonClient(client: client)
                 let info = try await withThrowingTimeout(seconds: 30) {
-                    try await daemon.hello()
+                    try await Log.timed("daemon/hello", component: "AppState", traceId: traceId) {
+                        try await daemon.hello(traceId: traceId)
+                    }
                 }
                 self.daemonClient = daemon
                 self.daemonSessions = info.sessions
                 await self.refreshAvailableAgents()
                 Log.app.info("Daemon connected: v\(info.daemonVersion), \(info.sessions.count) sessions")
-                Log.toFile("[AppState] Daemon connected: v\(info.daemonVersion)")
+                Log.log(
+                    component: "AppState",
+                    "daemon connected: v\(info.daemonVersion)",
+                    traceId: traceId
+                )
 
                 // Start notification listener once for the entire connection.
                 // Do NOT restart it per-session — AsyncStream only supports one consumer.
@@ -205,7 +252,12 @@ final class AppState {
                 self.connectionStatus = .connected
             } catch {
                 Log.app.error("Connection error: \(error)")
-                Log.toFile("[AppState] Connection error: \(error)")
+                Log.log(
+                    level: "error",
+                    component: "AppState",
+                    "connect failed: \(error.localizedDescription)",
+                    traceId: traceId
+                )
                 self.connectionError = error.localizedDescription
                 self.connectionStatus = .failed
                 self.cleanupConnection()
@@ -345,20 +397,36 @@ final class AppState {
             throw AppStateError.notConnected
         }
 
+        let traceId = newTraceId()
+
         messages = []
         let launchCommand = normalizeAgentCommand(command, fallback: AgentCommandStore.command(forAgentID: agentID))
 
-        Log.toFile("[AppState] Creating session via daemon...")
-        let sessionId = try await daemon.createSession(
-            cwd: workspace.path,
-            command: launchCommand
-        )
-        await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon)
+        Log.log(component: "AppState", "creating session via daemon", traceId: traceId)
+        let sessionId = try await Log.timed(
+            "daemon/session.create",
+            component: "AppState",
+            traceId: traceId
+        ) {
+            try await daemon.createSession(
+                cwd: workspace.path,
+                command: launchCommand,
+                traceId: traceId
+            )
+        }
+        await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon, traceId: traceId)
         self.currentSessionId = sessionId
         self.lastEventSeq[sessionId] = 0
 
         // Auto-attach to the new session
-        let _ = try await daemon.attachSession(sessionId: sessionId, lastEventSeq: 0)
+        let _ = try await Log.timed(
+            "daemon/session.attach",
+            component: "AppState",
+            traceId: traceId,
+            sessionId: sessionId
+        ) {
+            try await daemon.attachSession(sessionId: sessionId, lastEventSeq: 0, traceId: traceId)
+        }
 
         let session = Session(
             sessionId: sessionId,
@@ -388,6 +456,8 @@ final class AppState {
             throw AppStateError.notConnected
         }
 
+        let traceId = newTraceId()
+
         let sessionDescriptor = FetchDescriptor<Session>(
             predicate: #Predicate { $0.sessionId == sessionId }
         )
@@ -410,11 +480,16 @@ final class AppState {
 
         messages = []
 
-        await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon)
+        await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon, traceId: traceId)
 
         // External sessions (not managed by daemon) go straight to history recovery.
         if daemonKnownSession?.state == "external" {
-            Log.toFile("[AppState] External session \(sessionId), recovering via session/load")
+            Log.log(
+                component: "AppState",
+                "external session \(sessionId), recovering via session/load",
+                traceId: traceId,
+                sessionId: sessionId
+            )
             try await resumeHistorySession(
                 oldSessionId: sessionId,
                 sourceSessionId: sourceSessionId,
@@ -423,23 +498,38 @@ final class AppState {
                 agentID: sessionAgent.id,
                 command: sessionAgent.command,
                 daemon: daemon,
+                traceId: traceId,
                 modelContext: modelContext
             )
             return
         }
 
-        Log.toFile("[AppState] Attaching to session \(sessionId)...")
+        Log.log(component: "AppState", "attaching to session \(sessionId)", traceId: traceId, sessionId: sessionId)
         let shouldReplayFullBuffer = daemonKnownSession?.state == "idle" || daemonKnownSession?.state == "completed"
         let desiredAttachSeq = shouldReplayFullBuffer ? 0 : (lastEventSeq[sessionId] ?? 0)
         let result: DaemonAttachResult
         do {
-            result = try await daemon.attachSession(
-                sessionId: sessionId,
-                lastEventSeq: desiredAttachSeq
-            )
+            result = try await Log.timed(
+                "daemon/session.attach",
+                component: "AppState",
+                traceId: traceId,
+                sessionId: sessionId
+            ) {
+                try await daemon.attachSession(
+                    sessionId: sessionId,
+                    lastEventSeq: desiredAttachSeq,
+                    traceId: traceId
+                )
+            }
         } catch {
             // Daemon doesn't know this session — recover via session/load
-            Log.toFile("[AppState] Attach failed, recovering history session: \(error)")
+            Log.log(
+                level: "warning",
+                component: "AppState",
+                "attach failed, recovering history session: \(error.localizedDescription)",
+                traceId: traceId,
+                sessionId: sessionId
+            )
             try await resumeHistorySession(
                 oldSessionId: sessionId,
                 sourceSessionId: sourceSessionId,
@@ -448,6 +538,7 @@ final class AppState {
                 agentID: sessionAgent.id,
                 command: sessionAgent.command,
                 daemon: daemon,
+                traceId: traceId,
                 modelContext: modelContext
             )
             return
@@ -503,6 +594,7 @@ final class AppState {
                 )
                 let loadedPrimaryCwd = await loadSessionFromCandidates(
                     sessionId: sessionId,
+                    traceId: traceId,
                     candidateCwds: primaryCwds
                 )
 
@@ -523,6 +615,7 @@ final class AppState {
                     if let loadedHistoryCwd = await loadSessionFromCandidates(
                         sessionId: historySessionId,
                         routeToSessionId: sessionId,
+                        traceId: traceId,
                         candidateCwds: historyCwds
                     ) {
                         existingSession?.historySessionCwd = loadedHistoryCwd
@@ -597,21 +690,41 @@ final class AppState {
         agentID: String,
         command: String,
         daemon: DaemonClient,
+        traceId: String,
         modelContext: ModelContext
     ) async throws {
-        Log.toFile("[AppState] Creating new session to recover history of \(sourceSessionId)...")
+        Log.log(
+            component: "AppState",
+            "creating new session to recover history of \(sourceSessionId)",
+            traceId: traceId,
+            sessionId: oldSessionId
+        )
 
         // Create a fresh ACP process
         let launchCommand = command
-        let newSessionId = try await daemon.createSession(
-            cwd: workspace.path,
-            command: launchCommand
-        )
+        let newSessionId = try await Log.timed(
+            "daemon/session.create",
+            component: "AppState",
+            traceId: traceId
+        ) {
+            try await daemon.createSession(
+                cwd: workspace.path,
+                command: launchCommand,
+                traceId: traceId
+            )
+        }
 
-        await detachCurrentSessionIfNeeded(beforeAttaching: newSessionId, daemon: daemon)
+        await detachCurrentSessionIfNeeded(beforeAttaching: newSessionId, daemon: daemon, traceId: traceId)
 
         // Attach to the new session
-        let _ = try await daemon.attachSession(sessionId: newSessionId, lastEventSeq: 0)
+        let _ = try await Log.timed(
+            "daemon/session.attach",
+            component: "AppState",
+            traceId: traceId,
+            sessionId: newSessionId
+        ) {
+            try await daemon.attachSession(sessionId: newSessionId, lastEventSeq: 0, traceId: traceId)
+        }
         self.currentSessionId = newSessionId
         self.lastEventSeq[newSessionId] = 0
 
@@ -629,6 +742,7 @@ final class AppState {
         let loadedSourceCwd = await loadSessionFromCandidates(
             sessionId: sourceSessionId,
             routeToSessionId: newSessionId,
+            traceId: traceId,
             candidateCwds: sourceLoadCwds
         )
         let historyLoadFailed = loadedSourceCwd == nil
@@ -702,6 +816,7 @@ final class AppState {
         mockTransport = nil
         connectionStatus = .disconnected
         currentSessionId = nil
+        currentTraceId = nil
         activeSession = nil
         activeNode = nil
         activeWorkspace = nil
@@ -827,6 +942,7 @@ final class AppState {
             addSystemMessage("Not connected — please reconnect")
             return
         }
+        let promptTarget = resolvePromptTargetSession(daemonSessionId: sessionId)
 
         let mentionTokens = extractMentionTokens(in: text)
         let referencedMentions = resolveMentionedImages(in: text, sessionId: sessionId)
@@ -853,18 +969,43 @@ final class AppState {
         messages.append(assistantMsg)
         isPrompting = true
         forceScrollToBottom = true
-        Log.toFile("[AppState] sendMessage: isPrompting=true, sending prompt to \(sessionId), resourceLinks=\(referencedMentions.count)")
+
+        let traceId = newTraceId()
+        Log.log(
+            component: "AppState",
+            "sendMessage dispatching prompt, resourceLinks=\(referencedMentions.count), promptSessionId=\(promptTarget.sessionId), routeToSessionId=\(promptTarget.routeToSessionId ?? "none")",
+            traceId: traceId,
+            sessionId: sessionId
+        )
 
         Task {
             do {
-                let _ = try await service.sendPrompt(sessionId: sessionId, prompt: promptBlocks)
-                Log.toFile("[AppState] sendPrompt returned successfully")
+                let _ = try await Log.timed(
+                    "session/prompt",
+                    component: "AppState",
+                    traceId: traceId,
+                    sessionId: sessionId
+                ) {
+                    try await service.sendPrompt(
+                        sessionId: promptTarget.sessionId,
+                        prompt: promptBlocks,
+                        routeToSessionId: promptTarget.routeToSessionId,
+                        traceId: traceId
+                    )
+                }
+                Log.log(component: "AppState", "sendPrompt returned", traceId: traceId, sessionId: sessionId)
                 for msg in self.messages where msg.role == .assistant && msg.isStreaming {
                     msg.isStreaming = false
                 }
                 self.isPrompting = false
             } catch {
-                Log.toFile("[AppState] sendPrompt error: \(error)")
+                Log.log(
+                    level: "error",
+                    component: "AppState",
+                    "sendPrompt error: \(error.localizedDescription)",
+                    traceId: traceId,
+                    sessionId: sessionId
+                )
                 self.presentPromptError(error)
                 for msg in self.messages where msg.role == .assistant && msg.isStreaming {
                     msg.isStreaming = false
@@ -872,6 +1013,18 @@ final class AppState {
                 self.isPrompting = false
             }
         }
+    }
+
+    /// Resolve ACP prompt routing for recovered sessions.
+    /// When a daemon session is recovered via `session/load`, prompts should
+    /// continue targeting the original history session and route through the
+    /// currently attached daemon session.
+    private func resolvePromptTargetSession(daemonSessionId: String) -> (sessionId: String, routeToSessionId: String?) {
+        guard let sourceSessionId = activeSession?.historySessionId,
+              sourceSessionId != daemonSessionId else {
+            return (daemonSessionId, nil)
+        }
+        return (sourceSessionId, daemonSessionId)
     }
 
     private func generateMentionName(for sessionId: String) -> String {
@@ -1019,7 +1172,7 @@ final class AppState {
 
     private func shouldHandleSessionNotification(for sessionId: String?) -> Bool {
         guard let sessionId else { return true }
-        if sessionId == currentSessionId { return true }
+        if activeSessionNotificationIDs().contains(sessionId) { return true }
 
         // During/after session/load, allow source-session replay events to continue
         // until we observe prompt_complete or a fallback timeout.
@@ -1033,6 +1186,18 @@ final class AppState {
             return historyLoadSessionIds.isEmpty
         }
         return false
+    }
+
+    /// Notification session IDs that belong to the currently active chat.
+    /// Recovered chats can emit updates under the original history session ID.
+    private func activeSessionNotificationIDs() -> Set<String> {
+        guard let currentSessionId else { return [] }
+        var ids: Set<String> = [currentSessionId]
+        if let sourceSessionId = activeSession?.historySessionId,
+           sourceSessionId != currentSessionId {
+            ids.insert(sourceSessionId)
+        }
+        return ids
     }
 
     private func handleSessionEvent(_ event: SessionEvent, sessionId: String? = nil) {
@@ -1277,20 +1442,33 @@ final class AppState {
     private func loadSessionFromCandidates(
         sessionId: String,
         routeToSessionId: String? = nil,
+        traceId: String? = nil,
         candidateCwds: [String]
     ) async -> String? {
         guard let service = acpService else { return nil }
         for cwd in candidateCwds {
             do {
-                try await service.loadSession(
-                    sessionId: sessionId,
-                    cwd: cwd,
-                    routeToSessionId: routeToSessionId
-                )
+                try await Log.timed(
+                    "session/load",
+                    component: "AppState",
+                    traceId: traceId,
+                    sessionId: routeToSessionId ?? sessionId
+                ) {
+                    try await service.loadSession(
+                        sessionId: sessionId,
+                        cwd: cwd,
+                        routeToSessionId: routeToSessionId,
+                        traceId: traceId
+                    )
+                }
                 return cwd
             } catch {
-                Log.toFile(
-                    "[AppState] session/load failed for \(sessionId) (route: \(routeToSessionId ?? "none"), cwd: \(cwd)): \(error)"
+                Log.log(
+                    level: "warning",
+                    component: "AppState",
+                    "session/load failed for \(sessionId) (route: \(routeToSessionId ?? "none"), cwd: \(cwd)): \(error.localizedDescription)",
+                    traceId: traceId,
+                    sessionId: routeToSessionId ?? sessionId
                 )
                 // Routing errors are terminal; cwd retries cannot fix missing attachment.
                 // "Session not found" is often cwd-dependent, so keep trying candidates.
@@ -1342,13 +1520,28 @@ final class AppState {
 
     /// Detach the currently attached daemon session before switching to another one.
     /// Detach failures are logged but do not block the new attach flow.
-    private func detachCurrentSessionIfNeeded(beforeAttaching targetSessionId: String, daemon: DaemonClient) async {
+    private func detachCurrentSessionIfNeeded(
+        beforeAttaching targetSessionId: String,
+        daemon: DaemonClient,
+        traceId: String? = nil
+    ) async {
         guard let currentSessionId, currentSessionId != targetSessionId else { return }
         do {
-            try await daemon.detachSession(sessionId: currentSessionId)
-            Log.toFile("[AppState] Detached previous session \(currentSessionId)")
+            try await daemon.detachSession(sessionId: currentSessionId, traceId: traceId)
+            Log.log(
+                component: "AppState",
+                "detached previous session \(currentSessionId)",
+                traceId: traceId,
+                sessionId: currentSessionId
+            )
         } catch {
-            Log.toFile("[AppState] Failed to detach previous session \(currentSessionId): \(error)")
+            Log.log(
+                level: "warning",
+                component: "AppState",
+                "failed to detach previous session \(currentSessionId): \(error.localizedDescription)",
+                traceId: traceId,
+                sessionId: currentSessionId
+            )
         }
     }
 

@@ -11,13 +11,14 @@ actor DaemonClient {
     }
 
     /// Initialize daemon connection and get daemon info.
-    func hello() async throws -> DaemonInfo {
+    func hello(traceId: String? = nil) async throws -> DaemonInfo {
         let params: JSONValue = .object([
             "clientVersion": .string("0.1.0")
         ])
         let result = try await client.sendRequest(
             method: DaemonMethods.hello,
-            params: params
+            params: params,
+            traceId: traceId
         )
         let sessions = parseDaemonSessions(result["sessions"])
         return DaemonInfo(
@@ -28,14 +29,15 @@ actor DaemonClient {
 
     /// Create a new session via the daemon.
     /// The daemon internally spawns the ACP process, runs initialize + session/new.
-    func createSession(cwd: String, command: String) async throws -> String {
+    func createSession(cwd: String, command: String, traceId: String? = nil) async throws -> String {
         let params: JSONValue = .object([
             "cwd": .string(cwd),
             "command": .string(command)
         ])
         let result = try await client.sendRequest(
             method: DaemonMethods.sessionCreate,
-            params: params
+            params: params,
+            traceId: traceId
         )
         guard let sessionId = result["sessionId"]?.stringValue else {
             throw ACPError.unexpectedResponse
@@ -44,7 +46,7 @@ actor DaemonClient {
     }
 
     /// Probe whether agent launcher commands are available on this node.
-    func probeAgents(_ agents: [(id: String, command: String)]) async throws -> [DaemonAgentAvailability] {
+    func probeAgents(_ agents: [(id: String, command: String)], traceId: String? = nil) async throws -> [DaemonAgentAvailability] {
         let payloadAgents = agents.map { agent in
             JSONValue.object([
                 "id": .string(agent.id),
@@ -56,20 +58,22 @@ actor DaemonClient {
         ])
         let result = try await client.sendRequest(
             method: DaemonMethods.agentProbe,
-            params: params
+            params: params,
+            traceId: traceId
         )
         return parseAgentAvailability(result["agents"])
     }
 
     /// Attach to an existing session, receiving buffered events since lastEventSeq.
-    func attachSession(sessionId: String, lastEventSeq: UInt64) async throws -> DaemonAttachResult {
+    func attachSession(sessionId: String, lastEventSeq: UInt64, traceId: String? = nil) async throws -> DaemonAttachResult {
         let params: JSONValue = .object([
             "sessionId": .string(sessionId),
             "lastEventSeq": .int(Int(lastEventSeq))
         ])
         let result = try await client.sendRequest(
             method: DaemonMethods.sessionAttach,
-            params: params
+            params: params,
+            traceId: traceId
         )
         let state = result["state"]?.stringValue ?? "unknown"
         let bufferedEvents = parseBufferedEvents(result["bufferedEvents"])
@@ -77,33 +81,52 @@ actor DaemonClient {
     }
 
     /// Detach from a session without killing it.
-    func detachSession(sessionId: String) async throws {
+    func detachSession(sessionId: String, traceId: String? = nil) async throws {
         let _ = try await client.sendRequest(
             method: DaemonMethods.sessionDetach,
-            params: .object(["sessionId": .string(sessionId)])
+            params: .object(["sessionId": .string(sessionId)]),
+            traceId: traceId
         )
     }
 
     /// List all sessions managed by the daemon.
     /// When `cwd` is provided, daemon external-session discovery is scoped to that path.
-    func listSessions(cwd: String? = nil) async throws -> [DaemonSessionInfo] {
+    func listSessions(cwd: String? = nil, traceId: String? = nil) async throws -> [DaemonSessionInfo] {
         var params: [String: JSONValue] = [:]
         if let cwd = cwd?.trimmingCharacters(in: .whitespacesAndNewlines), !cwd.isEmpty {
             params["cwd"] = .string(cwd)
         }
         let result = try await client.sendRequest(
             method: DaemonMethods.sessionList,
-            params: .object(params)
+            params: .object(params),
+            traceId: traceId
         )
         return parseDaemonSessions(result["sessions"])
     }
 
     /// Kill a session and its ACP process.
-    func killSession(sessionId: String) async throws {
+    func killSession(sessionId: String, traceId: String? = nil) async throws {
         let _ = try await client.sendRequest(
             method: DaemonMethods.sessionKill,
-            params: .object(["sessionId": .string(sessionId)])
+            params: .object(["sessionId": .string(sessionId)]),
+            traceId: traceId
         )
+    }
+
+    /// Fetch recent daemon logs from in-memory ring buffer.
+    func fetchLogs(count: Int = 200, traceId: String? = nil, requestTraceId: String? = nil) async throws -> [DaemonLogEntry] {
+        var params: [String: JSONValue] = [
+            "count": .int(count)
+        ]
+        if let traceId, !traceId.isEmpty {
+            params["traceId"] = .string(traceId)
+        }
+        let result = try await client.sendRequest(
+            method: DaemonMethods.logs,
+            params: .object(params),
+            traceId: requestTraceId
+        )
+        return parseDaemonLogs(result["entries"])
     }
 
     // MARK: - Parsing helpers
@@ -178,6 +201,33 @@ actor DaemonClient {
             }
             let notification = JSONRPCMessage.notification(method: method, params: params)
             return DaemonBufferedEvent(seq: UInt64(seq), event: notification)
+        }
+    }
+
+    private func parseDaemonLogs(_ value: JSONValue?) -> [DaemonLogEntry] {
+        guard let arr = value?.arrayValue else { return [] }
+        return arr.compactMap { item in
+            let timestamp = item["timestamp"]?.stringValue ?? ""
+            let level = item["level"]?.stringValue ?? ""
+            let message = item["message"]?.stringValue ?? ""
+            var attrs: [String: String] = [:]
+            if let attrObj = item["attrs"]?.objectValue {
+                for (key, value) in attrObj {
+                    if let stringValue = value.stringValue {
+                        attrs[key] = stringValue
+                    } else if let intValue = value.intValue {
+                        attrs[key] = String(intValue)
+                    } else if let boolValue = value.boolValue {
+                        attrs[key] = boolValue ? "true" : "false"
+                    }
+                }
+            }
+            return DaemonLogEntry(
+                timestamp: timestamp,
+                level: level,
+                message: message,
+                attrs: attrs
+            )
         }
     }
 }

@@ -114,14 +114,24 @@ func (h *ClientHandler) Send(msg *protocol.Message) error {
 	return err
 }
 
+func (h *ClientHandler) loggerForMessage(msg *protocol.Message) *slog.Logger {
+	traceID := protocol.ExtractTraceID(msg)
+	if traceID == "" {
+		return h.logger
+	}
+	return h.logger.With("traceId", traceID)
+}
+
 // handleDaemonMethod dispatches daemon/ prefixed methods.
 func (h *ClientHandler) handleDaemonMethod(msg *protocol.Message) {
+	logger := h.loggerForMessage(msg)
 	if msg.ID == nil {
 		// JSON-RPC notifications do not expect a response.
 		// Ignore daemon notifications to avoid nil-id panics in handlers.
-		h.logger.Warn("ignoring daemon notification", "method", msg.Method)
+		logger.Warn("ignoring daemon notification", "method", msg.Method)
 		return
 	}
+	logger.Info("daemon request", "method", msg.Method)
 
 	switch msg.Method {
 	case protocol.MethodDaemonHello:
@@ -138,6 +148,8 @@ func (h *ClientHandler) handleDaemonMethod(msg *protocol.Message) {
 		h.handleSessionList(msg)
 	case protocol.MethodDaemonSessionKill:
 		h.handleSessionKill(msg)
+	case protocol.MethodDaemonLogs:
+		h.handleLogs(msg)
 	default:
 		if msg.ID != nil {
 			h.Send(protocol.NewErrorResponse(*msg.ID, -32601, "Unknown daemon method: "+msg.Method))
@@ -198,6 +210,7 @@ func (h *ClientHandler) handleSessionCreate(msg *protocol.Message) {
 }
 
 func (h *ClientHandler) handleSessionAttach(msg *protocol.Message) {
+	logger := h.loggerForMessage(msg)
 	var params struct {
 		SessionID    string `json:"sessionId"`
 		LastEventSeq uint64 `json:"lastEventSeq"`
@@ -232,7 +245,7 @@ func (h *ClientHandler) handleSessionAttach(msg *protocol.Message) {
 		"bufferedEvents": buffered,
 	})
 	h.Send(protocol.NewResponse(*msg.ID, result))
-	h.logger.Info("attached to session", "sessionId", params.SessionID, "state", state, "bufferedEvents", len(buffered))
+	logger.Info("attached to session", "sessionId", params.SessionID, "state", state, "bufferedEvents", len(buffered))
 }
 
 func (h *ClientHandler) handleSessionDetach(msg *protocol.Message) {
@@ -292,8 +305,40 @@ func (h *ClientHandler) handleSessionKill(msg *protocol.Message) {
 	h.Send(protocol.NewResponse(*msg.ID, result))
 }
 
+func (h *ClientHandler) handleLogs(msg *protocol.Message) {
+	var params struct {
+		Count   int    `json:"count"`
+		TraceID string `json:"traceId"`
+	}
+	if msg.Params != nil {
+		_ = json.Unmarshal(*msg.Params, &params)
+	}
+	if params.Count <= 0 {
+		params.Count = 200
+	}
+	if params.Count > 2000 {
+		params.Count = 2000
+	}
+
+	var entries []LogBufferEntry
+	if params.TraceID != "" {
+		entries = h.daemon.LogBuffer().Filter(params.TraceID)
+		if len(entries) > params.Count {
+			entries = entries[len(entries)-params.Count:]
+		}
+	} else {
+		entries = h.daemon.LogBuffer().Recent(params.Count)
+	}
+
+	result, _ := json.Marshal(map[string]interface{}{
+		"entries": entries,
+	})
+	h.Send(protocol.NewResponse(*msg.ID, result))
+}
+
 // handleACPRequest forwards non-daemon requests to the appropriate ACPProxy.
 func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
+	logger := h.loggerForMessage(msg)
 	sessionID := protocol.ExtractSessionID(msg)
 	if sessionID == "" {
 		if msg.ID != nil {
@@ -302,14 +347,15 @@ func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 		return
 	}
 
-	// For session/load, support __routeToSession to route the request to a
-	// different ACP proxy than the sessionId being loaded. This enables
-	// loading an old session's history into a newly created ACP process.
+	// Support __routeToSession only for methods that intentionally decouple
+	// the logical sessionId from the attached proxy session.
 	routeID := sessionID
-	if msg.Method == protocol.MethodSessionLoad {
-		if override := protocol.ExtractRouteToSession(msg); override != "" {
+	if override := protocol.ExtractRouteToSession(msg); override != "" {
+		if msg.Method == protocol.MethodSessionLoad || msg.Method == protocol.MethodSessionPrompt {
 			routeID = override
-			h.logger.Info("session/load routing override", "sessionId", sessionID, "routeToSession", routeID)
+			logger.Info("routing override", "method", msg.Method, "sessionId", sessionID, "routeToSession", routeID)
+		} else {
+			logger.Warn("ignoring routing override for unsupported method", "method", msg.Method, "sessionId", sessionID)
 		}
 	}
 
@@ -322,7 +368,7 @@ func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 	}
 
 	if err := p.ForwardFromClient(msg, h); err != nil {
-		h.logger.Error("forward to ACP", "error", err, "sessionId", sessionID)
+		logger.Error("forward to ACP", "error", err, "sessionId", sessionID)
 		if msg.ID != nil {
 			h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "failed to forward: "+err.Error()))
 		}
