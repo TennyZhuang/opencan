@@ -31,6 +31,7 @@ struct OpenCANApp: App {
             ContentView()
                 .environment(appState)
                 .onAppear {
+                    migrateSSHKeysToKeychainIfNeeded()
                     seedUITestDataIfNeeded()
                     seedUIIntegrationDataIfNeeded()
                 }
@@ -99,10 +100,11 @@ struct OpenCANApp: App {
 
             let existingKeys = try context.fetch(FetchDescriptor<SSHKeyPair>())
             for key in existingKeys {
+                key.deletePrivateKeyFromKeychain()
                 context.delete(key)
             }
 
-            let nodeKey = SSHKeyPair(name: "\(nodeName)-key", privateKeyPEM: Data(nodeKeyPEM.utf8))
+            let nodeKey = try SSHKeyPair(name: "\(nodeName)-key", privateKeyPEM: Data(nodeKeyPEM.utf8))
             context.insert(nodeKey)
 
             let node = Node(name: nodeName, host: nodeHost, port: nodePort, username: nodeUsername)
@@ -118,7 +120,7 @@ struct OpenCANApp: App {
                 let jumpKeyPEMRaw = envValue("OPENCAN_TEST_JUMP_PRIVATE_KEY_PEM", in: env) ?? nodeKeyPEMRaw
                 let jumpKeyPEM = jumpKeyPEMRaw.replacingOccurrences(of: "\\n", with: "\n")
 
-                let jumpKey = SSHKeyPair(name: "\(nodeName)-jump-key", privateKeyPEM: Data(jumpKeyPEM.utf8))
+                let jumpKey = try SSHKeyPair(name: "\(nodeName)-jump-key", privateKeyPEM: Data(jumpKeyPEM.utf8))
                 context.insert(jumpKey)
 
                 let jumpNode = Node(
@@ -139,6 +141,26 @@ struct OpenCANApp: App {
             try context.save()
         } catch {
             Log.toFile("[Seed] Integration seed failed: \(error)")
+        }
+    }
+
+    private func migrateSSHKeysToKeychainIfNeeded() {
+        let context = ModelContext(modelContainer)
+
+        do {
+            let keys = try context.fetch(FetchDescriptor<SSHKeyPair>())
+            var migratedCount = 0
+            for key in keys {
+                if try key.migrateLegacyPrivateKeyIfNeeded() {
+                    migratedCount += 1
+                }
+            }
+            if migratedCount > 0 {
+                try context.save()
+                Log.toFile("[Security] Migrated \(migratedCount) SSH key(s) to Keychain")
+            }
+        } catch {
+            Log.toFile("[Security] SSH key migration failed: \(error)")
         }
     }
 

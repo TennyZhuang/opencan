@@ -18,6 +18,7 @@ struct NodeFormView: View {
     @State private var showImportKey = false
     @State private var importKeyName = ""
     @State private var importKeyPEM = ""
+    @State private var importErrorMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -71,6 +72,21 @@ struct NodeFormView: View {
             .sheet(isPresented: $showImportKey) {
                 importKeySheet
             }
+            .alert(
+                "Import Failed",
+                isPresented: Binding(
+                    get: { importErrorMessage != nil },
+                    set: { isPresented in
+                        if !isPresented {
+                            importErrorMessage = nil
+                        }
+                    }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(importErrorMessage ?? "")
+            }
         }
     }
 
@@ -105,8 +121,9 @@ struct NodeFormView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Import") {
-                        importKey()
-                        showImportKey = false
+                        if importKey() {
+                            showImportKey = false
+                        }
                     }
                     .disabled(importKeyName.isEmpty || importKeyPEM.isEmpty)
                 }
@@ -142,13 +159,20 @@ struct NodeFormView: View {
         dismiss()
     }
 
-    private func importKey() {
+    @discardableResult
+    private func importKey() -> Bool {
         guard !importKeyName.isEmpty, !importKeyPEM.isEmpty,
-              let data = importKeyPEM.data(using: .utf8) else { return }
-        let key = SSHKeyPair(name: importKeyName, privateKeyPEM: data)
-        modelContext.insert(key)
-        selectedKey = key
-        importKeyName = ""
-        importKeyPEM = ""
+              let data = importKeyPEM.data(using: .utf8) else { return false }
+        do {
+            let key = try SSHKeyPair(name: importKeyName, privateKeyPEM: data)
+            modelContext.insert(key)
+            selectedKey = key
+            importKeyName = ""
+            importKeyPEM = ""
+            return true
+        } catch {
+            importErrorMessage = error.localizedDescription
+            return false
+        }
     }
 }

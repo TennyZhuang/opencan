@@ -141,6 +141,21 @@ final class AppState {
             return
         }
 
+        let privateKeyPEM: Data
+        let jumpKeyPEM: Data?
+        do {
+            privateKeyPEM = try key.privateKeyDataForConnection()
+            if let jumpKey = node.jumpServer?.sshKey {
+                jumpKeyPEM = try jumpKey.privateKeyDataForConnection()
+            } else {
+                jumpKeyPEM = nil
+            }
+        } catch {
+            connectionError = "Failed to load SSH key: \(error.localizedDescription)"
+            connectionStatus = .failed
+            return
+        }
+
         connectionStatus = .connecting
         connectionError = nil
         if !isAutoReconnect {
@@ -161,13 +176,12 @@ final class AppState {
         let jumpHost = node.jumpServer?.host
         let jumpPort = node.jumpServer?.port
         let jumpUsername = node.jumpServer?.username
-        let jumpKeyPEM = node.jumpServer?.sshKey?.privateKeyPEM
 
         let params = SSHConnectionManager.ConnectionParams(
             host: node.host,
             port: node.port,
             username: node.username,
-            privateKeyPEM: key.privateKeyPEM,
+            privateKeyPEM: privateKeyPEM,
             command: "~/.opencan/bin/opencan-daemon attach",  // Always use daemon
             jumpHost: jumpHost,
             jumpPort: jumpPort,
