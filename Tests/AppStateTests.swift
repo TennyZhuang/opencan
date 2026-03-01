@@ -1479,6 +1479,67 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testRecoverInterruptedSessionRoundTripCallsReconnectAndResume() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let sessionId = try XCTUnwrap(appState.currentSessionId)
+
+        appState.markTransportInterrupted("mock interruption")
+        XCTAssertEqual(appState.connectionStatus, .disconnected)
+
+        var connectCalls = 0
+        var resumedSessionIDs: [String] = []
+        appState.autoReconnectConnectHandler = { _ in
+            connectCalls += 1
+            self.appState.connectionStatus = .connected
+        }
+        appState.autoReconnectResumeHandler = { resumedSessionId, _ in
+            resumedSessionIDs.append(resumedSessionId)
+            self.appState.currentSessionId = resumedSessionId
+        }
+
+        await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
+
+        XCTAssertEqual(connectCalls, 1)
+        XCTAssertEqual(resumedSessionIDs, [sessionId])
+        XCTAssertEqual(appState.connectionStatus, .connected)
+        XCTAssertNil(appState.connectionError)
+
+        // Recovery flag should be cleared after success (no second attempt).
+        await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
+        XCTAssertEqual(connectCalls, 1)
+        XCTAssertEqual(resumedSessionIDs, [sessionId])
+    }
+
+    func testRecoverInterruptedSessionReconnectFailureAllowsRetry() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.markTransportInterrupted("mock interruption")
+        XCTAssertNotNil(appState.activeNode, "Failed recovery should preserve active node for retry")
+
+        var connectCalls = 0
+        var resumeCalls = 0
+        appState.autoReconnectConnectHandler = { _ in
+            connectCalls += 1
+            self.appState.connectionStatus = .failed
+            self.appState.connectionError = "mock connect failure"
+        }
+        appState.autoReconnectResumeHandler = { _, _ in
+            resumeCalls += 1
+        }
+
+        await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
+        XCTAssertEqual(connectCalls, 1)
+        XCTAssertEqual(resumeCalls, 0)
+        XCTAssertEqual(appState.connectionStatus, .failed)
+
+        // Retry should run again because auto-reconnect intent remains enabled.
+        await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
+        XCTAssertEqual(connectCalls, 2)
+        XCTAssertEqual(resumeCalls, 0)
+    }
+
     // MARK: - Helpers
 
     /// Build buffered event dicts from MockSteps for configuring mock attach responses.

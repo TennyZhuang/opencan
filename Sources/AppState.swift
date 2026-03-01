@@ -82,6 +82,10 @@ final class AppState {
     private var shouldAutoReconnectInterruptedSession = false
     /// Guards against overlapping reconnect+resume recovery attempts.
     private var isAutoReconnectInProgress = false
+    /// Test hook for mocking the auto-reconnect connect step.
+    var autoReconnectConnectHandler: ((Node) async -> Void)?
+    /// Test hook for mocking the auto-reconnect resume step.
+    var autoReconnectResumeHandler: ((String, ModelContext) async throws -> Void)?
 
     /// Uploaded image mentions available to the active chat session.
     var availableImageMentions: [UploadedImageMention] {
@@ -274,6 +278,8 @@ final class AppState {
                 )
                 self.connectionError = error.localizedDescription
                 self.connectionStatus = .failed
+                // Keep active node/session context on failure so retries and
+                // interrupted-session recovery can reuse the current page state.
                 self.clearRuntimeConnectionState()
             }
         }
@@ -827,8 +833,18 @@ final class AppState {
             sessionId: sessionId
         )
 
-        connect(node: node, isAutoReconnect: true)
-        let connected = await waitForConnectionResult(timeoutSeconds: 30)
+        if let connectHandler = autoReconnectConnectHandler {
+            await connectHandler(node)
+        } else {
+            connect(node: node, isAutoReconnect: true)
+        }
+
+        let connected: Bool
+        if autoReconnectConnectHandler != nil {
+            connected = connectionStatus == .connected
+        } else {
+            connected = await waitForConnectionResult(timeoutSeconds: 30)
+        }
         guard connected else {
             shouldAutoReconnectInterruptedSession = true
             Log.log(
@@ -843,7 +859,11 @@ final class AppState {
         // Session resume requires a workspace context.
         activeWorkspace = workspace
         do {
-            try await resumeSession(sessionId: sessionId, modelContext: modelContext)
+            if let resumeHandler = autoReconnectResumeHandler {
+                try await resumeHandler(sessionId, modelContext)
+            } else {
+                try await resumeSession(sessionId: sessionId, modelContext: modelContext)
+            }
             connectionError = nil
             shouldAutoReconnectInterruptedSession = false
         } catch {
@@ -942,61 +962,23 @@ final class AppState {
     }
 
     func disconnect() {
-        shouldAutoReconnectInterruptedSession = false
-        isAutoReconnectInProgress = false
         cleanupConnection()
         shouldPopToRoot = true
-        Task { await sshManager.disconnect() }
     }
 
-    /// Tear down the current connection state without triggering navigation.
-    /// Does not close the SSH session — caller is responsible for that.
+    /// Tear down the current connection and reset navigation/chat context.
     private func cleanupConnection() {
-        let client = acpClient
-        let t = transport
-        let mt = mockTransport
-        notificationTask?.cancel()
-        ptyTask?.cancel()
-        historyLoadCleanupTask?.cancel()
-        historyLoadCleanupTask = nil
-        acpClient = nil
-        acpService = nil
-        daemonClient = nil
-        transport = nil
-        mockTransport = nil
+        shouldAutoReconnectInterruptedSession = false
+        isAutoReconnectInProgress = false
+        clearRuntimeConnectionState()
         connectionStatus = .disconnected
         currentSessionId = nil
-        currentTraceId = nil
         activeSession = nil
         activeNode = nil
         activeWorkspace = nil
-        daemonSessions = []
-        daemonUploadProgress = nil
         messages = []
-        isPrompting = false
-        isCreatingSession = false
-        isLoadingHistory = false
-        isUploadingImage = false
-        isRefreshingDaemonSessions = false
-        availableNodeAgents = []
-        hasReliableAgentAvailability = false
-        shouldAutoReconnectInterruptedSession = false
-        isAutoReconnectInProgress = false
-        historyLoadSessionIds = []
-        historyLoadGeneration = 0
-        historySystemPromptCandidateSessionIds = []
-        historySystemPromptStreamingSessionIds = []
-        historyReplayUserMessageCount = [:]
-        historySystemPromptMessageIdBySession = [:]
         imageMentionsBySession = [:]
         lastChatUploadCleanupAt = nil
-        // lastEventSeq intentionally kept — needed for reconnect replay
-        // Stop ACP client and close transport asynchronously
-        Task.detached {
-            if let client { await client.stop() }
-            if let t { await t.close() }
-            if let mt { await mt.close() }
-        }
     }
 
     // MARK: - Chat
