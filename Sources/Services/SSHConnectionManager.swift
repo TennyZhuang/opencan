@@ -311,9 +311,82 @@ actor SSHConnectionManager {
         Log.toFile("[SSH] Cleaned expired chat uploads older than \(safeTTLHours)h")
     }
 
+    /// Check whether a remote directory exists.
+    /// Supports `~` and `~/...` paths.
+    func remoteDirectoryExists(path: String) async throws -> Bool {
+        guard let client = targetClient else {
+            throw SSHError.notConnected
+        }
+        let command = try tildeResolvedCommand(
+            path: path,
+            body: """
+        if [ -d "$resolved_path" ]; then
+          echo "__opencan_dir_exists__"
+        else
+          echo "__opencan_dir_missing__"
+        fi
+        """
+        )
+        let output = try await client.executeCommand(command)
+        let outputString = String(buffer: output)
+        if outputString.contains("__opencan_dir_exists__") {
+            return true
+        }
+        if outputString.contains("__opencan_dir_missing__") {
+            return false
+        }
+        throw SSHError.remoteCommandFailed("Failed to check remote directory '\(path)'")
+    }
+
+    /// Create a remote directory with `mkdir -p`.
+    /// Supports `~` and `~/...` paths.
+    func createRemoteDirectory(path: String) async throws {
+        guard let client = targetClient else {
+            throw SSHError.notConnected
+        }
+        let command = try tildeResolvedCommand(
+            path: path,
+            body: """
+        if mkdir -p "$resolved_path"; then
+          echo "__opencan_mkdir_ok__"
+        else
+          echo "__opencan_mkdir_fail__"
+        fi
+        """
+        )
+        let output = try await client.executeCommand(command)
+        let outputString = String(buffer: output)
+        guard outputString.contains("__opencan_mkdir_ok__") else {
+            throw SSHError.remoteCommandFailed("Failed to create remote directory '\(path)'")
+        }
+    }
+
     /// Shell-escape a string by wrapping in single quotes and escaping embedded single quotes.
     private func shellEscape(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Validate and trim a user-provided remote path.
+    private func normalizeRemotePath(_ path: String) throws -> String {
+        let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPath.isEmpty else {
+            throw SSHError.invalidRemotePath
+        }
+        return normalizedPath
+    }
+
+    /// Wrap command bodies with shared `~`/`~/...` expansion logic.
+    private func tildeResolvedCommand(path: String, body: String) throws -> String {
+        let escapedPath = shellEscape(try normalizeRemotePath(path))
+        return """
+        raw_path=\(escapedPath)
+        case "$raw_path" in
+          "~") resolved_path="$HOME" ;;
+          "~/"*) resolved_path="$HOME/${raw_path#~/}" ;;
+          *) resolved_path="$raw_path" ;;
+        esac
+        \(body)
+        """
     }
 
     private func sanitizePathComponent(_ value: String) -> String {
@@ -356,6 +429,8 @@ enum SSHError: Error, LocalizedError {
     case notConnected
     case keyNotFound(String)
     case invalidKeyData
+    case invalidRemotePath
+    case remoteCommandFailed(String)
     case daemonBinaryNotFound
 
     var errorDescription: String? {
@@ -363,6 +438,8 @@ enum SSHError: Error, LocalizedError {
         case .notConnected: "SSH client not connected"
         case .keyNotFound(let name): "SSH key '\(name)' not found"
         case .invalidKeyData: "Invalid SSH key data"
+        case .invalidRemotePath: "Remote path is empty"
+        case .remoteCommandFailed(let message): message
         case .daemonBinaryNotFound: "opencan-daemon binary not found in app bundle"
         }
     }
