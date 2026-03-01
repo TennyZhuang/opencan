@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct InputBarView: View {
     @Environment(AppState.self) private var appState
     @State private var text = ""
+    @State private var textFieldResetToken = 0
     @FocusState private var isFocused: Bool
     @State private var selectedPhotoItem: PhotosPickerItem?
 
@@ -40,6 +41,7 @@ struct InputBarView: View {
                 .disabled(appState.isPrompting || isUploadingImage)
 
                 TextField("Message...", text: $text, axis: .vertical)
+                    .id(textFieldResetToken)
                     .textFieldStyle(.plain)
                     .lineLimit(1...5)
                     .focused($isFocused)
@@ -76,8 +78,21 @@ struct InputBarView: View {
     private func send() {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        guard appState.sendMessage(trimmed) else { return }
+        // Work around occasional stale UITextField rendering where cleared text
+        // stays visible until the next layout/scroll tick.
+        let shouldRestoreFocus = isFocused
+        if shouldRestoreFocus {
+            isFocused = false
+        }
         text = ""
-        appState.sendMessage(trimmed)
+        textFieldResetToken &+= 1
+        if shouldRestoreFocus {
+            Task { @MainActor in
+                await Task.yield()
+                isFocused = true
+            }
+        }
     }
 
     private func insertMentionToken(_ token: String) {
