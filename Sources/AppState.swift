@@ -62,6 +62,14 @@ final class AppState {
     private var historyLoadSessionIds: Set<String> = []
     private var historyLoadCleanupTask: Task<Void, Never>?
     private var historyLoadGeneration: UInt64 = 0
+    /// Source sessions whose first replayed user message should be rendered as a system prompt.
+    private var historySystemPromptCandidateSessionIds: Set<String> = []
+    /// Source sessions currently streaming a demoted system-prompt message.
+    private var historySystemPromptStreamingSessionIds: Set<String> = []
+    /// Number of user-message updates seen per replayed session during history load.
+    private var historyReplayUserMessageCount: [String: Int] = [:]
+    /// Active demoted system-prompt message IDs keyed by replay source session.
+    private var historySystemPromptMessageIdBySession: [String: UUID] = [:]
     /// Guards against concurrent `refreshDaemonSessions` calls.
     private var isRefreshingDaemonSessions = false
     /// Session-scoped uploaded image mentions.
@@ -455,7 +463,7 @@ final class AppState {
             isPrompting = true
             for buffered in result.bufferedEvents {
                 if let event = SessionUpdateParser.parse(buffered.event) {
-                    handleSessionEvent(event)
+                    handleSessionEvent(event, sessionId: sessionId)
                 }
                 lastEventSeq[sessionId] = buffered.seq
             }
@@ -477,7 +485,7 @@ final class AppState {
             // session/load is only used as a backfill when replay gives no visible history.
             for buffered in result.bufferedEvents {
                 if let event = SessionUpdateParser.parse(buffered.event) {
-                    handleSessionEvent(event)
+                    handleSessionEvent(event, sessionId: sessionId)
                 }
                 lastEventSeq[sessionId] = buffered.seq
             }
@@ -486,6 +494,7 @@ final class AppState {
             let hasVisibleReplay = hasRenderableConversation()
             if !hasVisibleReplay || hasHistorySource {
                 beginHistoryLoadScope(sessionIds: Set([sessionId]))
+                prepareHistoryReplayTracking(for: sessionId)
                 Log.toFile("[AppState] Loading history via session/load for \(sessionId)...")
                 let primaryCwds = loadCwdCandidates(
                     preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
@@ -500,6 +509,7 @@ final class AppState {
                     resolvedSessionCwd = loadedPrimaryCwd
                 } else if let historySessionId, historySessionId != sessionId {
                     historyLoadSessionIds.insert(historySessionId)
+                    prepareHistoryReplayTracking(for: historySessionId)
                     let historyCwds = loadCwdCandidates(
                         preferred: [
                             existingSession?.historySessionCwd,
@@ -608,6 +618,8 @@ final class AppState {
         // __routeToSession tells the daemon to forward this to the new session's ACP process,
         // while sessionId tells the ACP which conversation to load from disk.
         beginHistoryLoadScope(sessionIds: Set([sourceSessionId, newSessionId]))
+        prepareHistoryReplayTracking(for: sourceSessionId)
+        prepareHistoryReplayTracking(for: newSessionId)
         Log.toFile("[AppState] Loading history of \(sourceSessionId) into new session \(newSessionId)...")
         let sourceLoadCwds = loadCwdCandidates(
             preferred: [sourceSessionCwd, workspace.path],
@@ -704,6 +716,10 @@ final class AppState {
         hasReliableAgentAvailability = false
         historyLoadSessionIds = []
         historyLoadGeneration = 0
+        historySystemPromptCandidateSessionIds = []
+        historySystemPromptStreamingSessionIds = []
+        historyReplayUserMessageCount = [:]
+        historySystemPromptMessageIdBySession = [:]
         imageMentionsBySession = [:]
         lastChatUploadCleanupAt = nil
         // lastEventSeq intentionally kept — needed for reconnect replay
@@ -983,12 +999,13 @@ final class AppState {
 
                 guard let event = SessionUpdateParser.parse(notification) else { continue }
                 Log.toFile("[AppState] Session event: \(event)")
-                self.handleSessionEvent(event)
+                self.handleSessionEvent(event, sessionId: notificationSessionId)
 
                 if case .promptComplete = event,
                    let notificationSessionId,
                    self.historyLoadSessionIds.contains(notificationSessionId) {
                     self.historyLoadSessionIds.remove(notificationSessionId)
+                    self.clearHistoryReplayTracking(for: notificationSessionId)
                     if self.historyLoadSessionIds.isEmpty {
                         self.historyLoadCleanupTask?.cancel()
                         self.historyLoadCleanupTask = nil
@@ -1017,10 +1034,14 @@ final class AppState {
         return false
     }
 
-    private func handleSessionEvent(_ event: SessionEvent) {
+    private func handleSessionEvent(_ event: SessionEvent, sessionId: String? = nil) {
         // Reset thought-streaming flag when a different event type arrives
         if case .thoughtDelta = event {} else {
             isStreamingThought = false
+        }
+        if case .userMessage = event {} else if let sessionId {
+            historySystemPromptStreamingSessionIds.remove(sessionId)
+            historySystemPromptMessageIdBySession.removeValue(forKey: sessionId)
         }
 
         switch event {
@@ -1041,6 +1062,11 @@ final class AppState {
             }
 
         case .userMessage(let text):
+            if let sessionId,
+               shouldRenderHistoryUserMessageAsSystem(text: text, sessionId: sessionId) {
+                appendHistorySystemPromptChunk(text, sessionId: sessionId)
+                break
+            }
             if let last = messages.last, last.role == .user {
                 last.content += text
             } else {
@@ -1095,6 +1121,55 @@ final class AppState {
             forceScrollToBottom = true
         }
         contentDidChange()
+    }
+
+    private func shouldRenderHistoryUserMessageAsSystem(text: String, sessionId: String) -> Bool {
+        guard historyLoadSessionIds.contains(sessionId) || isLoadingHistory else {
+            return false
+        }
+
+        if historySystemPromptStreamingSessionIds.contains(sessionId) {
+            return true
+        }
+
+        let count = historyReplayUserMessageCount[sessionId, default: 0]
+        historyReplayUserMessageCount[sessionId] = count + 1
+        guard count == 0 else { return false }
+
+        if historySystemPromptCandidateSessionIds.contains(sessionId)
+            || looksLikeAgentBootstrapPrompt(text) {
+            historySystemPromptStreamingSessionIds.insert(sessionId)
+            return true
+        }
+
+        return false
+    }
+
+    private func appendHistorySystemPromptChunk(_ text: String, sessionId: String) {
+        if let messageID = historySystemPromptMessageIdBySession[sessionId],
+           let existing = messages.first(where: { $0.id == messageID }) {
+            existing.content += text
+            return
+        }
+
+        let message = ChatMessage(role: .system, content: text)
+        messages.append(message)
+        historySystemPromptMessageIdBySession[sessionId] = message.id
+    }
+
+    private func looksLikeAgentBootstrapPrompt(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 180 else { return false }
+
+        let lower = trimmed.lowercased()
+        let startsLikePrompt = lower.hasPrefix("you are ")
+            || lower.hasPrefix("you are \"")
+            || lower.hasPrefix("system prompt")
+        let hasInstructionStructure = trimmed.contains("\n## ")
+            || lower.contains("who you are")
+            || lower.contains("you are not")
+            || lower.contains("long-running")
+        return startsLikePrompt && hasInstructionStructure
     }
 
     /// Notify the view that chat content changed.
@@ -1282,6 +1357,10 @@ final class AppState {
         historyLoadCleanupTask = nil
         isLoadingHistory = true
         historyLoadSessionIds = sessionIds
+        historySystemPromptCandidateSessionIds = []
+        historySystemPromptStreamingSessionIds = []
+        historyReplayUserMessageCount = [:]
+        historySystemPromptMessageIdBySession = [:]
     }
 
     private func endHistoryLoadScope() {
@@ -1295,8 +1374,26 @@ final class AppState {
             guard !Task.isCancelled else { return }
             guard generation == self.historyLoadGeneration else { return }
             self.historyLoadSessionIds = []
+            self.historySystemPromptCandidateSessionIds = []
+            self.historySystemPromptStreamingSessionIds = []
+            self.historyReplayUserMessageCount = [:]
+            self.historySystemPromptMessageIdBySession = [:]
             self.historyLoadCleanupTask = nil
         }
+    }
+
+    private func prepareHistoryReplayTracking(for sessionId: String) {
+        historyReplayUserMessageCount[sessionId] = 0
+        if sessionId.hasPrefix("agent-") {
+            historySystemPromptCandidateSessionIds.insert(sessionId)
+        }
+    }
+
+    private func clearHistoryReplayTracking(for sessionId: String) {
+        historySystemPromptCandidateSessionIds.remove(sessionId)
+        historySystemPromptStreamingSessionIds.remove(sessionId)
+        historyReplayUserMessageCount.removeValue(forKey: sessionId)
+        historySystemPromptMessageIdBySession.removeValue(forKey: sessionId)
     }
 
     /// Present a concise prompt failure in chat and add actionable guidance.

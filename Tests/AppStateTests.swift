@@ -1073,6 +1073,84 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testResumeExternalAgentSessionDemotesBootstrapPromptToSystemMessage() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string("agent-team-1"),
+                "cwd": .string("/test/path"),
+                "state": .string("external"),
+                "lastEventSeq": .int(11),
+            ]
+        ])
+        await transport.setMockLoadSteps([
+            .userMessageChunk("You are \"build-bot\", an autonomous teammate."),
+            .textDelta("Ready for delegated work."),
+            .promptComplete(.endTurn),
+        ])
+        await appState.refreshDaemonSessions()
+
+        try await appState.resumeSession(sessionId: "agent-team-1", modelContext: modelContext)
+
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("You are \"build-bot\"")
+            },
+            "Bootstrap prompt should render as a system message"
+        )
+        XCTAssertFalse(
+            appState.messages.contains {
+                $0.role == .user && $0.content.contains("You are \"build-bot\"")
+            },
+            "Bootstrap prompt should not render as a user message"
+        )
+    }
+
+    func testResumeExternalNonAgentSessionKeepsFirstMessageAsUser() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string("external-session-1"),
+                "cwd": .string("/test/path"),
+                "state": .string("external"),
+                "lastEventSeq": .int(3),
+            ]
+        ])
+        await transport.setMockLoadSteps([
+            .userMessageChunk("Please review this PR."),
+            .textDelta("Sure, let's review it."),
+            .promptComplete(.endTurn),
+        ])
+        await appState.refreshDaemonSessions()
+
+        try await appState.resumeSession(sessionId: "external-session-1", modelContext: modelContext)
+
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .user && $0.content.contains("Please review this PR.")
+            },
+            "Regular external sessions should keep user role for first replayed message"
+        )
+        XCTAssertFalse(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("Please review this PR.")
+            },
+            "Regular external session prompt should not be demoted to system"
+        )
+    }
+
     func testRefreshDaemonSessionsUpdatesSnapshot() async throws {
         try await connectMock()
 
