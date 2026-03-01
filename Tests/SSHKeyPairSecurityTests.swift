@@ -70,4 +70,19 @@ final class SSHKeyPairSecurityTests: XCTestCase {
         XCTAssertEqual(try survivor.privateKeyDataForConnection(), Data("alive".utf8))
         XCTAssertThrowsError(try orphan.privateKeyDataForConnection())
     }
+
+    func testPrivateKeyDataForConnectionThrowsWhenNoKeyDataExists() throws {
+        let key = try SSHKeyPair(name: "missing", privateKeyPEM: Data("initial".utf8))
+        modelContext.insert(key)
+        try modelContext.save()
+
+        key.deletePrivateKeyFromKeychain()
+        key.privateKeyPEM = Data()
+
+        XCTAssertThrowsError(try key.privateKeyDataForConnection()) { error in
+            guard case SSHKeyPairError.privateKeyUnavailable = error else {
+                return XCTFail("Expected privateKeyUnavailable, got \(error)")
+            }
+        }
+    }
 }
