@@ -57,6 +57,85 @@ private func normalizedRemotePathKey(_ rawPath: String) -> String? {
     return parts.joined(separator: "/")
 }
 
+/// Build merged session rows for a workspace by combining daemon + local records.
+/// External daemon sessions are suppressed when they are already tracked as
+/// history sources of a local recovered session to avoid duplicate list items.
+func mergeWorkspaceSessions(
+    workspacePath: String,
+    username: String?,
+    daemonSessions: [DaemonSessionInfo],
+    localSessions: [Session]
+) -> [UnifiedSession] {
+    let recoveredHistorySourceIDs: Set<String> = Set(localSessions.compactMap { local in
+        guard let historySessionId = normalizedSessionID(local.historySessionId),
+              historySessionId != local.sessionId else {
+            return nil
+        }
+        return historySessionId
+    })
+
+    var daemonByID: [String: DaemonSessionInfo] = [:]
+    for daemonSession in daemonSessions {
+        guard workspacePathMatchesSessionCwd(
+            workspacePath: workspacePath,
+            sessionCwd: daemonSession.cwd,
+            username: username
+        ) else {
+            continue
+        }
+        if daemonSession.state == "external",
+           recoveredHistorySourceIDs.contains(daemonSession.sessionId) {
+            continue
+        }
+        daemonByID[daemonSession.sessionId] = daemonSession
+    }
+
+    var localByID: [String: Session] = [:]
+    for localSession in localSessions {
+        if let existing = localByID[localSession.sessionId],
+           existing.lastUsedAt >= localSession.lastUsedAt {
+            continue
+        }
+        localByID[localSession.sessionId] = localSession
+    }
+
+    let allIds = Set(daemonByID.keys).union(localByID.keys)
+    let unified = allIds.map { sessionId -> UnifiedSession in
+        let daemon = daemonByID[sessionId]
+        let local = localByID[sessionId]
+        return UnifiedSession(
+            sessionId: sessionId,
+            daemonState: daemon?.state,
+            cwd: daemon?.cwd ?? workspacePath,
+            lastEventSeq: daemon?.lastEventSeq,
+            title: local?.title,
+            daemonTitle: daemon?.title,
+            lastUsedAt: local?.lastUsedAt,
+            daemonUpdatedAt: daemon?.updatedAt,
+            agentID: local?.agentID,
+            agentCommand: local?.agentCommand ?? daemon?.command
+        )
+    }
+    .filter { !$0.isEmptyPlaceholder }
+
+    return unified.sorted { lhs, rhs in
+        let lhsActive = lhs.daemonState == "prompting" || lhs.daemonState == "draining"
+        let rhsActive = rhs.daemonState == "prompting" || rhs.daemonState == "draining"
+        if lhsActive != rhsActive { return lhsActive }
+
+        let lhsDate = lhs.effectiveLastUsedAt ?? .distantPast
+        let rhsDate = rhs.effectiveLastUsedAt ?? .distantPast
+        return lhsDate > rhsDate
+    }
+}
+
+private func normalizedSessionID(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    return trimmed
+}
+
 struct SessionPickerView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.modelContext) private var modelContext
@@ -93,58 +172,12 @@ struct SessionPickerView: View {
 
     /// Merge daemon sessions and local SwiftData sessions into a single list.
     private var unifiedSessions: [UnifiedSession] {
-        let username = workspace.node?.username
-
-        // Index daemon sessions (filtered by workspace cwd) by sessionId
-        var daemonByID: [String: DaemonSessionInfo] = [:]
-        for ds in appState.daemonSessions {
-            if workspacePathMatchesSessionCwd(
-                workspacePath: workspace.path,
-                sessionCwd: ds.cwd,
-                username: username
-            ) {
-                daemonByID[ds.sessionId] = ds
-            }
-        }
-
-        // Index local sessions by sessionId
-        var localByID: [String: Session] = [:]
-        for ls in workspace.sessions ?? [] {
-            localByID[ls.sessionId] = ls
-        }
-
-        // Union all sessionIds
-        let allIds = Set(daemonByID.keys).union(localByID.keys)
-
-        let unified = allIds.map { sid -> UnifiedSession in
-            let daemon = daemonByID[sid]
-            let local = localByID[sid]
-            return UnifiedSession(
-                sessionId: sid,
-                daemonState: daemon?.state,
-                cwd: daemon?.cwd ?? workspace.path,
-                lastEventSeq: daemon?.lastEventSeq,
-                title: local?.title,
-                daemonTitle: daemon?.title,
-                lastUsedAt: local?.lastUsedAt,
-                daemonUpdatedAt: daemon?.updatedAt,
-                agentID: local?.agentID,
-                agentCommand: local?.agentCommand ?? daemon?.command
-            )
-        }
-        .filter { !$0.isEmptyPlaceholder }
-
-        // Sort: active (prompting/draining) first, then by lastUsedAt desc.
-        // External and daemon sessions are intermixed by time.
-        return unified.sorted { a, b in
-            let aActive = a.daemonState == "prompting" || a.daemonState == "draining"
-            let bActive = b.daemonState == "prompting" || b.daemonState == "draining"
-            if aActive != bActive { return aActive }
-
-            let aDate = a.effectiveLastUsedAt ?? .distantPast
-            let bDate = b.effectiveLastUsedAt ?? .distantPast
-            return aDate > bDate
-        }
+        mergeWorkspaceSessions(
+            workspacePath: workspace.path,
+            username: workspace.node?.username,
+            daemonSessions: appState.daemonSessions,
+            localSessions: workspace.sessions ?? []
+        )
     }
 
     private var availableAgents: [AgentKind] {
