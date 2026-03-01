@@ -1,6 +1,62 @@
 import SwiftUI
 import SwiftData
 
+func workspacePathMatchesSessionCwd(workspacePath: String, sessionCwd: String, username: String?) -> Bool {
+    let workspaceKeys = remotePathMatchKeys(workspacePath, username: username)
+    guard !workspaceKeys.isEmpty else { return false }
+    let sessionKeys = remotePathMatchKeys(sessionCwd, username: username)
+    guard !sessionKeys.isEmpty else { return false }
+    return !workspaceKeys.isDisjoint(with: sessionKeys)
+}
+
+/// Build path match keys for remote UNIX-like paths.
+/// Keys normalize slashes and include common home-path expansions (`~`, `/home/<user>`, `/Users/<user>`).
+func remotePathMatchKeys(_ rawPath: String, username: String?) -> Set<String> {
+    let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return [] }
+
+    var candidates: Set<String> = [trimmed]
+
+    if let username {
+        let linuxHome = "/home/\(username)"
+        let macHome = "/Users/\(username)"
+
+        if trimmed == "~" {
+            candidates.insert(linuxHome)
+            candidates.insert(macHome)
+        } else if trimmed.hasPrefix("~/") {
+            let suffix = String(trimmed.dropFirst(2))
+            candidates.insert("\(linuxHome)/\(suffix)")
+            candidates.insert("\(macHome)/\(suffix)")
+        } else if trimmed == linuxHome {
+            candidates.insert("~")
+            candidates.insert(macHome)
+        } else if trimmed.hasPrefix("\(linuxHome)/") {
+            let suffix = String(trimmed.dropFirst(linuxHome.count + 1))
+            candidates.insert("~/" + suffix)
+            candidates.insert("\(macHome)/\(suffix)")
+        } else if trimmed == macHome {
+            candidates.insert("~")
+            candidates.insert(linuxHome)
+        } else if trimmed.hasPrefix("\(macHome)/") {
+            let suffix = String(trimmed.dropFirst(macHome.count + 1))
+            candidates.insert("~/" + suffix)
+            candidates.insert("\(linuxHome)/\(suffix)")
+        }
+    }
+
+    return Set(candidates.compactMap { normalizedRemotePathKey($0) })
+}
+
+private func normalizedRemotePathKey(_ rawPath: String) -> String? {
+    let parts = rawPath
+        .split(separator: "/")
+        .map(String.init)
+        .filter { !$0.isEmpty }
+    guard !parts.isEmpty else { return nil }
+    return parts.joined(separator: "/")
+}
+
 struct SessionPickerView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.modelContext) private var modelContext
@@ -37,12 +93,16 @@ struct SessionPickerView: View {
 
     /// Merge daemon sessions and local SwiftData sessions into a single list.
     private var unifiedSessions: [UnifiedSession] {
-        let normalizedPath = workspace.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let username = workspace.node?.username
 
         // Index daemon sessions (filtered by workspace cwd) by sessionId
         var daemonByID: [String: DaemonSessionInfo] = [:]
         for ds in appState.daemonSessions {
-            if ds.cwd.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == normalizedPath {
+            if workspacePathMatchesSessionCwd(
+                workspacePath: workspace.path,
+                sessionCwd: ds.cwd,
+                username: username
+            ) {
                 daemonByID[ds.sessionId] = ds
             }
         }
