@@ -238,11 +238,10 @@ struct SessionPickerView: View {
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
-                                    Text(session.sessionId)
+                                    Text(String(session.sessionId.prefix(8)) + "…")
                                         .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(.tertiary)
                                         .lineLimit(1)
-                                        .textSelection(.enabled)
                                     if let date = session.effectiveLastUsedAt {
                                         Text(date.formatted(.relative(presentation: .named)))
                                             .font(.caption)

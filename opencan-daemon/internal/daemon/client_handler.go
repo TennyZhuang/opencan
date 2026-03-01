@@ -257,7 +257,9 @@ func (h *ClientHandler) handleSessionList(msg *protocol.Message) {
 		CWD string `json:"cwd"`
 	}
 	if msg.Params != nil {
-		json.Unmarshal(*msg.Params, &params)
+		if err := json.Unmarshal(*msg.Params, &params); err != nil {
+			h.logger.Debug("failed to parse session list params", "error", err)
+		}
 	}
 
 	sessions := h.daemon.sessions.ListSessionsForCWD(params.CWD)

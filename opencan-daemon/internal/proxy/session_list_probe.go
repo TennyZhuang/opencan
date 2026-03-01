@@ -114,6 +114,9 @@ func waitForProbeResponse(scanner *bufio.Scanner, expectedID int64, timeout time
 		err error
 	}
 	resultCh := make(chan result, 1)
+	// NOTE: On timeout, this goroutine is orphaned until the caller kills the
+	// process (via defer in ProbeLoadableSessionsForCWD), which closes stdout
+	// and causes scanner.Scan() to return false, ending the goroutine.
 	go func() {
 		for scanner.Scan() {
 			msg, err := protocol.ParseLine(scanner.Bytes())

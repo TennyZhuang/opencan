@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"sync"
+	"time"
 )
 
 // BufferedEvent is a notification event with a sequence number.
@@ -14,10 +15,11 @@ type BufferedEvent struct {
 // EventBuffer is a thread-safe ring buffer that stores JSON-RPC notifications
 // with monotonically increasing sequence numbers.
 type EventBuffer struct {
-	mu      sync.RWMutex
-	events  []BufferedEvent
-	nextSeq uint64
-	maxSize int
+	mu           sync.RWMutex
+	events       []BufferedEvent
+	nextSeq      uint64
+	maxSize      int
+	lastAppendAt time.Time
 }
 
 // NewEventBuffer creates a new EventBuffer with the given maximum size.
@@ -39,6 +41,7 @@ func (b *EventBuffer) Append(event json.RawMessage) uint64 {
 
 	seq := b.nextSeq
 	b.nextSeq++
+	b.lastAppendAt = time.Now()
 
 	b.events = append(b.events, BufferedEvent{
 		Seq:   seq,
@@ -89,4 +92,11 @@ func (b *EventBuffer) Len() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.events)
+}
+
+// LastAppendAt returns the time of the most recent Append call, or zero if empty.
+func (b *EventBuffer) LastAppendAt() time.Time {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.lastAppendAt
 }

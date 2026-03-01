@@ -120,12 +120,17 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 				continue
 			}
 		}
+		var updatedAt string
+		if t := p.EventBuf().LastAppendAt(); !t.IsZero() {
+			updatedAt = t.UTC().Format(time.RFC3339)
+		}
 		infos = append(infos, SessionInfo{
 			SessionID:    p.SessionID,
 			CWD:          p.CWD,
 			State:        state,
 			LastEventSeq: p.EventBuf().LastSeq(),
 			Command:      p.Command,
+			UpdatedAt:    updatedAt,
 		})
 	}
 
@@ -202,26 +207,44 @@ func (sm *SessionManager) loadableSessions(proxies []*proxy.ACPProxy, discoveryC
 
 func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD string) ([]proxy.LoadableSession, error) {
 	commands := discoveryProbeCommands()
+
+	type probeResult struct {
+		sessions []proxy.LoadableSession
+		err      error
+		command  string
+	}
+
+	results := make([]probeResult, len(commands))
+	var wg sync.WaitGroup
+	for i, command := range commands {
+		wg.Add(1)
+		go func(idx int, cmd string) {
+			defer wg.Done()
+			sessions, err := proxy.ProbeLoadableSessionsForCWD(cmd, discoveryCWD, 1200*time.Millisecond, sm.logger)
+			results[idx] = probeResult{sessions: sessions, err: err, command: cmd}
+		}(i, command)
+	}
+	wg.Wait()
+
 	seen := make(map[string]struct{})
 	merged := make([]proxy.LoadableSession, 0, maxExternalSessions)
-
 	var lastErr error
 	succeeded := false
-	for _, command := range commands {
-		sessions, err := proxy.ProbeLoadableSessionsForCWD(command, discoveryCWD, 1200*time.Millisecond, sm.logger)
-		if err != nil {
-			lastErr = err
+
+	for _, r := range results {
+		if r.err != nil {
+			lastErr = r.err
 			sm.logger.Debug(
 				"external discovery probe command failed",
-				"command", command,
+				"command", r.command,
 				"cwd", discoveryCWD,
-				"error", err,
+				"error", r.err,
 			)
 			continue
 		}
 
 		succeeded = true
-		for _, s := range sessions {
+		for _, s := range r.sessions {
 			if s.SessionID == "" {
 				continue
 			}
