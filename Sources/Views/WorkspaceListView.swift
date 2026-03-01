@@ -198,6 +198,7 @@ struct WorkspaceListView: View {
             }
             clearWorkspaceForm()
         } catch {
+            clearWorkspaceForm()
             workspaceCreationError = "Failed to validate remote path: \(error.localizedDescription)"
         }
     }
