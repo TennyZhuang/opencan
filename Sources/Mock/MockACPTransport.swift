@@ -35,6 +35,8 @@ actor MockACPTransport: ACPTransport {
     /// Tracks the most recent daemon/session.create parameters.
     var lastCreateCwd: String?
     var lastCreateCommand: String?
+    /// Tracks the most recent session/prompt content blocks.
+    var lastPromptBlocks: [JSONValue]?
 
     /// Track last received method for test assertions.
     var lastReceivedMethod: String?
@@ -161,6 +163,7 @@ actor MockACPTransport: ACPTransport {
         // ACP passthrough (daemon forwards transparently)
         case ACPMethods.sessionPrompt:
             let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
+            lastPromptBlocks = params?["prompt"]?.arrayValue
             if let promptError = nextPromptError {
                 nextPromptError = nil
                 messageContinuation.yield(
@@ -399,6 +402,10 @@ actor MockACPTransport: ACPTransport {
 
     func getLastCreateCwd() -> String? {
         lastCreateCwd
+    }
+
+    func getLastPromptBlocks() -> [JSONValue]? {
+        lastPromptBlocks
     }
 
     func getReceivedMethods() -> [String] {

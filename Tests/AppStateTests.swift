@@ -325,6 +325,65 @@ final class AppStateTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(assistantMessages.count, 1, "Should have at least one assistant message")
     }
 
+    func testSendMessageWithImageMentionAddsResourceLinkPromptBlock() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        let mention = await appState.uploadImageMention(
+            data: Data([0xFF, 0xD8, 0xFF, 0xD9]),
+            mimeType: "image/jpeg",
+            fileExtension: "jpg"
+        )
+        guard let mention else {
+            XCTFail("Expected uploaded mention")
+            return
+        }
+
+        appState.sendMessage("请看这张图 \(mention.mentionToken)")
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        guard let blocks = await transport.getLastPromptBlocks() else {
+            XCTFail("Prompt blocks should be captured")
+            return
+        }
+        XCTAssertEqual(blocks.count, 2, "Prompt should include text + resource_link blocks")
+        XCTAssertEqual(blocks[0]["type"]?.stringValue, "text")
+        XCTAssertEqual(blocks[1]["type"]?.stringValue, "resource_link")
+        XCTAssertEqual(blocks[1]["name"]?.stringValue, mention.mentionToken)
+        XCTAssertEqual(blocks[1]["mimeType"]?.stringValue, "image/jpeg")
+        XCTAssertNotNil(blocks[1]["uri"]?.stringValue)
+    }
+
+    func testSendMessageWithUnknownImageMentionDoesNotAddResourceLinkBlock() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        appState.sendMessage("请分析 @img_missing")
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        guard let blocks = await transport.getLastPromptBlocks() else {
+            XCTFail("Prompt blocks should be captured")
+            return
+        }
+        XCTAssertEqual(blocks.count, 1, "Unknown mention should not emit resource_link")
+        XCTAssertEqual(blocks[0]["type"]?.stringValue, "text")
+
+        let systemMessages = appState.messages.filter { $0.role == .system }.map(\.content)
+        XCTAssertTrue(
+            systemMessages.contains { $0.contains("Unknown image mention") && $0.contains("@img_missing") }
+        )
+    }
+
     func testNewSessionStreamingContent() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)

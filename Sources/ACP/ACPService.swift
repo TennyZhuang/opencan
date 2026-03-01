@@ -50,14 +50,14 @@ struct ACPService {
 
     /// Send a prompt to a session.
     func sendPrompt(sessionId: String, text: String) async throws -> StopReason {
+        try await sendPrompt(sessionId: sessionId, prompt: [.text(text)])
+    }
+
+    /// Send a structured prompt to a session.
+    func sendPrompt(sessionId: String, prompt: [PromptBlock]) async throws -> StopReason {
         let params: JSONValue = .object([
             "sessionId": .string(sessionId),
-            "prompt": .array([
-                .object([
-                    "type": .string("text"),
-                    "text": .string(text)
-                ])
-            ])
+            "prompt": .array(prompt.map { $0.jsonValue })
         ])
         let result = try await client.sendRequest(
             method: ACPMethods.sessionPrompt,

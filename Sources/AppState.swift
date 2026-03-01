@@ -5,6 +5,8 @@ import SwiftData
 /// Root state coordinator connecting SSH, ACP, and UI.
 @MainActor @Observable
 final class AppState {
+    private let chatUploadTTLHours = 24
+
     // Active connection context
     var activeNode: Node?
     var activeWorkspace: Workspace?
@@ -35,6 +37,8 @@ final class AppState {
     /// Set to true when the user sends a message — forces scroll
     /// to bottom regardless of current scroll position.
     var forceScrollToBottom = false
+    /// True while uploading an image mention to the remote node.
+    var isUploadingImage = false
 
     // Daemon upload progress (nil = not uploading, 0..1 = uploading)
     var daemonUploadProgress: Double?
@@ -57,6 +61,14 @@ final class AppState {
     private var historyLoadGeneration: UInt64 = 0
     /// Guards against concurrent `refreshDaemonSessions` calls.
     private var isRefreshingDaemonSessions = false
+    /// Session-scoped uploaded image mentions.
+    private var imageMentionsBySession: [String: [UploadedImageMention]] = [:]
+
+    /// Uploaded image mentions available to the active chat session.
+    var availableImageMentions: [UploadedImageMention] {
+        guard let sessionId = currentSessionId else { return [] }
+        return (imageMentionsBySession[sessionId] ?? []).sorted { $0.createdAt < $1.createdAt }
+    }
 
     enum ConnectionStatus: Equatable {
         case disconnected
@@ -119,6 +131,12 @@ final class AppState {
                     }
                 }
                 self.daemonUploadProgress = nil
+
+                do {
+                    try await sshManager.cleanupExpiredChatUploads(ttlHours: chatUploadTTLHours)
+                } catch {
+                    Log.toFile("[AppState] Skipped chat upload cleanup: \(error)")
+                }
 
                 ptyTask = Task.detached { [sshManager] in
                     do {
@@ -679,11 +697,13 @@ final class AppState {
         isPrompting = false
         isCreatingSession = false
         isLoadingHistory = false
+        isUploadingImage = false
         isRefreshingDaemonSessions = false
         availableNodeAgents = []
         hasReliableAgentAvailability = false
         historyLoadSessionIds = []
         historyLoadGeneration = 0
+        imageMentionsBySession = [:]
         // lastEventSeq intentionally kept — needed for reconnect replay
         // Stop ACP client and close transport asynchronously
         Task.detached {
@@ -694,6 +714,86 @@ final class AppState {
     }
 
     // MARK: - Chat
+
+    /// Upload a local image to the connected server and register an @mention alias.
+    @discardableResult
+    func uploadImageMention(
+        data: Data,
+        mimeType: String,
+        fileExtension: String,
+        originalFilename: String? = nil
+    ) async -> UploadedImageMention? {
+        guard let sessionId = currentSessionId else {
+            addSystemMessage("Please start a session before attaching images")
+            return nil
+        }
+        guard !isUploadingImage else {
+            addSystemMessage("Image upload already in progress")
+            return nil
+        }
+        guard !data.isEmpty else {
+            addSystemMessage("Image data is empty")
+            return nil
+        }
+
+        // Mock mode: skip SSH and register an in-memory mention directly.
+        if mockTransport != nil {
+            let mentionName = generateMentionName(for: sessionId)
+            let filename = "\(mentionName).\(fileExtension)"
+            let remotePath = "/mock/.opencan/uploads/\(sessionId)/\(filename)"
+            let mention = UploadedImageMention(
+                sessionId: sessionId,
+                mentionName: mentionName,
+                remotePath: remotePath,
+                uri: URL(fileURLWithPath: remotePath).absoluteString,
+                mimeType: mimeType,
+                sizeBytes: data.count,
+                originalFilename: originalFilename,
+                createdAt: Date()
+            )
+            var mentions = imageMentionsBySession[sessionId] ?? []
+            mentions.append(mention)
+            imageMentionsBySession[sessionId] = mentions
+            return mention
+        }
+
+        isUploadingImage = true
+        defer { isUploadingImage = false }
+
+        do {
+            do {
+                try await sshManager.cleanupExpiredChatUploads(ttlHours: chatUploadTTLHours)
+            } catch {
+                Log.toFile("[AppState] Skipped pre-upload cleanup: \(error)")
+            }
+
+            let upload = try await sshManager.uploadChatImage(
+                sessionId: sessionId,
+                data: data,
+                fileExtension: fileExtension
+            )
+            let mentionName = generateMentionName(for: sessionId)
+            let mention = UploadedImageMention(
+                sessionId: sessionId,
+                mentionName: mentionName,
+                remotePath: upload.remotePath,
+                uri: upload.fileURI,
+                mimeType: mimeType,
+                sizeBytes: upload.sizeBytes,
+                originalFilename: originalFilename,
+                createdAt: Date()
+            )
+            var mentions = imageMentionsBySession[sessionId] ?? []
+            mentions.append(mention)
+            imageMentionsBySession[sessionId] = mentions
+            Log.toFile("[AppState] Uploaded image mention \(mention.mentionToken) -> \(upload.remotePath)")
+            return mention
+        } catch {
+            Log.toFile("[AppState] Image upload failed: \(error)")
+            addSystemMessage("Image upload failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
 
     func sendMessage(_ text: String) {
         guard !text.isEmpty else { return }
@@ -707,6 +807,17 @@ final class AppState {
             addSystemMessage("Not connected — please reconnect")
             return
         }
+
+        let mentionTokens = extractMentionTokens(in: text)
+        let referencedMentions = resolveMentionedImages(in: text, sessionId: sessionId)
+        let resolvedTokenSet = Set(referencedMentions.map(\.mentionToken))
+        let unresolvedTokens = mentionTokens.filter { !resolvedTokenSet.contains($0) }
+        if !unresolvedTokens.isEmpty {
+            addSystemMessage("Unknown image mention(s): \(unresolvedTokens.joined(separator: ", "))")
+        }
+
+        var promptBlocks: [PromptBlock] = [.text(text)]
+        promptBlocks.append(contentsOf: referencedMentions.map { .resourceLink($0.promptResourceLink) })
 
         let userMsg = ChatMessage(role: .user, content: text)
         messages.append(userMsg)
@@ -722,11 +833,11 @@ final class AppState {
         messages.append(assistantMsg)
         isPrompting = true
         forceScrollToBottom = true
-        Log.toFile("[AppState] sendMessage: isPrompting=true, sending prompt to \(sessionId)")
+        Log.toFile("[AppState] sendMessage: isPrompting=true, sending prompt to \(sessionId), resourceLinks=\(referencedMentions.count)")
 
         Task {
             do {
-                let _ = try await service.sendPrompt(sessionId: sessionId, text: text)
+                let _ = try await service.sendPrompt(sessionId: sessionId, prompt: promptBlocks)
                 Log.toFile("[AppState] sendPrompt returned successfully")
                 for msg in self.messages where msg.role == .assistant && msg.isStreaming {
                     msg.isStreaming = false
@@ -741,6 +852,44 @@ final class AppState {
                 self.isPrompting = false
             }
         }
+    }
+
+    private func generateMentionName(for sessionId: String) -> String {
+        let existing = Set((imageMentionsBySession[sessionId] ?? []).map(\.mentionName))
+        while true {
+            let suffix = UUID().uuidString
+                .replacingOccurrences(of: "-", with: "")
+                .prefix(6)
+                .lowercased()
+            let candidate = "img_\(suffix)"
+            if !existing.contains(candidate) {
+                return candidate
+            }
+        }
+    }
+
+    private func extractMentionTokens(in text: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: #"@[A-Za-z0-9_-]+"#) else {
+            return []
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        var tokens: [String] = []
+        var seen = Set<String>()
+        regex.enumerateMatches(in: text, range: range) { match, _, _ in
+            guard let match, let r = Range(match.range, in: text) else { return }
+            let token = String(text[r])
+            if seen.insert(token).inserted {
+                tokens.append(token)
+            }
+        }
+        return tokens
+    }
+
+    private func resolveMentionedImages(in text: String, sessionId: String) -> [UploadedImageMention] {
+        let mentions = imageMentionsBySession[sessionId] ?? []
+        guard !mentions.isEmpty else { return [] }
+        let byToken = Dictionary(uniqueKeysWithValues: mentions.map { ($0.mentionToken, $0) })
+        return extractMentionTokens(in: text).compactMap { byToken[$0] }
     }
 
     /// Delete the current session if it has no user-visible content.

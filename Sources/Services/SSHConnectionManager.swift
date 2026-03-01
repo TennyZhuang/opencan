@@ -34,6 +34,12 @@ actor SSHConnectionManager {
         let jumpKeyPEM: Data?  // nil = use same key as target
     }
 
+    struct RemoteFileUploadResult: Sendable {
+        let remotePath: String
+        let fileURI: String
+        let sizeBytes: Int
+    }
+
     func connect(params: ConnectionParams) async throws -> SSHStdioTransport {
         state = .connecting
         Log.ssh.warning("Host key verification is disabled — connections are vulnerable to MITM")
@@ -221,9 +227,108 @@ actor SSHConnectionManager {
         Log.toFile("[SSH] Daemon uploaded successfully (\(binaryData.count) bytes, \(localHash.prefix(12))...)")
     }
 
+    /// Upload an image to a per-session temp directory on the remote server.
+    /// Returns the absolute remote path and file:// URI for ACP resource links.
+    func uploadChatImage(
+        sessionId: String,
+        data: Data,
+        fileExtension: String,
+        progress: (@Sendable (Double) -> Void)? = nil
+    ) async throws -> RemoteFileUploadResult {
+        guard let client = targetClient else {
+            throw SSHError.notConnected
+        }
+
+        let safeSessionID = sanitizePathComponent(sessionId)
+        let safeExtension = sanitizeFileExtension(fileExtension)
+        let uniqueName = "img-\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).\(safeExtension)"
+
+        let sftp = try await client.openSFTP()
+        defer { Task { try? await sftp.close() } }
+
+        let homePath = try await sftp.getRealPath(atPath: ".")
+        let rootPath = homePath + "/.opencan/uploads"
+        let sessionPath = rootPath + "/\(safeSessionID)"
+
+        for path in [homePath + "/.opencan", rootPath, sessionPath] {
+            do {
+                try await sftp.createDirectory(atPath: path)
+            } catch {
+                // Directory may already exist — ignore
+            }
+        }
+
+        let remotePath = sessionPath + "/\(uniqueName)"
+        var attrs = SFTPFileAttributes()
+        attrs.permissions = 0o600
+        let file = try await sftp.openFile(
+            filePath: remotePath,
+            flags: [.write, .create, .truncate],
+            attributes: attrs
+        )
+
+        progress?(0)
+        let chunkSize = 64 * 1024
+        let totalSize = data.count
+        var offset = 0
+        while offset < totalSize {
+            let end = min(offset + chunkSize, totalSize)
+            let chunk = data[offset..<end]
+            try await file.write(ByteBuffer(data: chunk), at: UInt64(offset))
+            offset = end
+            progress?(Double(offset) / Double(totalSize))
+        }
+        try await file.close()
+
+        let escapedPath = shellEscape(remotePath)
+        let _ = try? await client.executeCommand("chmod 600 \(escapedPath)")
+
+        let uri = URL(fileURLWithPath: remotePath).absoluteString
+        Log.toFile("[SSH] Uploaded chat image to \(remotePath)")
+        return RemoteFileUploadResult(
+            remotePath: remotePath,
+            fileURI: uri,
+            sizeBytes: data.count
+        )
+    }
+
+    /// Best-effort cleanup of expired uploaded chat images under ~/.opencan/uploads.
+    /// Files older than `ttlHours` are deleted, then empty directories are pruned.
+    func cleanupExpiredChatUploads(ttlHours: Int) async throws {
+        guard let client = targetClient else {
+            throw SSHError.notConnected
+        }
+
+        let safeTTLHours = max(ttlHours, 1)
+        let ttlMinutes = safeTTLHours * 60
+        let command = """
+        if [ -d ~/.opencan/uploads ]; then \
+          find ~/.opencan/uploads -type f -mmin +\(ttlMinutes) -delete 2>/dev/null; \
+          find ~/.opencan/uploads -depth -type d -empty -delete 2>/dev/null; \
+        fi
+        """
+        let _ = try await client.executeCommand(command)
+        Log.toFile("[SSH] Cleaned expired chat uploads older than \(safeTTLHours)h")
+    }
+
     /// Shell-escape a string by wrapping in single quotes and escaping embedded single quotes.
     private func shellEscape(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func sanitizePathComponent(_ value: String) -> String {
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        let filtered = String(value.filter { allowed.contains($0) })
+        return filtered.isEmpty ? "session" : filtered
+    }
+
+    private func sanitizeFileExtension(_ ext: String) -> String {
+        let normalized = ext.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            .lowercased()
+        let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789")
+        let filtered = String(normalized.filter { allowed.contains($0) })
+        return filtered.isEmpty ? "jpg" : filtered
     }
 
     private func sha256Hex(_ data: Data) -> String {
