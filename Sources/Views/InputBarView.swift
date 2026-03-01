@@ -81,8 +81,9 @@ struct InputBarView: View {
     }
 
     private func insertMentionToken(_ token: String) {
-        let separator = text.isEmpty ? "" : " "
-        text += "\(separator)\(token)"
+        let needsLeadingSpace = !text.isEmpty && !text.hasSuffix(" ")
+        let leading = needsLeadingSpace ? " " : ""
+        text += "\(leading)\(token) "
         isFocused = true
     }
 
