@@ -120,6 +120,8 @@ struct InputBarView: View {
         return String(text[range])
     }
 
+    // Known limitation: SwiftUI TextField doesn't expose caret position, so
+    // mention matching assumes the active token is at the end of the text.
     private var activeMentionRange: Range<String.Index>? {
         guard !text.isEmpty else { return nil }
 

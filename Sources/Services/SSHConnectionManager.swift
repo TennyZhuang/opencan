@@ -283,7 +283,7 @@ actor SSHConnectionManager {
         let escapedPath = shellEscape(remotePath)
         let _ = try? await client.executeCommand("chmod 600 \(escapedPath)")
 
-        let uri = URL(fileURLWithPath: remotePath).absoluteString
+        let uri = fileURIString(forRemotePath: remotePath)
         Log.toFile("[SSH] Uploaded chat image to \(remotePath)")
         return RemoteFileUploadResult(
             remotePath: remotePath,
@@ -329,6 +329,11 @@ actor SSHConnectionManager {
         let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789")
         let filtered = String(normalized.filter { allowed.contains($0) })
         return filtered.isEmpty ? "jpg" : filtered
+    }
+
+    private func fileURIString(forRemotePath remotePath: String) -> String {
+        let encodedPath = remotePath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? remotePath
+        return "file://\(encodedPath)"
     }
 
     private func sha256Hex(_ data: Data) -> String {

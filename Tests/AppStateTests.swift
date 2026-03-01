@@ -384,6 +384,109 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testSendMessageWithMultipleImageMentionsAddsMultipleResourceLinkBlocks() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        let mention1 = await appState.uploadImageMention(
+            data: Data([0x01, 0x02, 0x03]),
+            mimeType: "image/png",
+            fileExtension: "png"
+        )
+        let mention2 = await appState.uploadImageMention(
+            data: Data([0x04, 0x05, 0x06]),
+            mimeType: "image/jpeg",
+            fileExtension: "jpg"
+        )
+        guard let mention1, let mention2 else {
+            XCTFail("Expected two uploaded mentions")
+            return
+        }
+
+        appState.sendMessage("请比较 \(mention1.mentionToken) 和 \(mention2.mentionToken)")
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        guard let blocks = await transport.getLastPromptBlocks() else {
+            XCTFail("Prompt blocks should be captured")
+            return
+        }
+        XCTAssertEqual(blocks.count, 3, "Prompt should include text + two resource_link blocks")
+        XCTAssertEqual(blocks[1]["type"]?.stringValue, "resource_link")
+        XCTAssertEqual(blocks[2]["type"]?.stringValue, "resource_link")
+        XCTAssertEqual(blocks[1]["name"]?.stringValue, mention1.mentionToken)
+        XCTAssertEqual(blocks[2]["name"]?.stringValue, mention2.mentionToken)
+    }
+
+    func testImageMentionsAreSessionScoped() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        let mention = await appState.uploadImageMention(
+            data: Data([0x09, 0x08, 0x07]),
+            mimeType: "image/png",
+            fileExtension: "png"
+        )
+        guard let mention else {
+            XCTFail("Expected uploaded mention")
+            return
+        }
+
+        // Switch to a new session; old session mentions should not leak.
+        try await appState.createNewSession(modelContext: modelContext)
+        appState.sendMessage("请看 \(mention.mentionToken)")
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        guard let blocks = await transport.getLastPromptBlocks() else {
+            XCTFail("Prompt blocks should be captured")
+            return
+        }
+        XCTAssertEqual(blocks.count, 1, "Old session mention should not emit resource_link")
+        XCTAssertEqual(blocks[0]["type"]?.stringValue, "text")
+    }
+
+    func testUploadImageMentionBlockedWhileUploading() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.isUploadingImage = true
+        let mention = await appState.uploadImageMention(
+            data: Data([0x01]),
+            mimeType: "image/png",
+            fileExtension: "png"
+        )
+        appState.isUploadingImage = false
+
+        XCTAssertNil(mention, "upload should be blocked when upload flag is already true")
+        let systemMessages = appState.messages.filter { $0.role == .system }.map(\.content)
+        XCTAssertTrue(systemMessages.contains { $0.contains("already in progress") })
+    }
+
+    func testUploadImageMentionRejectsOversizedImage() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        let oversized = Data(repeating: 0x00, count: 12 * 1024 * 1024 + 1)
+        let mention = await appState.uploadImageMention(
+            data: oversized,
+            mimeType: "image/png",
+            fileExtension: "png"
+        )
+
+        XCTAssertNil(mention, "oversized image should be rejected")
+        let systemMessages = appState.messages.filter { $0.role == .system }.map(\.content)
+        XCTAssertTrue(systemMessages.contains { $0.contains("Image too large") })
+    }
+
     func testNewSessionStreamingContent() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)

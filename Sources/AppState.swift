@@ -6,6 +6,9 @@ import SwiftData
 @MainActor @Observable
 final class AppState {
     private let chatUploadTTLHours = 24
+    private let chatUploadCleanupInterval: TimeInterval = 15 * 60
+    private let maxChatImageBytes = 12 * 1024 * 1024
+    private static let mentionRegex = try! NSRegularExpression(pattern: #"@[A-Za-z0-9_-]+"#)
 
     // Active connection context
     var activeNode: Node?
@@ -63,11 +66,13 @@ final class AppState {
     private var isRefreshingDaemonSessions = false
     /// Session-scoped uploaded image mentions.
     private var imageMentionsBySession: [String: [UploadedImageMention]] = [:]
+    /// Last time we ran remote upload cleanup.
+    private var lastChatUploadCleanupAt: Date?
 
     /// Uploaded image mentions available to the active chat session.
     var availableImageMentions: [UploadedImageMention] {
         guard let sessionId = currentSessionId else { return [] }
-        return (imageMentionsBySession[sessionId] ?? []).sorted { $0.createdAt < $1.createdAt }
+        return imageMentionsBySession[sessionId] ?? []
     }
 
     enum ConnectionStatus: Equatable {
@@ -132,11 +137,7 @@ final class AppState {
                 }
                 self.daemonUploadProgress = nil
 
-                do {
-                    try await sshManager.cleanupExpiredChatUploads(ttlHours: chatUploadTTLHours)
-                } catch {
-                    Log.toFile("[AppState] Skipped chat upload cleanup: \(error)")
-                }
+                await performUploadCleanupIfNeeded()
 
                 ptyTask = Task.detached { [sshManager] in
                     do {
@@ -704,6 +705,7 @@ final class AppState {
         historyLoadSessionIds = []
         historyLoadGeneration = 0
         imageMentionsBySession = [:]
+        lastChatUploadCleanupAt = nil
         // lastEventSeq intentionally kept — needed for reconnect replay
         // Stop ACP client and close transport asynchronously
         Task.detached {
@@ -735,6 +737,11 @@ final class AppState {
             addSystemMessage("Image data is empty")
             return nil
         }
+        guard data.count <= maxChatImageBytes else {
+            let maxMB = maxChatImageBytes / (1024 * 1024)
+            addSystemMessage("Image too large (\(data.count / (1024 * 1024))MB). Limit is \(maxMB)MB.")
+            return nil
+        }
 
         // Mock mode: skip SSH and register an in-memory mention directly.
         if mockTransport != nil {
@@ -745,7 +752,7 @@ final class AppState {
                 sessionId: sessionId,
                 mentionName: mentionName,
                 remotePath: remotePath,
-                uri: URL(fileURLWithPath: remotePath).absoluteString,
+                uri: fileURIString(forRemotePath: remotePath),
                 mimeType: mimeType,
                 sizeBytes: data.count,
                 originalFilename: originalFilename,
@@ -761,11 +768,7 @@ final class AppState {
         defer { isUploadingImage = false }
 
         do {
-            do {
-                try await sshManager.cleanupExpiredChatUploads(ttlHours: chatUploadTTLHours)
-            } catch {
-                Log.toFile("[AppState] Skipped pre-upload cleanup: \(error)")
-            }
+            await performUploadCleanupIfNeeded()
 
             let upload = try await sshManager.uploadChatImage(
                 sessionId: sessionId,
@@ -856,7 +859,7 @@ final class AppState {
 
     private func generateMentionName(for sessionId: String) -> String {
         let existing = Set((imageMentionsBySession[sessionId] ?? []).map(\.mentionName))
-        while true {
+        for _ in 0..<100 {
             let suffix = UUID().uuidString
                 .replacingOccurrences(of: "-", with: "")
                 .prefix(6)
@@ -866,16 +869,14 @@ final class AppState {
                 return candidate
             }
         }
+        return "img_\(Int(Date().timeIntervalSince1970))"
     }
 
     private func extractMentionTokens(in text: String) -> [String] {
-        guard let regex = try? NSRegularExpression(pattern: #"@[A-Za-z0-9_-]+"#) else {
-            return []
-        }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         var tokens: [String] = []
         var seen = Set<String>()
-        regex.enumerateMatches(in: text, range: range) { match, _, _ in
+        Self.mentionRegex.enumerateMatches(in: text, range: range) { match, _, _ in
             guard let match, let r = Range(match.range, in: text) else { return }
             let token = String(text[r])
             if seen.insert(token).inserted {
@@ -888,8 +889,30 @@ final class AppState {
     private func resolveMentionedImages(in text: String, sessionId: String) -> [UploadedImageMention] {
         let mentions = imageMentionsBySession[sessionId] ?? []
         guard !mentions.isEmpty else { return [] }
-        let byToken = Dictionary(uniqueKeysWithValues: mentions.map { ($0.mentionToken, $0) })
+        let byToken = Dictionary(
+            mentions.map { ($0.mentionToken, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         return extractMentionTokens(in: text).compactMap { byToken[$0] }
+    }
+
+    private func fileURIString(forRemotePath remotePath: String) -> String {
+        let encodedPath = remotePath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? remotePath
+        return "file://\(encodedPath)"
+    }
+
+    private func performUploadCleanupIfNeeded() async {
+        let now = Date()
+        if let last = lastChatUploadCleanupAt,
+           now.timeIntervalSince(last) < chatUploadCleanupInterval {
+            return
+        }
+        do {
+            try await sshManager.cleanupExpiredChatUploads(ttlHours: chatUploadTTLHours)
+            lastChatUploadCleanupAt = now
+        } catch {
+            Log.toFile("[AppState] Skipped chat upload cleanup: \(error)")
+        }
     }
 
     /// Delete the current session if it has no user-visible content.
