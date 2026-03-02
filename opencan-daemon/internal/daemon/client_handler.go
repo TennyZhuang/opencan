@@ -3,7 +3,9 @@ package daemon
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -40,7 +42,9 @@ type ClientHandler struct {
 // NewClientHandler creates a handler for a client connection.
 func NewClientHandler(conn net.Conn, daemon *Daemon, logger *slog.Logger) *ClientHandler {
 	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	// Requests can include large prompt payloads; keep headroom to avoid scanner
+	// token truncation on valid JSON-RPC lines.
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 
 	return &ClientHandler{
 		conn:              conn,
@@ -59,9 +63,24 @@ func (h *ClientHandler) Serve() {
 	defer h.cleanup()
 
 	for h.scanner.Scan() {
-		msg, err := protocol.ParseLine(h.scanner.Bytes())
+		line := append([]byte(nil), h.scanner.Bytes()...)
+		msg, err := protocol.ParseLine(line)
 		if err != nil {
-			h.logger.Warn("parse error", "error", err)
+			h.logger.Warn(
+				"parse error",
+				"error", err,
+				"bytes", len(line),
+				"preview", previewLine(line, 512),
+			)
+			if id, ok := protocol.ExtractIDFromPossiblyMalformedLine(line); ok {
+				if sendErr := h.Send(protocol.NewErrorResponse(
+					id,
+					-32700,
+					"Parse error: invalid JSON-RPC payload",
+				)); sendErr != nil {
+					h.logger.Warn("failed to send parse error response", "error", sendErr)
+				}
+			}
 			continue
 		}
 		if msg == nil {
@@ -79,6 +98,10 @@ func (h *ClientHandler) Serve() {
 	}
 
 	if err := h.scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			h.logger.Warn("client disconnected: JSON-RPC line exceeded scanner limit", "error", err)
+			return
+		}
 		h.logger.Info("client disconnected", "error", err)
 	} else {
 		h.logger.Info("client disconnected (EOF)")
@@ -110,8 +133,7 @@ func (h *ClientHandler) Send(msg *protocol.Message) error {
 	if h.closed {
 		return fmt.Errorf("client connection closed")
 	}
-	_, err = h.conn.Write(data)
-	return err
+	return writeAll(h.conn, data)
 }
 
 func (h *ClientHandler) loggerForMessage(msg *protocol.Message) *slog.Logger {
@@ -120,6 +142,29 @@ func (h *ClientHandler) loggerForMessage(msg *protocol.Message) *slog.Logger {
 		return h.logger
 	}
 	return h.logger.With("traceId", traceID)
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+func previewLine(line []byte, max int) string {
+	if max <= 0 || len(line) <= max {
+		return string(line)
+	}
+	return string(line[:max]) + "...(truncated)"
 }
 
 // handleDaemonMethod dispatches daemon/ prefixed methods.
@@ -214,6 +259,7 @@ func (h *ClientHandler) handleSessionAttach(msg *protocol.Message) {
 	var params struct {
 		SessionID    string `json:"sessionId"`
 		LastEventSeq uint64 `json:"lastEventSeq"`
+		ClientID     string `json:"clientId"`
 	}
 	if msg.Params != nil {
 		json.Unmarshal(*msg.Params, &params)
@@ -230,7 +276,7 @@ func (h *ClientHandler) handleSessionAttach(msg *protocol.Message) {
 	}
 
 	// Attach client (single owner per session)
-	state, attached := p.TryAttachClient(h)
+	state, attached := p.TryAttachClientWithOwner(h, params.ClientID)
 	if !attached {
 		h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "session already attached by another client: "+params.SessionID))
 		return
@@ -361,6 +407,13 @@ func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 
 	p, ok := h.attachedProxies[routeID]
 	if !ok {
+		if msg.ID != nil {
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+routeID))
+		}
+		return
+	}
+	if p.GetClient() != h {
+		logger.Warn("rejecting request from stale session owner", "sessionId", routeID, "method", msg.Method)
 		if msg.ID != nil {
 			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+routeID))
 		}

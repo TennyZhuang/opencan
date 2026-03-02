@@ -236,12 +236,28 @@ enum ACPError: Error, LocalizedError {
         return combined.contains("session not found")
     }
 
+    /// True when upstream reports the requested history/session resource is missing.
+    var isResourceNotFound: Bool {
+        guard case .rpcError(_, let message, let data) = self else { return false }
+        let details = data?["details"]?.stringValue ?? ""
+        let combined = "\(message) \(details)".lowercased()
+        return combined.contains("resource not found")
+    }
+
     /// True when the request was routed to a proxy we're not attached to.
     var isNotAttached: Bool {
         guard case .rpcError(_, let message, let data) = self else { return false }
         let details = data?["details"]?.stringValue ?? ""
         let combined = "\(message) \(details)".lowercased()
         return combined.contains("not attached to session")
+    }
+
+    /// True when daemon/session.attach failed because another client owns it.
+    var isSessionAlreadyAttachedByAnotherClient: Bool {
+        guard case .rpcError(_, let message, let data) = self else { return false }
+        let details = data?["details"]?.stringValue ?? ""
+        let combined = "\(message) \(details)".lowercased()
+        return combined.contains("session already attached by another client")
     }
 
     /// True when upstream model routing has no available backend provider.

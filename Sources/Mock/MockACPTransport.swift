@@ -20,6 +20,10 @@ actor MockACPTransport: ACPTransport {
 
     /// If true, sessionAttach returns an error (simulates unknown session).
     var mockAttachShouldFail = false
+    /// Optional attach error override for daemon/session.attach.
+    var mockAttachError: (code: Int, message: String, data: JSONValue?)?
+    /// Optional one-shot attach error injected for the next daemon/session.attach.
+    var nextAttachError: (code: Int, message: String, data: JSONValue?)?
 
     /// Steps to stream during session/load (simulates history replay).
     var mockLoadSteps: [MockStep] = []
@@ -35,6 +39,9 @@ actor MockACPTransport: ACPTransport {
     /// Tracks the most recent daemon/session.create parameters.
     var lastCreateCwd: String?
     var lastCreateCommand: String?
+    /// Tracks the most recent daemon/session.attach params.
+    var lastAttachSessionId: String?
+    var lastAttachLastEventSeq: UInt64?
     /// Tracks the most recent session/prompt content blocks.
     var lastPromptSessionId: String?
     var lastPromptRouteToSessionId: String?
@@ -51,6 +58,10 @@ actor MockACPTransport: ACPTransport {
     var killedSessionIds: [String] = []
     /// Optional one-shot error injected for the next session/prompt request.
     var nextPromptError: (code: Int, message: String, data: JSONValue?)?
+    /// If true, session/prompt request receives no updates and no response.
+    var mockPromptShouldHang = false
+    /// If true, session/prompt streams updates but intentionally drops terminal response.
+    var mockDropPromptResponse = false
     /// Optional per-agent probe results. If absent, probes default to available.
     var mockAgentAvailabilityByID: [String: Bool] = [:]
     /// If true, daemon/agent.probe returns method not found.
@@ -132,6 +143,35 @@ actor MockACPTransport: ACPTransport {
             messageContinuation.yield(.response(id: id, result: result))
 
         case DaemonMethods.sessionAttach:
+            lastAttachSessionId = params?["sessionId"]?.stringValue
+            if let attachSeqInt = params?["lastEventSeq"]?.intValue {
+                lastAttachLastEventSeq = UInt64(attachSeqInt)
+            } else {
+                lastAttachLastEventSeq = nil
+            }
+            if let nextAttachError {
+                self.nextAttachError = nil
+                messageContinuation.yield(
+                    .error(
+                        id: id,
+                        code: nextAttachError.code,
+                        message: nextAttachError.message,
+                        data: nextAttachError.data
+                    )
+                )
+                return
+            }
+            if let mockAttachError {
+                messageContinuation.yield(
+                    .error(
+                        id: id,
+                        code: mockAttachError.code,
+                        message: mockAttachError.message,
+                        data: mockAttachError.data
+                    )
+                )
+                return
+            }
             if mockAttachShouldFail {
                 messageContinuation.yield(
                     .error(id: id, code: -32000, message: "Session not found", data: nil)
@@ -176,6 +216,9 @@ actor MockACPTransport: ACPTransport {
             lastPromptSessionId = sessionId
             lastPromptRouteToSessionId = routeToSessionId
             lastPromptBlocks = params?["prompt"]?.arrayValue
+            if mockPromptShouldHang {
+                return
+            }
             if let promptError = nextPromptError {
                 nextPromptError = nil
                 messageContinuation.yield(
@@ -189,7 +232,12 @@ actor MockACPTransport: ACPTransport {
                 return
             }
             let steps = scenario.steps
-            await streamScenario(requestId: id, sessionId: sessionId, steps: steps)
+            await streamScenario(
+                requestId: id,
+                sessionId: sessionId,
+                steps: steps,
+                sendResponse: !mockDropPromptResponse
+            )
 
         case ACPMethods.sessionLoad:
             let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
@@ -224,13 +272,15 @@ actor MockACPTransport: ACPTransport {
     private func streamScenario(
         requestId: JSONRPCMessage.JSONRPCID,
         sessionId: String,
-        steps: [MockStep]
+        steps: [MockStep],
+        sendResponse: Bool = true
     ) async {
         for step in steps {
             guard !isClosed else { return }
             await executeStep(step, sessionId: sessionId)
         }
 
+        guard sendResponse else { return }
         let result: JSONValue = .object([
             "stopReason": .string("end_turn")
         ])
@@ -372,6 +422,18 @@ actor MockACPTransport: ACPTransport {
         self.mockAttachShouldFail = fail
     }
 
+    func setMockAttachError(code: Int, message: String, data: JSONValue?) {
+        mockAttachError = (code: code, message: message, data: data)
+    }
+
+    func clearMockAttachError() {
+        mockAttachError = nil
+    }
+
+    func setNextAttachError(code: Int, message: String, data: JSONValue?) {
+        nextAttachError = (code: code, message: message, data: data)
+    }
+
     func setMockSessionList(_ list: [[String: JSONValue]]) {
         self.mockSessionList = list
     }
@@ -416,6 +478,14 @@ actor MockACPTransport: ACPTransport {
         lastCreateCwd
     }
 
+    func getLastAttachSessionId() -> String? {
+        lastAttachSessionId
+    }
+
+    func getLastAttachLastEventSeq() -> UInt64? {
+        lastAttachLastEventSeq
+    }
+
     func getLastPromptBlocks() -> [JSONValue]? {
         lastPromptBlocks
     }
@@ -442,5 +512,13 @@ actor MockACPTransport: ACPTransport {
 
     func setNextPromptError(code: Int, message: String, data: JSONValue?) {
         nextPromptError = (code: code, message: message, data: data)
+    }
+
+    func setMockPromptShouldHang(_ shouldHang: Bool) {
+        mockPromptShouldHang = shouldHang
+    }
+
+    func setMockDropPromptResponse(_ drop: Bool) {
+        mockDropPromptResponse = drop
     }
 }

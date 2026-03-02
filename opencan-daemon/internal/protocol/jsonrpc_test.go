@@ -189,6 +189,35 @@ func TestParseLine_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestExtractIDFromPossiblyMalformedLine_IntID(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","id":123,"method":"session/prompt","params":{"sessionId":"abc"}`)
+	id, ok := ExtractIDFromPossiblyMalformedLine(line)
+	if !ok {
+		t.Fatal("expected id extraction to succeed")
+	}
+	if !id.IsInt() || id.IntValue() != 123 {
+		t.Fatalf("expected int id 123, got %#v", id)
+	}
+}
+
+func TestExtractIDFromPossiblyMalformedLine_StringID(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","id":"req-42","method":"session/prompt","params":{"sessionId":"abc"}`)
+	id, ok := ExtractIDFromPossiblyMalformedLine(line)
+	if !ok {
+		t.Fatal("expected id extraction to succeed")
+	}
+	if !id.IsString() || id.StringValue() != "req-42" {
+		t.Fatalf("expected string id req-42, got %#v", id)
+	}
+}
+
+func TestExtractIDFromPossiblyMalformedLine_MissingID(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","method":"session/prompt","params":{"sessionId":"abc"}`)
+	if _, ok := ExtractIDFromPossiblyMalformedLine(line); ok {
+		t.Fatal("expected id extraction to fail without id")
+	}
+}
+
 func TestIsDaemonMethod(t *testing.T) {
 	tests := []struct {
 		method string

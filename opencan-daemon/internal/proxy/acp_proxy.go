@@ -56,7 +56,8 @@ type ACPProxy struct {
 }
 
 type clientWrapper struct {
-	conn ClientConn
+	conn    ClientConn
+	ownerID string
 }
 
 // NewACPProxy spawns an ACP process, initializes the ACP protocol,
@@ -86,7 +87,8 @@ func NewACPProxy(cwd, command string, logger *slog.Logger) (*ACPProxy, error) {
 	}
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	// ACP updates/tool outputs can be large single-line JSON notifications.
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 
 	p := &ACPProxy{
 		CWD:             cwd,
@@ -254,7 +256,10 @@ func (p *ACPProxy) handleNotification(msg *protocol.Message) {
 	if client := p.GetClient(); client != nil {
 		fwd := msg.Clone()
 		fwd.SetParam("__seq", seq)
-		client.Send(fwd)
+		if err := client.Send(fwd); err != nil {
+			p.logger.Warn("forward notification to client failed", "session", p.SessionID, "error", err)
+			p.DetachClient(client)
+		}
 	}
 }
 
@@ -279,7 +284,16 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 	fwd := msg.Clone()
 	fwd.ID = pr.OriginalID
 	if pr.Client != nil {
-		pr.Client.Send(fwd)
+		if err := pr.Client.Send(fwd); err != nil {
+			p.logger.Warn(
+				"forward response to client failed",
+				"session", p.SessionID,
+				"id", internalID,
+				"method", pr.Method,
+				"error", err,
+			)
+			p.DetachClient(pr.Client)
+		}
 	}
 	if pr.ResponseCh != nil {
 		pr.ResponseCh <- msg.Clone()
@@ -294,8 +308,11 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 func (p *ACPProxy) handleServerRequest(msg *protocol.Message) {
 	if msg.Method == "session/request_permission" {
 		if client := p.GetClient(); client != nil {
-			client.ForwardServerRequest(msg, p)
-			return
+			if err := client.ForwardServerRequest(msg, p); err == nil {
+				return
+			}
+			p.logger.Warn("forward permission request to client failed, auto-approving", "session", p.SessionID)
+			p.DetachClient(client)
 		}
 		// No client — auto-approve
 		p.logger.Info("auto-approving permission (no client)", "session", p.SessionID)
@@ -403,28 +420,41 @@ func (p *ACPProxy) EventBuf() *EventBuffer { return p.eventBuffer }
 
 // AttachClient sets the active client. Returns the resulting state.
 func (p *ACPProxy) AttachClient(c ClientConn) SessionState {
-	state, _ := p.TryAttachClient(c)
+	state, _ := p.TryAttachClientWithOwner(c, "")
 	return state
 }
 
 // TryAttachClient attaches a client if no other client is attached.
 // Returns false when another client already owns the session.
 func (p *ACPProxy) TryAttachClient(c ClientConn) (SessionState, bool) {
+	return p.TryAttachClientWithOwner(c, "")
+}
+
+// TryAttachClientWithOwner attaches a client if no other client is attached.
+// If ownerID is provided and matches the current ownerID, ownership is
+// transferred to the new connection. This allows reconnect handoff while
+// preserving single-owner semantics for different clients.
+func (p *ACPProxy) TryAttachClientWithOwner(c ClientConn, ownerID string) (SessionState, bool) {
 	for {
 		current := p.client.Load()
 		if current != nil {
 			if current.conn != c {
-				return p.State(), false
+				if ownerID != "" && current.ownerID != "" && current.ownerID == ownerID {
+					p.client.Store(&clientWrapper{conn: c, ownerID: ownerID})
+					p.logger.Info("transferred session ownership to reconnected client", "session", p.SessionID)
+				} else {
+					return p.State(), false
+				}
 			}
 		} else {
-			if !p.client.CompareAndSwap(nil, &clientWrapper{conn: c}) {
+			if !p.client.CompareAndSwap(nil, &clientWrapper{conn: c, ownerID: ownerID}) {
 				// Lost a race; re-check ownership.
 				continue
 			}
 		}
 
 		// Keep behavior identical to AttachClient for valid attaches.
-		p.client.Store(&clientWrapper{conn: c})
+		p.client.Store(&clientWrapper{conn: c, ownerID: ownerID})
 		state := p.State()
 		switch state {
 		case StateCompleted:
@@ -436,6 +466,16 @@ func (p *ACPProxy) TryAttachClient(c ClientConn) (SessionState, bool) {
 		}
 		return state, true
 	}
+}
+
+// CurrentOwnerID returns the owner identity string for the attached client.
+// Empty string means no owner identity was provided.
+func (p *ACPProxy) CurrentOwnerID() string {
+	w := p.client.Load()
+	if w == nil {
+		return ""
+	}
+	return w.ownerID
 }
 
 // DetachClient removes the client if it matches.
@@ -645,8 +685,23 @@ func (p *ACPProxy) writeMessage(msg *protocol.Message) error {
 	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	_, err = p.stdin.Write(data)
-	return err
+	return writeAll(p.stdin, data)
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func isPromptComplete(msg *protocol.Message) bool {

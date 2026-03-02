@@ -143,6 +143,7 @@ struct SessionPickerView: View {
     let workspace: Workspace
     @State private var navigateToChat = false
     @State private var loadingSessionId: String?
+    @State private var resumeErrorMessage: String?
 
     var body: some View {
         sessionListView
@@ -152,6 +153,19 @@ struct SessionPickerView: View {
             #endif
             .navigationDestination(isPresented: $navigateToChat) {
                 ChatView()
+            }
+            .alert(
+                "Cannot Open Session",
+                isPresented: Binding(
+                    get: { resumeErrorMessage != nil },
+                    set: { showing in
+                        if !showing { resumeErrorMessage = nil }
+                    }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(resumeErrorMessage ?? "Unknown error")
             }
             .onAppear {
                 appState.activeWorkspace = workspace
@@ -271,7 +285,7 @@ struct SessionPickerView: View {
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
-                                    Text(String(session.sessionId.prefix(8)) + "…")
+                                    Text(session.sessionId)
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
                                         .lineLimit(1)
@@ -321,6 +335,7 @@ struct SessionPickerView: View {
             navigateToChat = true
         } catch {
             appState.connectionError = error.localizedDescription
+            resumeErrorMessage = error.localizedDescription
         }
     }
 }

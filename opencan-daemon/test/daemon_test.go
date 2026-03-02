@@ -173,6 +173,35 @@ func TestDaemon_Hello_StringRequestIDRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDaemon_MalformedRequestReturnsParseErrorOnSameID(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	// Intentionally malformed/truncated JSON so ParseLine fails after the id.
+	raw := `{"jsonrpc":"2.0","id":99,"method":"session/prompt","params":{"sessionId":"abc","prompt":[{"type":"text","text":"hello"}]}`
+	if _, err := conn.Write([]byte(raw + "\n")); err != nil {
+		t.Fatalf("write malformed request: %v", err)
+	}
+
+	resp := readJSON(t, conn)
+	if resp["id"].(float64) != 99 {
+		t.Fatalf("expected id 99 in parse error response, got %v", resp["id"])
+	}
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error object, got %#v", resp)
+	}
+	if code := errObj["code"].(float64); code != -32700 {
+		t.Fatalf("expected parse error code -32700, got %v", code)
+	}
+	if !strings.Contains(fmt.Sprint(errObj["message"]), "Parse error") {
+		t.Fatalf("unexpected parse error message: %v", errObj["message"])
+	}
+}
+
 func TestDaemon_LogsEndpointSupportsTraceFiltering(t *testing.T) {
 	d, sockPath := testDaemon(t)
 	defer d.Stop()
@@ -918,6 +947,111 @@ func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
 	resp = readResponseWithID(t, scanner2, 2)
 	if resp["error"] != nil {
 		t.Fatalf("client2 attach after detach should succeed: %v", resp["error"])
+	}
+}
+
+func TestDaemon_SessionAttachAllowsSameClientIDReclaim(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	defer conn1.Close()
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Client 1 creates and attaches a session with clientId.
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.create",
+		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
+	})
+	resp := readResponseWithID(t, scanner1, 1)
+	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.attach",
+		"params": map[string]interface{}{
+			"sessionId":    sessionID,
+			"lastEventSeq": 0,
+			"clientId":     "ios-app-1",
+		},
+	})
+	resp = readResponseWithID(t, scanner1, 2)
+	if resp["error"] != nil {
+		t.Fatalf("client1 attach error: %v", resp["error"])
+	}
+
+	// Client 2 with the same clientId can reclaim ownership.
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn2, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.attach",
+		"params": map[string]interface{}{
+			"sessionId":    sessionID,
+			"lastEventSeq": 0,
+			"clientId":     "ios-app-1",
+		},
+	})
+	resp = readResponseWithID(t, scanner2, 1)
+	if resp["error"] != nil {
+		t.Fatalf("client2 attach with same clientId should succeed: %v", resp["error"])
+	}
+
+	// Old reclaimed connection should no longer be allowed to forward ACP requests.
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": sessionID,
+			"prompt": []map[string]interface{}{
+				{"type": "text", "text": "old-owner-should-fail"},
+			},
+		},
+	})
+	resp = readResponseWithID(t, scanner1, 3)
+	if resp["error"] == nil {
+		t.Fatal("expected old connection prompt rejection after reclaim")
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: "+sessionID) {
+		t.Fatalf("unexpected old connection error: %v", resp["error"])
+	}
+
+	// A third client with a different clientId is still rejected.
+	conn3 := connectToDaemon(t, sockPath)
+	defer conn3.Close()
+	scanner3 := bufio.NewScanner(conn3)
+	scanner3.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn3.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn3, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.attach",
+		"params": map[string]interface{}{
+			"sessionId":    sessionID,
+			"lastEventSeq": 0,
+			"clientId":     "ios-app-2",
+		},
+	})
+	resp = readResponseWithID(t, scanner3, 1)
+	if resp["error"] == nil {
+		t.Fatal("expected attach rejection for different clientId")
 	}
 }
 

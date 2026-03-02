@@ -8,7 +8,24 @@ final class AppState {
     private let chatUploadTTLHours = 24
     private let chatUploadCleanupInterval: TimeInterval = 15 * 60
     private let maxChatImageBytes = 12 * 1024 * 1024
+    /// Stable per-install ID used to reclaim daemon session ownership after reconnect.
+    private let daemonAttachClientID = AppState.loadOrCreateDaemonAttachClientID()
+    /// Fallback timeout when session/prompt never returns a terminal response.
+    var promptResponseTimeoutSeconds: TimeInterval = 45
     private static let mentionRegex = try! NSRegularExpression(pattern: #"@[A-Za-z0-9_-]+"#)
+    private static let daemonAttachClientIDDefaultsKey = "opencan.daemonAttachClientID"
+
+    private static func loadOrCreateDaemonAttachClientID() -> String {
+        let defaults = UserDefaults.standard
+        if let existing = defaults.string(forKey: daemonAttachClientIDDefaultsKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !existing.isEmpty {
+            return existing
+        }
+        let generated = UUID().uuidString.lowercased()
+        defaults.set(generated, forKey: daemonAttachClientIDDefaultsKey)
+        return generated
+    }
 
     // Active connection context
     var activeNode: Node?
@@ -182,7 +199,9 @@ final class AppState {
             port: node.port,
             username: node.username,
             privateKeyPEM: privateKeyPEM,
-            command: "~/.opencan/bin/opencan-daemon attach",  // Always use daemon
+            // Force raw TTY mode before attach so large JSON-RPC lines are not
+            // mangled by line discipline (which leads to daemon-side parse errors).
+            command: "stty raw -echo -icrnl -inlcr -ixon -ixoff 2>/dev/null || true; exec ~/.opencan/bin/opencan-daemon attach",
             jumpHost: jumpHost,
             jumpPort: jumpPort,
             jumpUsername: jumpUsername,
@@ -459,8 +478,6 @@ final class AppState {
         }
 
         let traceId = newTraceId()
-
-        messages = []
         let launchCommand = normalizeAgentCommand(command, fallback: AgentCommandStore.command(forAgentID: agentID))
 
         Log.log(component: "AppState", "creating session via daemon", traceId: traceId)
@@ -475,9 +492,8 @@ final class AppState {
                 traceId: traceId
             )
         }
+        settlePromptingStateForSessionSwitch(clearMessages: false)
         await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon, traceId: traceId)
-        self.currentSessionId = sessionId
-        self.lastEventSeq[sessionId] = 0
 
         // Auto-attach to the new session
         let _ = try await Log.timed(
@@ -486,8 +502,16 @@ final class AppState {
             traceId: traceId,
             sessionId: sessionId
         ) {
-            try await daemon.attachSession(sessionId: sessionId, lastEventSeq: 0, traceId: traceId)
+            try await daemon.attachSession(
+                sessionId: sessionId,
+                lastEventSeq: 0,
+                clientId: daemonAttachClientID,
+                traceId: traceId
+            )
         }
+        self.currentSessionId = sessionId
+        self.lastEventSeq[sessionId] = 0
+        settlePromptingStateForSessionSwitch(clearMessages: true)
 
         let session = Session(
             sessionId: sessionId,
@@ -538,8 +562,12 @@ final class AppState {
             storedAgentCommand: existingSession?.agentCommand,
             daemonCommand: daemonKnownCommand
         )
-
-        messages = []
+        let previousSessionId = currentSessionId
+        let previousSessionAttachSeq: UInt64 = {
+            guard let previousSessionId else { return 0 }
+            return lastEventSeq[previousSessionId] ?? 0
+        }()
+        settlePromptingStateForSessionSwitch(clearMessages: false)
 
         await detachCurrentSessionIfNeeded(beforeAttaching: sessionId, daemon: daemon, traceId: traceId)
 
@@ -576,39 +604,80 @@ final class AppState {
                 traceId: traceId,
                 sessionId: sessionId
             ) {
-                try await daemon.attachSession(
+                try await attachSessionWithRetryIfNeeded(
+                    daemon: daemon,
                     sessionId: sessionId,
                     lastEventSeq: desiredAttachSeq,
                     traceId: traceId
                 )
             }
         } catch {
-            // Daemon doesn't know this session — recover via session/load
+            if shouldRecoverHistorySession(afterAttachError: error) {
+                // Daemon doesn't know this session — recover via session/load
+                Log.log(
+                    level: "warning",
+                    component: "AppState",
+                    "attach failed, recovering history session: \(error.localizedDescription)",
+                    traceId: traceId,
+                    sessionId: sessionId
+                )
+                try await resumeHistorySession(
+                    oldSessionId: sessionId,
+                    sourceSessionId: sourceSessionId,
+                    sourceSessionCwd: sourceSessionCwd,
+                    workspace: workspace,
+                    agentID: sessionAgent.id,
+                    command: sessionAgent.command,
+                    daemon: daemon,
+                    traceId: traceId,
+                    modelContext: modelContext
+                )
+                return
+            }
+
+            if shouldTreatAttachFailureAsOwnershipConflict(error) {
+                await restorePreviousAttachmentIfNeeded(
+                    previousSessionId: previousSessionId,
+                    previousSessionAttachSeq: previousSessionAttachSeq,
+                    failedTargetSessionId: sessionId,
+                    daemon: daemon,
+                    traceId: traceId
+                )
+                Log.log(
+                    level: "warning",
+                    component: "AppState",
+                    "attach rejected by active owner, not creating recovery session",
+                    traceId: traceId,
+                    sessionId: sessionId
+                )
+                throw AppStateError.sessionAttachedByAnotherClient(sessionId)
+            }
+
+            await restorePreviousAttachmentIfNeeded(
+                previousSessionId: previousSessionId,
+                previousSessionAttachSeq: previousSessionAttachSeq,
+                failedTargetSessionId: sessionId,
+                daemon: daemon,
+                traceId: traceId
+            )
             Log.log(
-                level: "warning",
+                level: "error",
                 component: "AppState",
-                "attach failed, recovering history session: \(error.localizedDescription)",
+                "attach failed: \(error.localizedDescription)",
                 traceId: traceId,
                 sessionId: sessionId
             )
-            try await resumeHistorySession(
-                oldSessionId: sessionId,
-                sourceSessionId: sourceSessionId,
-                sourceSessionCwd: sourceSessionCwd,
-                workspace: workspace,
-                agentID: sessionAgent.id,
-                command: sessionAgent.command,
-                daemon: daemon,
-                traceId: traceId,
-                modelContext: modelContext
-            )
-            return
+            throw error
         }
 
         self.currentSessionId = sessionId
+        settlePromptingStateForSessionSwitch(clearMessages: true)
 
         let isRunning = result.state == "prompting" || result.state == "draining"
         var resolvedSessionCwd = daemonKnownCwd ?? existingSession?.sessionCwd ?? workspace.path
+        var didAttemptHistoryBackfill = false
+        var didSucceedHistoryBackfill = false
+        var didObserveHistoryNotFound = false
 
         if isRunning {
             // Replay buffered events. Set isPrompting before replay so that
@@ -643,27 +712,23 @@ final class AppState {
                 lastEventSeq[sessionId] = buffered.seq
             }
 
-            let hasHistorySource = (historySessionId != nil && historySessionId != sessionId)
             let hasVisibleReplay = hasRenderableConversation()
-            if !hasVisibleReplay || hasHistorySource {
-                beginHistoryLoadScope(sessionIds: Set([sessionId]))
+            if !hasVisibleReplay {
+                let sourceHistorySessionId: String? = {
+                    guard let historySessionId, historySessionId != sessionId else { return nil }
+                    return historySessionId
+                }()
+                beginHistoryLoadScope(
+                    sessionIds: Set([sessionId, sourceHistorySessionId].compactMap { $0 })
+                )
                 prepareHistoryReplayTracking(for: sessionId)
-                Log.toFile("[AppState] Loading history via session/load for \(sessionId)...")
-                let primaryCwds = loadCwdCandidates(
-                    preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
-                    workspace: workspace
-                )
-                let loadedPrimaryCwd = await loadSessionFromCandidates(
-                    sessionId: sessionId,
-                    traceId: traceId,
-                    candidateCwds: primaryCwds
-                )
 
-                if let loadedPrimaryCwd {
-                    resolvedSessionCwd = loadedPrimaryCwd
-                } else if let historySessionId, historySessionId != sessionId {
-                    historyLoadSessionIds.insert(historySessionId)
-                    prepareHistoryReplayTracking(for: historySessionId)
+                if let sourceHistorySessionId {
+                    // Recovered sessions should backfill from the original source first.
+                    // Loading the recovered session ID itself often returns "Resource not found".
+                    historyLoadSessionIds.insert(sourceHistorySessionId)
+                    prepareHistoryReplayTracking(for: sourceHistorySessionId)
+                    Log.toFile("[AppState] Loading history source \(sourceHistorySessionId) into \(sessionId)...")
                     let historyCwds = loadCwdCandidates(
                         preferred: [
                             existingSession?.historySessionCwd,
@@ -673,13 +738,38 @@ final class AppState {
                         ],
                         workspace: workspace
                     )
-                    if let loadedHistoryCwd = await loadSessionFromCandidates(
-                        sessionId: historySessionId,
+                    let historyLoadResult = await loadSessionFromCandidates(
+                        sessionId: sourceHistorySessionId,
                         routeToSessionId: sessionId,
                         traceId: traceId,
                         candidateCwds: historyCwds
-                    ) {
+                    )
+                    didAttemptHistoryBackfill = true
+                    didObserveHistoryNotFound = historyLoadResult.sawNotFound
+                    if let loadedHistoryCwd = historyLoadResult.loadedCwd {
+                        didSucceedHistoryBackfill = true
                         existingSession?.historySessionCwd = loadedHistoryCwd
+                    } else if historyLoadResult.sawNotFound {
+                        // Stop repeatedly probing a history source that no longer exists.
+                        existingSession?.historySessionId = nil
+                        existingSession?.historySessionCwd = nil
+                    }
+                } else {
+                    Log.toFile("[AppState] Loading history via session/load for \(sessionId)...")
+                    let primaryCwds = loadCwdCandidates(
+                        preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
+                        workspace: workspace
+                    )
+                    let primaryLoadResult = await loadSessionFromCandidates(
+                        sessionId: sessionId,
+                        traceId: traceId,
+                        candidateCwds: primaryCwds
+                    )
+                    didAttemptHistoryBackfill = true
+                    didObserveHistoryNotFound = primaryLoadResult.sawNotFound
+                    if let loadedPrimaryCwd = primaryLoadResult.loadedCwd {
+                        didSucceedHistoryBackfill = true
+                        resolvedSessionCwd = loadedPrimaryCwd
                     }
                 }
             } else {
@@ -728,6 +818,10 @@ final class AppState {
             statusMsg = "Session resumed (still running)"
         } else if result.state == "completed" {
             statusMsg = "Session resumed (completed)"
+        } else if didAttemptHistoryBackfill && !didSucceedHistoryBackfill {
+            statusMsg = didObserveHistoryNotFound
+                ? "Session resumed (history unavailable)"
+                : "Session resumed (history load failed)"
         } else {
             statusMsg = "Session resumed"
         }
@@ -784,10 +878,16 @@ final class AppState {
             traceId: traceId,
             sessionId: newSessionId
         ) {
-            try await daemon.attachSession(sessionId: newSessionId, lastEventSeq: 0, traceId: traceId)
+            try await daemon.attachSession(
+                sessionId: newSessionId,
+                lastEventSeq: 0,
+                clientId: daemonAttachClientID,
+                traceId: traceId
+            )
         }
         self.currentSessionId = newSessionId
         self.lastEventSeq[newSessionId] = 0
+        settlePromptingStateForSessionSwitch(clearMessages: true)
 
         // Load old session's history into the new ACP process.
         // __routeToSession tells the daemon to forward this to the new session's ACP process,
@@ -800,13 +900,15 @@ final class AppState {
             preferred: [sourceSessionCwd, workspace.path],
             workspace: workspace
         )
-        let loadedSourceCwd = await loadSessionFromCandidates(
+        let sourceLoadResult = await loadSessionFromCandidates(
             sessionId: sourceSessionId,
             routeToSessionId: newSessionId,
             traceId: traceId,
             candidateCwds: sourceLoadCwds
         )
+        let loadedSourceCwd = sourceLoadResult.loadedCwd
         let historyLoadFailed = loadedSourceCwd == nil
+        let historyUnavailable = historyLoadFailed && sourceLoadResult.sawNotFound
         endHistoryLoadScope()
         for msg in messages where msg.isStreaming {
             msg.isStreaming = false
@@ -819,8 +921,10 @@ final class AppState {
         if let existing = try? modelContext.fetch(descriptor).first {
             existing.sessionId = newSessionId
             existing.sessionCwd = workspace.path
-            existing.historySessionId = sourceSessionId == newSessionId ? nil : sourceSessionId
-            existing.historySessionCwd = sourceSessionId == newSessionId
+            existing.historySessionId = (sourceSessionId == newSessionId || historyUnavailable)
+                ? nil
+                : sourceSessionId
+            existing.historySessionCwd = (sourceSessionId == newSessionId || historyUnavailable)
                 ? nil
                 : (loadedSourceCwd ?? sourceSessionCwd)
             existing.agentID = agentID
@@ -831,8 +935,10 @@ final class AppState {
             let session = Session(
                 sessionId: newSessionId,
                 sessionCwd: workspace.path,
-                historySessionId: sourceSessionId == newSessionId ? nil : sourceSessionId,
-                historySessionCwd: sourceSessionId == newSessionId
+                historySessionId: (sourceSessionId == newSessionId || historyUnavailable)
+                    ? nil
+                    : sourceSessionId,
+                historySessionCwd: (sourceSessionId == newSessionId || historyUnavailable)
                     ? nil
                     : (loadedSourceCwd ?? sourceSessionCwd),
                 agentID: agentID,
@@ -848,7 +954,11 @@ final class AppState {
         await refreshDaemonSessions()
 
         if historyLoadFailed {
-            addSystemMessage("Session recovered (conversation history unavailable)")
+            if historyUnavailable {
+                addSystemMessage("Session recovered (conversation history unavailable)")
+            } else {
+                addSystemMessage("Session recovered (history load failed)")
+            }
         } else {
             addSystemMessage("Session recovered from history")
         }
@@ -1154,6 +1264,7 @@ final class AppState {
         )
 
         Task {
+            let timeoutSeconds = self.promptResponseTimeoutSeconds
             do {
                 let _ = try await Log.timed(
                     "session/prompt",
@@ -1161,12 +1272,25 @@ final class AppState {
                     traceId: traceId,
                     sessionId: sessionId
                 ) {
-                    try await service.sendPrompt(
-                        sessionId: promptTarget.sessionId,
-                        prompt: promptBlocks,
-                        routeToSessionId: promptTarget.routeToSessionId,
-                        traceId: traceId
+                    try await withThrowingTimeout(seconds: timeoutSeconds) {
+                        try await service.sendPrompt(
+                            sessionId: promptTarget.sessionId,
+                            prompt: promptBlocks,
+                            routeToSessionId: promptTarget.routeToSessionId,
+                            traceId: traceId
+                        )
+                    }
+                }
+                let promptStillActive = self.isPrompting && self.currentSessionId == sessionId
+                guard promptStillActive else {
+                    Log.log(
+                        level: "warning",
+                        component: "AppState",
+                        "sendPrompt returned after prompt already settled",
+                        traceId: traceId,
+                        sessionId: sessionId
                     )
+                    return
                 }
                 Log.log(component: "AppState", "sendPrompt returned", traceId: traceId, sessionId: sessionId)
                 for msg in self.messages where msg.role == .assistant && msg.isStreaming {
@@ -1174,33 +1298,41 @@ final class AppState {
                 }
                 self.isPrompting = false
             } catch {
+                let normalizedError = self.normalizePromptSendError(error, timeoutSeconds: timeoutSeconds)
+                let promptStillActive = self.isPrompting && self.currentSessionId == sessionId
+                guard promptStillActive else {
+                    Log.log(
+                        level: "warning",
+                        component: "AppState",
+                        "sendPrompt finished after prompt already settled: \(normalizedError.localizedDescription)",
+                        traceId: traceId,
+                        sessionId: sessionId
+                    )
+                    return
+                }
                 Log.log(
                     level: "error",
                     component: "AppState",
-                    "sendPrompt error: \(error.localizedDescription)",
+                    "sendPrompt error: \(normalizedError.localizedDescription)",
                     traceId: traceId,
                     sessionId: sessionId
                 )
-                self.presentPromptError(error)
+                self.presentPromptError(normalizedError)
                 for msg in self.messages where msg.role == .assistant && msg.isStreaming {
                     msg.isStreaming = false
                 }
                 self.isPrompting = false
+                self.forceScrollToBottom = true
+                Task { await self.refreshDaemonSessions() }
             }
         }
         return true
     }
 
-    /// Resolve ACP prompt routing for recovered sessions.
-    /// When a daemon session is recovered via `session/load`, prompts should
-    /// continue targeting the original history session and route through the
-    /// currently attached daemon session.
+    /// Resolve ACP prompt routing for the active daemon session.
+    /// Keep prompt target 1:1 with the currently attached daemon session.
     private func resolvePromptTargetSession(daemonSessionId: String) -> (sessionId: String, routeToSessionId: String?) {
-        guard let sourceSessionId = activeSession?.historySessionId,
-              sourceSessionId != daemonSessionId else {
-            return (daemonSessionId, nil)
-        }
-        return (sourceSessionId, daemonSessionId)
+        (daemonSessionId, nil)
     }
 
     private func generateMentionName(for sessionId: String) -> String {
@@ -1308,13 +1440,6 @@ final class AppState {
         Log.toFile("[AppState] Starting notification listener")
         notificationTask = Task {
             for await notification in client.notifications {
-                // Track __seq from daemon-forwarded notifications
-                if case .notification(_, let params) = notification,
-                   let seq = params?["__seq"]?.intValue,
-                   let routedSessionId = self.currentSessionId {
-                    self.lastEventSeq[routedSessionId] = UInt64(seq)
-                }
-
                 let notificationSessionId: String?
                 if case .notification(_, let params) = notification {
                     notificationSessionId = params?["sessionId"]?.stringValue
@@ -1325,6 +1450,13 @@ final class AppState {
                 guard self.shouldHandleSessionNotification(for: notificationSessionId) else {
                     Log.toFile("[AppState] Ignoring event for non-active session \(notificationSessionId ?? "nil")")
                     continue
+                }
+
+                // Track __seq only for notifications that are actually accepted.
+                if case .notification(_, let params) = notification,
+                   let seq = params?["__seq"]?.intValue,
+                   let notificationSessionId {
+                    self.lastEventSeq[notificationSessionId] = UInt64(seq)
                 }
 
                 guard let event = SessionUpdateParser.parse(notification) else { continue }
@@ -1362,7 +1494,7 @@ final class AppState {
         // During session/load, history events can be emitted for the loaded source
         // sessionId even though we're attached to a different live session.
         if isLoadingHistory {
-            return historyLoadSessionIds.isEmpty
+            return false
         }
         return false
     }
@@ -1623,8 +1755,11 @@ final class AppState {
         routeToSessionId: String? = nil,
         traceId: String? = nil,
         candidateCwds: [String]
-    ) async -> String? {
-        guard let service = acpService else { return nil }
+    ) async -> SessionLoadResult {
+        guard let service = acpService else {
+            return SessionLoadResult(loadedCwd: nil, sawNotFound: false)
+        }
+        var sawNotFound = false
         for cwd in candidateCwds {
             do {
                 try await Log.timed(
@@ -1640,8 +1775,11 @@ final class AppState {
                         traceId: traceId
                     )
                 }
-                return cwd
+                return SessionLoadResult(loadedCwd: cwd, sawNotFound: sawNotFound)
             } catch {
+                if shouldTreatSessionLoadFailureAsNotFound(error) {
+                    sawNotFound = true
+                }
                 Log.log(
                     level: "warning",
                     component: "AppState",
@@ -1656,13 +1794,125 @@ final class AppState {
                 }
             }
         }
-        return nil
+        return SessionLoadResult(loadedCwd: nil, sawNotFound: sawNotFound)
     }
 
     /// Whether we should stop trying more cwd candidates for session/load.
     private func shouldStopSessionLoadRetries(after error: Error) -> Bool {
         guard let acpError = error as? ACPError else { return false }
         return acpError.isNotAttached
+    }
+
+    private func shouldTreatSessionLoadFailureAsNotFound(_ error: Error) -> Bool {
+        guard let acpError = error as? ACPError else { return false }
+        return acpError.isSessionNotFound || acpError.isResourceNotFound
+    }
+
+    private struct SessionLoadResult {
+        let loadedCwd: String?
+        let sawNotFound: Bool
+    }
+
+    /// End in-flight prompt UI when transitioning away from the current session.
+    private func settlePromptingStateForSessionSwitch(clearMessages: Bool) {
+        isPrompting = false
+        for msg in messages where msg.isStreaming {
+            msg.isStreaming = false
+        }
+        if clearMessages {
+            messages = []
+        }
+    }
+
+    private func restorePreviousAttachmentIfNeeded(
+        previousSessionId: String?,
+        previousSessionAttachSeq: UInt64,
+        failedTargetSessionId: String,
+        daemon: DaemonClient,
+        traceId: String?
+    ) async {
+        guard let previousSessionId, previousSessionId != failedTargetSessionId else { return }
+        do {
+            let _ = try await attachSessionWithRetryIfNeeded(
+                daemon: daemon,
+                sessionId: previousSessionId,
+                lastEventSeq: previousSessionAttachSeq,
+                traceId: traceId
+            )
+            currentSessionId = previousSessionId
+            Log.log(
+                level: "warning",
+                component: "AppState",
+                "restored previous attachment after failed switch",
+                traceId: traceId,
+                sessionId: previousSessionId
+            )
+        } catch {
+            Log.log(
+                level: "warning",
+                component: "AppState",
+                "failed to restore previous attachment after switch failure: \(error.localizedDescription)",
+                traceId: traceId,
+                sessionId: previousSessionId
+            )
+        }
+    }
+
+    /// Only "session not found" should create a brand new recovered session.
+    private func shouldRecoverHistorySession(afterAttachError error: Error) -> Bool {
+        guard let acpError = error as? ACPError else { return false }
+        return acpError.isSessionNotFound
+    }
+
+    private func shouldTreatAttachFailureAsOwnershipConflict(_ error: Error) -> Bool {
+        guard let acpError = error as? ACPError else { return false }
+        return acpError.isSessionAlreadyAttachedByAnotherClient
+    }
+
+    /// Retry daemon/session.attach when ownership is briefly stale during reconnect.
+    private func attachSessionWithRetryIfNeeded(
+        daemon: DaemonClient,
+        sessionId: String,
+        lastEventSeq: UInt64,
+        traceId: String?
+    ) async throws -> DaemonAttachResult {
+        do {
+            return try await daemon.attachSession(
+                sessionId: sessionId,
+                lastEventSeq: lastEventSeq,
+                clientId: daemonAttachClientID,
+                traceId: traceId
+            )
+        } catch {
+            guard shouldTreatAttachFailureAsOwnershipConflict(error) else {
+                throw error
+            }
+
+            let retryDelays: [Duration] = [
+                .milliseconds(100),
+                .milliseconds(200),
+                .milliseconds(400),
+                .milliseconds(800),
+            ]
+            var lastError = error
+            for delay in retryDelays {
+                try? await Task.sleep(for: delay)
+                do {
+                    return try await daemon.attachSession(
+                        sessionId: sessionId,
+                        lastEventSeq: lastEventSeq,
+                        clientId: daemonAttachClientID,
+                        traceId: traceId
+                    )
+                } catch {
+                    lastError = error
+                    guard shouldTreatAttachFailureAsOwnershipConflict(error) else {
+                        throw error
+                    }
+                }
+            }
+            throw lastError
+        }
     }
 
     /// Returns true when replay produced any user-visible conversation/tool output.
@@ -1785,6 +2035,14 @@ final class AppState {
     }
 
     private func userFacingPromptError(_ error: Error) -> (inline: String, guidance: String?) {
+        if let promptTimeout = error as? PromptResponseTimeoutError {
+            let seconds = max(1, Int(promptTimeout.seconds.rounded()))
+            return (
+                "Timed out waiting for model response.",
+                "No terminal response was received within \(seconds)s. You can resend the message."
+            )
+        }
+
         if error is CancellationError {
             return (
                 "Connection interrupted while waiting for a response.",
@@ -1833,8 +2091,25 @@ final class AppState {
         return (acpError.errorDescription ?? error.localizedDescription, nil)
     }
 
+    private func normalizePromptSendError(_ error: Error, timeoutSeconds: TimeInterval) -> Error {
+        if let appStateError = error as? AppStateError,
+           case .timeout = appStateError {
+            return PromptResponseTimeoutError(seconds: timeoutSeconds)
+        }
+        return error
+    }
+
     private func addSystemMessage(_ text: String) {
         messages.append(ChatMessage(role: .system, content: text))
+    }
+}
+
+private struct PromptResponseTimeoutError: LocalizedError {
+    let seconds: TimeInterval
+
+    var errorDescription: String? {
+        let roundedSeconds = max(1, Int(seconds.rounded()))
+        return "Timed out waiting for session/prompt after \(roundedSeconds)s"
     }
 }
 
@@ -1843,6 +2118,7 @@ enum AppStateError: Error, LocalizedError {
     case timeout
     case noAvailableAgents
     case agentUnavailable(String)
+    case sessionAttachedByAnotherClient(String)
 
     var errorDescription: String? {
         switch self {
@@ -1850,6 +2126,8 @@ enum AppStateError: Error, LocalizedError {
         case .timeout: "Connection timed out — server did not respond"
         case .noAvailableAgents: "No available ACP agents on this node"
         case .agentUnavailable(let displayName): "\(displayName) is not available on this node"
+        case .sessionAttachedByAnotherClient(let sessionId):
+            "Session \(sessionId) is currently attached by another client. Close that client and retry."
         }
     }
 }

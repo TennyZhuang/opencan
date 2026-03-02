@@ -65,11 +65,20 @@ actor DaemonClient {
     }
 
     /// Attach to an existing session, receiving buffered events since lastEventSeq.
-    func attachSession(sessionId: String, lastEventSeq: UInt64, traceId: String? = nil) async throws -> DaemonAttachResult {
-        let params: JSONValue = .object([
+    func attachSession(
+        sessionId: String,
+        lastEventSeq: UInt64,
+        clientId: String? = nil,
+        traceId: String? = nil
+    ) async throws -> DaemonAttachResult {
+        var payload: [String: JSONValue] = [
             "sessionId": .string(sessionId),
             "lastEventSeq": .int(Int(lastEventSeq))
-        ])
+        ]
+        if let clientId = clientId?.trimmingCharacters(in: .whitespacesAndNewlines), !clientId.isEmpty {
+            payload["clientId"] = .string(clientId)
+        }
+        let params: JSONValue = .object(payload)
         let result = try await client.sendRequest(
             method: DaemonMethods.sessionAttach,
             params: params,

@@ -135,7 +135,7 @@ struct UnifiedSession: Identifiable {
     var displayTitle: String {
         if let title, !title.isEmpty { return title }
         if let daemonTitle, !daemonTitle.isEmpty { return daemonTitle }
-        return String(sessionId.prefix(8))
+        return sessionId
     }
     var agentDisplayName: String? {
         if let known = AgentCommandStore.agent(forAgentID: agentID)?.displayName {
