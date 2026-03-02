@@ -663,8 +663,10 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(accepted)
         XCTAssertTrue(appState.isPrompting)
 
-        let keepAliveTask = Task {
-            for tick in 0..<7 {
+        let keepAliveTask = Task.detached {
+            // Keep updates flowing past at least one 1s poll interval so the
+            // inactivity timeout cannot fire while activity is ongoing.
+            for tick in 0..<20 {
                 await transport.emitSessionTextDeltaForTest(
                     sessionId: sessionId,
                     text: "heartbeat \(tick)"
@@ -673,9 +675,8 @@ final class AppStateTests: XCTestCase {
             }
         }
 
-        // Prompt should still be active while updates keep arriving, even though
-        // total elapsed time is already beyond the base timeout.
-        try await Task.sleep(for: .milliseconds(450))
+        // Prompt should still be active while updates keep arriving.
+        try await Task.sleep(for: .milliseconds(1800))
         XCTAssertTrue(appState.isPrompting)
         XCTAssertFalse(
             appState.messages.contains {
@@ -685,7 +686,7 @@ final class AppStateTests: XCTestCase {
         )
 
         _ = await keepAliveTask.result
-        try await waitFor(timeout: 2) { !self.appState.isPrompting }
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
         XCTAssertTrue(
             appState.messages.contains {
                 $0.role == .system && $0.content.contains("No terminal response")

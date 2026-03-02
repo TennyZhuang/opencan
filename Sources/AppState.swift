@@ -2051,33 +2051,39 @@ final class AppState {
     ) async throws -> StopReason {
         let startedAt = Date()
         markPromptActivity(for: monitorSessionId)
+        let pollIntervalSeconds = min(
+            promptResponsePollIntervalSeconds,
+            max(0.05, inactivityTimeoutSeconds / 2)
+        )
+        let client = service.client
 
-        let sendTask = Task {
-            try await service.sendPrompt(
-                sessionId: sessionId,
-                prompt: prompt,
-                routeToSessionId: routeToSessionId,
-                traceId: traceId
-            )
-        }
-        defer { sendTask.cancel() }
+        return try await withThrowingTaskGroup(of: StopReason.self) { group in
+            group.addTask {
+                try await ACPService(client: client).sendPrompt(
+                    sessionId: sessionId,
+                    prompt: prompt,
+                    routeToSessionId: routeToSessionId,
+                    traceId: traceId
+                )
+            }
 
-        while true {
-            do {
-                return try await withThrowingTimeout(seconds: promptResponsePollIntervalSeconds) {
-                    try await sendTask.value
-                }
-            } catch let appStateError as AppStateError {
-                if case .timeout = appStateError {
-                    if promptInactivitySeconds(for: monitorSessionId, fallback: startedAt) >= inactivityTimeoutSeconds {
+            group.addTask {
+                while true {
+                    try await Task.sleep(for: .seconds(pollIntervalSeconds))
+                    let inactivity = await MainActor.run {
+                        self.promptInactivitySeconds(for: monitorSessionId, fallback: startedAt)
+                    }
+                    if inactivity >= inactivityTimeoutSeconds {
                         throw PromptResponseTimeoutError(seconds: inactivityTimeoutSeconds)
                     }
-                    continue
                 }
-                throw appStateError
-            } catch {
-                throw error
             }
+
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else {
+                throw CancellationError()
+            }
+            return first
         }
     }
 
