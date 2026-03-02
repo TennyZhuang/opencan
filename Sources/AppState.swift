@@ -12,6 +12,8 @@ final class AppState {
     private let daemonAttachClientID = AppState.loadOrCreateDaemonAttachClientID()
     /// Fallback timeout when session/prompt never returns a terminal response.
     var promptResponseTimeoutSeconds: TimeInterval = 45
+    /// Absolute cap for unresolved prompts to avoid hanging forever on stale daemon state.
+    var promptResponseMaxWaitSeconds: TimeInterval = 15 * 60
     /// Poll cadence while waiting for terminal `session/prompt` response.
     private let promptResponsePollIntervalSeconds: TimeInterval = 1
     private static let mentionRegex = try! NSRegularExpression(pattern: #"@[A-Za-z0-9_-]+"#)
@@ -2055,6 +2057,7 @@ final class AppState {
             promptResponsePollIntervalSeconds,
             max(0.05, inactivityTimeoutSeconds / 2)
         )
+        let maxWaitSeconds = max(inactivityTimeoutSeconds, promptResponseMaxWaitSeconds)
         let client = service.client
 
         return try await withThrowingTaskGroup(of: StopReason.self) { group in
@@ -2067,15 +2070,34 @@ final class AppState {
                 )
             }
 
-            group.addTask {
+            group.addTask { @MainActor in
                 while true {
                     try await Task.sleep(for: .seconds(pollIntervalSeconds))
-                    let inactivity = await MainActor.run {
-                        self.promptInactivitySeconds(for: monitorSessionId, fallback: startedAt)
+                    let inactivity = self.promptInactivitySeconds(for: monitorSessionId, fallback: startedAt)
+                    if inactivity < inactivityTimeoutSeconds {
+                        continue
                     }
-                    if inactivity >= inactivityTimeoutSeconds {
-                        throw PromptResponseTimeoutError(seconds: inactivityTimeoutSeconds)
+
+                    let promptStillActive = self.isPrompting && self.currentSessionId == monitorSessionId
+                    if !promptStillActive {
+                        throw CancellationError()
                     }
+
+                    let elapsedSeconds = max(0, Date().timeIntervalSince(startedAt))
+                    if elapsedSeconds >= maxWaitSeconds {
+                        throw PromptResponseTimeoutError(seconds: maxWaitSeconds)
+                    }
+
+                    let shouldKeepWaiting = await self.shouldKeepWaitingForPromptAfterInactivity(
+                        sessionId: monitorSessionId,
+                        traceId: traceId
+                    )
+                    if shouldKeepWaiting {
+                        self.markPromptActivity(for: monitorSessionId)
+                        continue
+                    }
+
+                    throw PromptResponseTimeoutError(seconds: inactivityTimeoutSeconds)
                 }
             }
 
@@ -2085,6 +2107,60 @@ final class AppState {
             }
             return first
         }
+    }
+
+    /// When the watchdog reaches inactivity timeout, confirm whether daemon still
+    /// considers this session actively running before surfacing a timeout to UI.
+    private func shouldKeepWaitingForPromptAfterInactivity(
+        sessionId: String,
+        traceId: String?
+    ) async -> Bool {
+        let cachedState = daemonSessions.first(where: { $0.sessionId == sessionId })?.state
+        guard let daemon = daemonClient else {
+            return isBusyDaemonSessionState(cachedState)
+        }
+
+        do {
+            let sessions = try await daemon.listSessions(traceId: traceId)
+            if let refreshed = sessions.first(where: { $0.sessionId == sessionId }) {
+                if let index = daemonSessions.firstIndex(where: { $0.sessionId == sessionId }) {
+                    daemonSessions[index] = refreshed
+                } else {
+                    daemonSessions.append(refreshed)
+                }
+                let busy = isBusyDaemonSessionState(refreshed.state)
+                if busy {
+                    Log.log(
+                        level: "warning",
+                        component: "AppState",
+                        "prompt watchdog deferred timeout; daemon state=\(refreshed.state)",
+                        traceId: traceId,
+                        sessionId: sessionId
+                    )
+                }
+                return busy
+            }
+            return false
+        } catch {
+            let cachedBusy = isBusyDaemonSessionState(cachedState)
+            Log.log(
+                level: "warning",
+                component: "AppState",
+                "prompt watchdog daemon state check failed (cachedBusy=\(cachedBusy)): \(error.localizedDescription)",
+                traceId: traceId,
+                sessionId: sessionId
+            )
+            return cachedBusy
+        }
+    }
+
+    private func isBusyDaemonSessionState(_ state: String?) -> Bool {
+        guard let normalized = state?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return false
+        }
+        return normalized == "starting"
+            || normalized == "prompting"
+            || normalized == "draining"
     }
 
     private func markPromptActivity(for sessionId: String) {

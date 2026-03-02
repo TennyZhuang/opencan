@@ -695,6 +695,61 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testDaemonPromptingStateDefersInactivityTimeout() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        guard let sessionId = appState.currentSessionId else {
+            XCTFail("Missing current session id")
+            return
+        }
+
+        appState.promptResponseTimeoutSeconds = 0.2
+        appState.promptResponseMaxWaitSeconds = 2.0
+        await transport.setMockPromptShouldHang(true)
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string(sessionId),
+                "cwd": .string("/test/path"),
+                "state": .string("prompting"),
+                "lastEventSeq": .int(1),
+            ]
+        ])
+
+        let accepted = appState.sendMessage("long running prompt without intermediate updates")
+        XCTAssertTrue(accepted)
+
+        try await Task.sleep(for: .milliseconds(700))
+        XCTAssertTrue(appState.isPrompting, "Prompt should stay active while daemon reports prompting")
+        XCTAssertFalse(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Timeout guidance should not appear while daemon still reports prompting"
+        )
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string(sessionId),
+                "cwd": .string("/test/path"),
+                "state": .string("idle"),
+                "lastEventSeq": .int(1),
+            ]
+        ])
+
+        try await waitFor(timeout: 2) { !self.appState.isPrompting }
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Timeout should eventually surface once daemon no longer reports a busy prompt state"
+        )
+    }
+
     func testPromptResponseFromPreviousSessionDoesNotSettleCurrentPrompt() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)
