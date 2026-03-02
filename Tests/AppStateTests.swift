@@ -603,7 +603,7 @@ final class AppStateTests: XCTestCase {
         )
         XCTAssertTrue(
             appState.messages.contains {
-                $0.role == .system && $0.content.contains("No terminal response was received")
+                $0.role == .system && $0.content.contains("No terminal response")
             },
             "Timeout guidance should be shown in system message"
         )
@@ -637,9 +637,60 @@ final class AppStateTests: XCTestCase {
 
         XCTAssertFalse(
             appState.messages.contains {
-                $0.role == .system && $0.content.contains("No terminal response was received")
+                $0.role == .system && $0.content.contains("No terminal response")
             },
             "Prompt timeout should be ignored after prompt_complete"
+        )
+    }
+
+    func testStreamingUpdatesKeepPromptAlivePastBaseTimeout() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        guard let sessionId = appState.currentSessionId else {
+            XCTFail("Missing current session id")
+            return
+        }
+
+        appState.promptResponseTimeoutSeconds = 0.2
+        await transport.setMockPromptShouldHang(true)
+
+        let accepted = appState.sendMessage("keep prompt alive with updates")
+        XCTAssertTrue(accepted)
+        XCTAssertTrue(appState.isPrompting)
+
+        let keepAliveTask = Task {
+            for tick in 0..<7 {
+                await transport.emitSessionTextDeltaForTest(
+                    sessionId: sessionId,
+                    text: "heartbeat \(tick)"
+                )
+                try? await Task.sleep(for: .milliseconds(80))
+            }
+        }
+
+        // Prompt should still be active while updates keep arriving, even though
+        // total elapsed time is already beyond the base timeout.
+        try await Task.sleep(for: .milliseconds(450))
+        XCTAssertTrue(appState.isPrompting)
+        XCTAssertFalse(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Timeout should not trigger while streaming updates are still flowing"
+        )
+
+        _ = await keepAliveTask.result
+        try await waitFor(timeout: 2) { !self.appState.isPrompting }
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Timeout should trigger after streaming updates stop and prompt remains unfinished"
         )
     }
 

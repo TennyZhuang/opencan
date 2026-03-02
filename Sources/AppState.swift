@@ -12,6 +12,8 @@ final class AppState {
     private let daemonAttachClientID = AppState.loadOrCreateDaemonAttachClientID()
     /// Fallback timeout when session/prompt never returns a terminal response.
     var promptResponseTimeoutSeconds: TimeInterval = 45
+    /// Poll cadence while waiting for terminal `session/prompt` response.
+    private let promptResponsePollIntervalSeconds: TimeInterval = 1
     private static let mentionRegex = try! NSRegularExpression(pattern: #"@[A-Za-z0-9_-]+"#)
     private static let daemonAttachClientIDDefaultsKey = "opencan.daemonAttachClientID"
 
@@ -79,6 +81,8 @@ final class AppState {
     private var notificationTask: Task<Void, Never>?
     private var ptyTask: Task<Void, Never>?
     private var isStreamingThought = false
+    /// Last observed prompt-related activity timestamp per session.
+    private var promptLastActivityAt: [String: Date] = [:]
     /// Per-session event sequence tracking for daemon replay.
     private var lastEventSeq: [String: UInt64] = [:]
     /// Session IDs that are allowed to emit events during session/load history replay.
@@ -1070,6 +1074,7 @@ final class AppState {
         daemonUploadProgress = nil
         currentTraceId = nil
         isPrompting = false
+        clearAllPromptActivity()
         isCreatingSession = false
         isLoadingHistory = false
         isUploadingImage = false
@@ -1253,6 +1258,7 @@ final class AppState {
         let assistantMsg = ChatMessage(role: .assistant, isStreaming: true)
         messages.append(assistantMsg)
         isPrompting = true
+        markPromptActivity(for: sessionId)
         forceScrollToBottom = true
 
         let traceId = newTraceId()
@@ -1272,14 +1278,15 @@ final class AppState {
                     traceId: traceId,
                     sessionId: sessionId
                 ) {
-                    try await withThrowingTimeout(seconds: timeoutSeconds) {
-                        try await service.sendPrompt(
-                            sessionId: promptTarget.sessionId,
-                            prompt: promptBlocks,
-                            routeToSessionId: promptTarget.routeToSessionId,
-                            traceId: traceId
-                        )
-                    }
+                    try await self.sendPromptAwaitingTerminalResponse(
+                        service: service,
+                        sessionId: promptTarget.sessionId,
+                        prompt: promptBlocks,
+                        routeToSessionId: promptTarget.routeToSessionId,
+                        monitorSessionId: sessionId,
+                        traceId: traceId,
+                        inactivityTimeoutSeconds: timeoutSeconds
+                    )
                 }
                 let promptStillActive = self.isPrompting && self.currentSessionId == sessionId
                 guard promptStillActive else {
@@ -1297,6 +1304,7 @@ final class AppState {
                     msg.isStreaming = false
                 }
                 self.isPrompting = false
+                self.clearPromptActivity(for: sessionId)
             } catch {
                 let normalizedError = self.normalizePromptSendError(error, timeoutSeconds: timeoutSeconds)
                 let promptStillActive = self.isPrompting && self.currentSessionId == sessionId
@@ -1322,6 +1330,7 @@ final class AppState {
                     msg.isStreaming = false
                 }
                 self.isPrompting = false
+                self.clearPromptActivity(for: sessionId)
                 self.forceScrollToBottom = true
                 Task { await self.refreshDaemonSessions() }
             }
@@ -1512,6 +1521,10 @@ final class AppState {
     }
 
     private func handleSessionEvent(_ event: SessionEvent, sessionId: String? = nil) {
+        if let sessionId, isPrompting {
+            markPromptActivity(for: sessionId)
+        }
+
         // Reset thought-streaming flag when a different event type arrives
         if case .thoughtDelta = event {} else {
             isStreamingThought = false
@@ -1592,6 +1605,11 @@ final class AppState {
                 msg.isStreaming = false
             }
             isPrompting = false
+            if let sessionId {
+                clearPromptActivity(for: sessionId)
+            } else if let currentSessionId {
+                clearPromptActivity(for: currentSessionId)
+            }
             Task { await self.refreshDaemonSessions() }
             // Force scroll regardless of isNearBottom — the final content
             // must be visible even if the anchor drifted off-screen.
@@ -1816,6 +1834,7 @@ final class AppState {
     /// End in-flight prompt UI when transitioning away from the current session.
     private func settlePromptingStateForSessionSwitch(clearMessages: Bool) {
         isPrompting = false
+        clearAllPromptActivity()
         for msg in messages where msg.isStreaming {
             msg.isStreaming = false
         }
@@ -2019,6 +2038,66 @@ final class AppState {
         historySystemPromptMessageIdBySession.removeValue(forKey: sessionId)
     }
 
+    /// Wait for terminal `session/prompt` response with an inactivity timeout.
+    /// As long as streaming updates keep arriving, we keep waiting past the base timeout.
+    private func sendPromptAwaitingTerminalResponse(
+        service: ACPService,
+        sessionId: String,
+        prompt: [PromptBlock],
+        routeToSessionId: String?,
+        monitorSessionId: String,
+        traceId: String?,
+        inactivityTimeoutSeconds: TimeInterval
+    ) async throws -> StopReason {
+        let startedAt = Date()
+        markPromptActivity(for: monitorSessionId)
+
+        let sendTask = Task {
+            try await service.sendPrompt(
+                sessionId: sessionId,
+                prompt: prompt,
+                routeToSessionId: routeToSessionId,
+                traceId: traceId
+            )
+        }
+        defer { sendTask.cancel() }
+
+        while true {
+            do {
+                return try await withThrowingTimeout(seconds: promptResponsePollIntervalSeconds) {
+                    try await sendTask.value
+                }
+            } catch let appStateError as AppStateError {
+                if case .timeout = appStateError {
+                    if promptInactivitySeconds(for: monitorSessionId, fallback: startedAt) >= inactivityTimeoutSeconds {
+                        throw PromptResponseTimeoutError(seconds: inactivityTimeoutSeconds)
+                    }
+                    continue
+                }
+                throw appStateError
+            } catch {
+                throw error
+            }
+        }
+    }
+
+    private func markPromptActivity(for sessionId: String) {
+        promptLastActivityAt[sessionId] = Date()
+    }
+
+    private func clearPromptActivity(for sessionId: String) {
+        promptLastActivityAt.removeValue(forKey: sessionId)
+    }
+
+    private func clearAllPromptActivity() {
+        promptLastActivityAt.removeAll()
+    }
+
+    private func promptInactivitySeconds(for sessionId: String, fallback: Date) -> TimeInterval {
+        let lastActivity = promptLastActivityAt[sessionId] ?? fallback
+        return max(0, Date().timeIntervalSince(lastActivity))
+    }
+
     /// Present a concise prompt failure in chat and add actionable guidance.
     private func presentPromptError(_ error: Error) {
         let presentation = userFacingPromptError(error)
@@ -2039,7 +2118,7 @@ final class AppState {
             let seconds = max(1, Int(promptTimeout.seconds.rounded()))
             return (
                 "Timed out waiting for model response.",
-                "No terminal response was received within \(seconds)s. You can resend the message."
+                "No terminal response or streaming updates were received within \(seconds)s. You can resend the message."
             )
         }
 
