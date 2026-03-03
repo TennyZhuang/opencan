@@ -1,6 +1,12 @@
 import XCTest
 
 final class OpenCANUIIntegrationTests: XCTestCase {
+    private struct IntegrationConfig {
+        let environment: [String: String]
+        let nodeName: String
+        let workspaceName: String
+    }
+
     private let integrationEnvKeys = [
         "OPENCAN_TEST_NODE_NAME",
         "OPENCAN_TEST_NODE_HOST",
@@ -143,10 +149,8 @@ final class OpenCANUIIntegrationTests: XCTestCase {
         }
     }
 
-    func testIntegrationSendMessage() throws {
-        let integrationApp = XCUIApplication()
+    private func integrationConfig() throws -> IntegrationConfig {
         let integrationEnv = try integrationLaunchEnvironment()
-
         guard
             nonEmpty(integrationEnv["OPENCAN_TEST_NODE_HOST"]) != nil,
             nonEmpty(integrationEnv["OPENCAN_TEST_NODE_USERNAME"]) != nil,
@@ -160,36 +164,72 @@ final class OpenCANUIIntegrationTests: XCTestCase {
             )
         }
 
-        let nodeName = nonEmpty(integrationEnv["OPENCAN_TEST_NODE_NAME"]) ?? "integration-target"
-        let workspaceName = nonEmpty(integrationEnv["OPENCAN_TEST_WORKSPACE_NAME"]) ?? "home"
+        return IntegrationConfig(
+            environment: integrationEnv,
+            nodeName: nonEmpty(integrationEnv["OPENCAN_TEST_NODE_NAME"]) ?? "integration-target",
+            workspaceName: nonEmpty(integrationEnv["OPENCAN_TEST_WORKSPACE_NAME"]) ?? "home"
+        )
+    }
 
-        integrationApp.launchArguments = ["--uitesting", "--uitesting-integration"]
-        integrationApp.launchEnvironment = integrationEnv
-        integrationApp.launch()
+    private func launchIntegrationApp(config: IntegrationConfig) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["--uitesting", "--uitesting-integration"]
+        app.launchEnvironment = config.environment
+        app.launch()
+        return app
+    }
 
-        let targetNode = integrationApp.cells.staticTexts.matching(
-            NSPredicate(format: "label == %@", nodeName)
+    private func openWorkspace(_ config: IntegrationConfig, in app: XCUIApplication) {
+        let targetNode = app.cells.staticTexts.matching(
+            NSPredicate(format: "label == %@", config.nodeName)
         ).firstMatch
-        XCTAssertTrue(targetNode.waitForExistence(timeout: 8), "Node '\(nodeName)' not found")
+        XCTAssertTrue(targetNode.waitForExistence(timeout: 8), "Node '\(config.nodeName)' not found")
         targetNode.tap()
 
-        let workspace = integrationApp.cells.staticTexts.matching(
-            NSPredicate(format: "label == %@", workspaceName)
+        let workspace = app.cells.staticTexts.matching(
+            NSPredicate(format: "label == %@", config.workspaceName)
         ).firstMatch
-        XCTAssertTrue(workspace.waitForExistence(timeout: 8), "Workspace '\(workspaceName)' not found")
+        XCTAssertTrue(workspace.waitForExistence(timeout: 8), "Workspace '\(config.workspaceName)' not found")
         workspace.tap()
+    }
 
-        let newSessionButton = integrationApp.buttons["New Session"]
+    private func waitForSessionPicker(_ config: IntegrationConfig, in app: XCUIApplication) throws {
+        let newSessionButton = app.buttons["New Session"]
         guard newSessionButton.waitForExistence(timeout: 30) else {
-            throw XCTSkip("Could not connect to integration target '\(nodeName)' — server may be unreachable")
+            throw XCTSkip("Could not connect to integration target '\(config.nodeName)' — server may be unreachable")
         }
+    }
 
-        tapNewSession(in: integrationApp)
+    private func createSession(_ config: IntegrationConfig, in app: XCUIApplication) throws {
+        tapNewSession(in: app)
 
-        let systemMessage = integrationApp.staticTexts["New session on home"]
+        let systemMessage = app.staticTexts["New session on \(config.workspaceName)"]
         guard systemMessage.waitForExistence(timeout: 15) else {
             throw XCTSkip("Session creation timed out — server may be unreachable")
         }
+    }
+
+    func testIntegrationCreateSession() throws {
+        let config = try integrationConfig()
+        let integrationApp = launchIntegrationApp(config: config)
+        openWorkspace(config, in: integrationApp)
+        try waitForSessionPicker(config, in: integrationApp)
+        try createSession(config, in: integrationApp)
+    }
+
+    func testIntegrationConnectsToSessionPicker() throws {
+        let config = try integrationConfig()
+        let integrationApp = launchIntegrationApp(config: config)
+        openWorkspace(config, in: integrationApp)
+        try waitForSessionPicker(config, in: integrationApp)
+    }
+
+    func testIntegrationSendMessage() throws {
+        let config = try integrationConfig()
+        let integrationApp = launchIntegrationApp(config: config)
+        openWorkspace(config, in: integrationApp)
+        try waitForSessionPicker(config, in: integrationApp)
+        try createSession(config, in: integrationApp)
 
         let textField = integrationApp.textFields.firstMatch
         guard textField.waitForExistence(timeout: 5) else {
@@ -204,6 +244,31 @@ final class OpenCANUIIntegrationTests: XCTestCase {
         XCTAssertTrue(
             userMessage.waitForExistence(timeout: 5),
             "User message should appear in chat"
+        )
+    }
+
+    func testIntegrationResumeSessionFromSessionPicker() throws {
+        let config = try integrationConfig()
+        let integrationApp = launchIntegrationApp(config: config)
+        openWorkspace(config, in: integrationApp)
+        try waitForSessionPicker(config, in: integrationApp)
+        try createSession(config, in: integrationApp)
+
+        let backButton = integrationApp.navigationBars.buttons.element(boundBy: 0)
+        XCTAssertTrue(backButton.waitForExistence(timeout: 5))
+        backButton.tap()
+
+        let sessionRow = integrationApp.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH 'mock-sess'")
+        ).firstMatch
+        guard sessionRow.waitForExistence(timeout: 10) else {
+            throw XCTSkip("No resumable session row found after creating a session")
+        }
+        sessionRow.tap()
+
+        XCTAssertTrue(
+            integrationApp.buttons["Disconnect"].waitForExistence(timeout: 8),
+            "Expected to enter chat after resuming a session"
         )
     }
 }

@@ -136,7 +136,20 @@ OPENCAN_TEST_JUMP_KEY_PATH=
 EOF
 wrote_temp_dotenv=1
 
-xcodebuild test \
-  -scheme OpenCAN \
-  -destination "platform=iOS Simulator,name=iPhone 17 Pro" \
-  -only-testing:OpenCANUIIntegrationTests/OpenCANUIIntegrationTests/testIntegrationSendMessage
+test_mode="${OPENCAN_INTEGRATION_TEST_MODE:-smoke}"
+test_selector="-only-testing:OpenCANUIIntegrationTests/OpenCANUIIntegrationTests/testIntegrationSendMessage"
+if [[ "$test_mode" == "full" ]]; then
+  test_selector=""
+fi
+
+if [[ -n "$test_selector" ]]; then
+  xcodebuild test \
+    -scheme OpenCAN \
+    -destination "platform=iOS Simulator,name=iPhone 17 Pro" \
+    "$test_selector"
+else
+  xcodebuild test \
+    -scheme OpenCAN \
+    -destination "platform=iOS Simulator,name=iPhone 17 Pro" \
+    -only-testing:OpenCANUIIntegrationTests/OpenCANUIIntegrationTests
+fi

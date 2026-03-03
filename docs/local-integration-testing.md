@@ -106,9 +106,16 @@ What it does:
    - `OPENCAN_DAEMON_BUNDLE_TARGETS=linux-amd64,darwin-<local-arch>`
    - `OPENCAN_TEST_AGENT_COMMAND=~/.opencan/bin/mock-acp-server`
 5. Runs:
-   - `xcodebuild test -scheme OpenCAN -destination "platform=iOS Simulator,name=iPhone 17 Pro" -only-testing:OpenCANUIIntegrationTests/OpenCANUIIntegrationTests/testIntegrationSendMessage`
+   - default (`OPENCAN_INTEGRATION_TEST_MODE=smoke`): only `testIntegrationSendMessage`
+   - optional (`OPENCAN_INTEGRATION_TEST_MODE=full`): full `OpenCANUIIntegrationTests` target
 
 If the script started sshd, it stops it on exit.
+
+To run the full integration suite manually:
+
+```bash
+OPENCAN_INTEGRATION_TEST_MODE=full ./Scripts/run-local-integration.sh
+```
 
 ## Debugging
 

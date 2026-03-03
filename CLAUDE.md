@@ -140,7 +140,7 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
 - **XcodeGen** (`project.yml`) generates `.xcodeproj`; run `xcodegen generate` after file list changes.
 - **Unit tests:** `AppStateTests` cover agent probing/fallback, image mention prompts, resume/recovery routing, interrupted-session auto reconnect paths, detach-before-switch, cross-session filtering, dead-session recovery, and empty-session pruning.
 - **Other tests:** `ACPClientTests`, `SessionPickerPathMatchingTests`, `SessionUpdateParserTests`, `JSONRPCMessageTests`.
-- **UI tests** (`OpenCANUITests`) cover mock-backed navigation, session creation, sending, resume, and loading state. SSH/daemon end-to-end coverage lives in `OpenCANUIIntegrationTests` (see `testIntegrationSendMessage`).
+- **UI tests** (`OpenCANUITests`) cover mock-backed navigation, session creation, sending, resume, and loading state. SSH/daemon end-to-end coverage lives in `OpenCANUIIntegrationTests` (connect/create/send/resume flows).
 
 **Daemon architecture:**
 - `opencan-daemon/` contains the Go daemon source. See `docs/daemon-architecture.md` for protocol/lifecycle details.
