@@ -38,7 +38,7 @@ xcrun devicectl device copy from --device $DEVICE \
 
 App logs are JSON lines (`LogEntry`). Daemon logs are also structured JSON and live on the remote host at `~/.opencan/daemon.log` (rotates to `daemon.log.prev` at 10MB).
 
-No linter is configured. A UI test target (`OpenCANUITests`) exists in `project.yml`.
+No linter is configured. UI test targets (`OpenCANUITests`, `OpenCANUIIntegrationTests`) exist in `project.yml`.
 
 ## Daemon Build & Test
 
@@ -140,7 +140,7 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
 - **XcodeGen** (`project.yml`) generates `.xcodeproj`; run `xcodegen generate` after file list changes.
 - **Unit tests:** `AppStateTests` cover agent probing/fallback, image mention prompts, resume/recovery routing, interrupted-session auto reconnect paths, detach-before-switch, cross-session filtering, dead-session recovery, and empty-session pruning.
 - **Other tests:** `ACPClientTests`, `SessionPickerPathMatchingTests`, `SessionUpdateParserTests`, `JSONRPCMessageTests`.
-- **UI tests** (`OpenCANUITests`) cover navigation, session creation, sending, resume, and loading state. E2E tests require reachable cp32 server and use `XCTSkip` when unavailable.
+- **UI tests** (`OpenCANUITests`) cover mock-backed navigation, session creation, sending, resume, and loading state. SSH/daemon end-to-end coverage lives in `OpenCANUIIntegrationTests` (see `testIntegrationSendMessage`).
 
 **Daemon architecture:**
 - `opencan-daemon/` contains the Go daemon source. See `docs/daemon-architecture.md` for protocol/lifecycle details.

@@ -136,13 +136,11 @@ actor SSHConnectionManager {
             throw SSHError.notConnected
         }
 
-        // Load the binary from the app bundle
-        guard let bundleURL = Bundle.main.url(
-            forResource: "opencan-daemon-linux-amd64",
-            withExtension: nil
-        ) else {
-            throw SSHError.daemonBinaryNotFound
-        }
+        // Select the bundled daemon that matches the remote host platform.
+        // Falls back to linux-amd64 only when remote detection is unavailable.
+        let remoteTarget = try await detectRemoteDaemonTarget(client: client)
+        let (bundleName, bundleURL) = try bundledDaemonBinary(remoteTarget: remoteTarget)
+        Log.toFile("[SSH] Using bundled daemon \(bundleName)")
         let binaryData = try Data(contentsOf: bundleURL)
         let localHash = sha256Hex(binaryData)
 
@@ -415,6 +413,70 @@ actor SSHConnectionManager {
             _ = CC_SHA256(ptr.baseAddress, CC_LONG(data.count), &digest)
         }
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func bundledDaemonBinary(remoteTarget: String?) throws -> (name: String, url: URL) {
+        if let remoteTarget {
+            let preferredName = "opencan-daemon-\(remoteTarget)"
+            if let preferredURL = Bundle.main.url(forResource: preferredName, withExtension: nil) {
+                return (preferredName, preferredURL)
+            }
+            if remoteTarget != "linux-amd64" {
+                Log.toFile("[SSH] Missing bundled daemon for remote target \(remoteTarget)")
+                throw SSHError.daemonBinaryNotFound
+            }
+        }
+
+        let fallbackName = "opencan-daemon-linux-amd64"
+        guard let fallbackURL = Bundle.main.url(forResource: fallbackName, withExtension: nil) else {
+            throw SSHError.daemonBinaryNotFound
+        }
+        return (fallbackName, fallbackURL)
+    }
+
+    private func detectRemoteDaemonTarget(client: SSHClient) async throws -> String? {
+        do {
+            let output = try await client.executeCommand("uname -s 2>/dev/null; uname -m 2>/dev/null")
+            let lines = String(buffer: output)
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard lines.count >= 2 else {
+                return nil
+            }
+
+            guard let os = normalizeRemoteOS(lines[0]), let arch = normalizeRemoteArch(lines[1]) else {
+                Log.toFile("[SSH] Unsupported remote platform: os='\(lines[0])' arch='\(lines[1])'")
+                return nil
+            }
+            return "\(os)-\(arch)"
+        } catch {
+            Log.toFile("[SSH] Failed to detect remote platform, defaulting to linux-amd64: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func normalizeRemoteOS(_ raw: String) -> String? {
+        let value = raw.lowercased()
+        if value.contains("linux") {
+            return "linux"
+        }
+        if value.contains("darwin") {
+            return "darwin"
+        }
+        return nil
+    }
+
+    private func normalizeRemoteArch(_ raw: String) -> String? {
+        let value = raw.lowercased()
+        switch value {
+        case "x86_64", "amd64":
+            return "amd64"
+        case "arm64", "aarch64", "arm64e":
+            return "arm64"
+        default:
+            return nil
+        }
     }
 
     private func loadPrivateKey(pem data: Data) throws -> Insecure.RSA.PrivateKey {

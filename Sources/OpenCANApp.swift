@@ -80,11 +80,19 @@ struct OpenCANApp: App {
         let workspaceName = envValue("OPENCAN_TEST_WORKSPACE_NAME", in: env) ?? "home"
         let nodePort = Int(envValue("OPENCAN_TEST_NODE_PORT", in: env) ?? "") ?? 22
         let nodeKeyPEM = nodeKeyPEMRaw.replacingOccurrences(of: "\\n", with: "\n")
+        let integrationAgentCommand = envValue("OPENCAN_TEST_AGENT_COMMAND", in: env)
 
         let context = ModelContext(modelContainer)
         var createdKeys: [SSHKeyPair] = []
 
         do {
+            if let integrationAgentCommand {
+                // Force integration runs to use a deterministic local ACP command.
+                let defaults = UserDefaults.standard
+                defaults.set(integrationAgentCommand, forKey: AgentCommandStore.claudeCommandKey)
+                defaults.set(AgentKind.claude.rawValue, forKey: AgentCommandStore.defaultAgentKey)
+            }
+
             // Keep integration runs deterministic by resetting persisted connection data.
             let existingSessions = try context.fetch(FetchDescriptor<Session>())
             for session in existingSessions {

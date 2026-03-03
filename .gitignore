@@ -27,5 +27,6 @@ Resources/opencan-daemon-linux-amd64
 # Local environment and SSH keys
 .env
 .env.local
+.local-ssh/
 *.pem
 id_rsa*
