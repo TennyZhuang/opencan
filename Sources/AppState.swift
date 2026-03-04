@@ -1884,7 +1884,49 @@ final class AppState {
                         sessionId: newSessionId
                     )
                 }
+                self.currentSessionId = nil
+                self.lastEventSeq.removeValue(forKey: newSessionId)
                 continue
+            }
+
+            // Only persist a takeover mapping after session/load succeeds.
+            // Otherwise we can permanently rewrite local session IDs to
+            // throwaway managed IDs that cannot be loaded later.
+            guard loadResult.loadedCwd != nil else {
+                var failureExtra = acpErrorObservabilityExtra(loadResult.lastError)
+                failureExtra["candidateCommand"] = candidateCommand
+                failureExtra["takeoverAttempt"] = "\(index + 1)"
+                failureExtra["takeoverAttemptCount"] = "\(commandCandidates.count)"
+                failureExtra["externalSessionCwd"] = externalSessionCwd
+                Log.log(
+                    level: "warning",
+                    component: "AppState",
+                    "external takeover load failed; aborting takeover without persisting managed session id",
+                    traceId: traceId,
+                    sessionId: externalSessionId,
+                    extra: failureExtra
+                )
+                do {
+                    try await daemon.killSession(sessionId: newSessionId, traceId: traceId)
+                } catch {
+                    Log.log(
+                        level: "warning",
+                        component: "AppState",
+                        "failed to cleanup failed takeover session \(newSessionId): \(error.localizedDescription)",
+                        traceId: traceId,
+                        sessionId: newSessionId
+                    )
+                }
+                self.currentSessionId = previousSessionId
+                self.lastEventSeq.removeValue(forKey: newSessionId)
+                await restorePreviousAttachmentIfNeeded(
+                    previousSessionId: previousSessionId,
+                    previousSessionAttachSeq: previousSessionAttachSeq,
+                    failedTargetSessionId: newSessionId,
+                    daemon: daemon,
+                    traceId: traceId
+                )
+                throw AppStateError.sessionNotRecoverable(externalSessionId)
             }
 
             selectedSessionId = newSessionId

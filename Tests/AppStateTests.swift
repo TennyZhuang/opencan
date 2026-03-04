@@ -1521,6 +1521,87 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testResumeExternalSessionTakeoverLoadFailureDoesNotPersistManagedSessionID() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAgentAvailabilityByID([
+            "claude": true,
+            "codex": true,
+        ])
+        await appState.refreshAvailableAgents()
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string("external-session-fail"),
+                "cwd": .string("/test/path"),
+                "state": .string("external"),
+                "lastEventSeq": .int(0),
+            ]
+        ])
+        await transport.setMockLoadFailSessionIDs(["external-session-fail"])
+        await appState.refreshDaemonSessions()
+
+        let local = Session(sessionId: "external-session-fail", workspace: workspace)
+        modelContext.insert(local)
+        try modelContext.save()
+
+        do {
+            try await appState.resumeSession(sessionId: "external-session-fail", modelContext: modelContext)
+            XCTFail("Expected resumeSession to fail when takeover load fails for all commands")
+        } catch let error as AppStateError {
+            guard case .sessionNotRecoverable(let sessionId) = error else {
+                XCTFail("Expected sessionNotRecoverable, got \(error)")
+                return
+            }
+            XCTAssertEqual(sessionId, "external-session-fail")
+        }
+
+        let sessions = try modelContext.fetch(FetchDescriptor<Session>())
+        XCTAssertTrue(sessions.contains { $0.sessionId == "external-session-fail" })
+        XCTAssertFalse(sessions.contains { $0.sessionId.hasPrefix("mock-sess-") })
+
+        let createCommands = await transport.getCreateCommands()
+        XCTAssertGreaterThanOrEqual(createCommands.count, 2)
+
+        let killed = await transport.getKilledSessionIds()
+        XCTAssertEqual(killed.count, createCommands.count, "All failed takeover sessions should be cleaned up")
+    }
+
+    func testResumeMissingSessionTakeoverFailureMarksSessionDead() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAttachShouldFail(true)
+        await transport.setMockLoadFailSessionIDs(["missing-session-dead"])
+
+        let missing = Session(sessionId: "missing-session-dead", workspace: workspace)
+        modelContext.insert(missing)
+        try modelContext.save()
+
+        do {
+            try await appState.resumeSession(sessionId: "missing-session-dead", modelContext: modelContext)
+            XCTFail("Expected resumeSession to fail")
+        } catch let error as AppStateError {
+            guard case .sessionNotRecoverable(let sessionId) = error else {
+                XCTFail("Expected sessionNotRecoverable, got \(error)")
+                return
+            }
+            XCTAssertEqual(sessionId, "missing-session-dead")
+        }
+
+        let deadEntry = appState.daemonSessions.first { $0.sessionId == "missing-session-dead" }
+        XCTAssertEqual(deadEntry?.state, "dead")
+    }
+
     func testResumeExternalSessionTakeoverCleansCreatedSessionWhenAttachFails() async throws {
         try await connectMock()
 
