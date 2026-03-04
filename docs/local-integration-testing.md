@@ -2,7 +2,7 @@
 
 ## Motivation
 
-`OpenCANUIIntegrationTests.testIntegrationSendMessage` currently depends on an external SSH host. That makes failures hard to reproduce and blocks CI/local debugging when infra is unavailable.
+`OpenCANUIIntegrationTests.testIntegrationSmoke` currently depends on an external SSH host. That makes failures hard to reproduce and blocks CI/local debugging when infra is unavailable.
 
 This workflow runs the full stack against `localhost`:
 
@@ -65,7 +65,7 @@ What it does:
 
 - creates `.local-ssh/test_key` (RSA private key used by UITest seed)
 - creates `.local-ssh/host_key` (isolated sshd host key)
-- appends `test_key.pub` to `~/.ssh/authorized_keys`
+- appends `test_key.pub` to `~/.ssh/authorized_keys` (persistent until manually removed)
 - writes `.local-ssh/sshd_config` with key-only auth on `127.0.0.1:22222`
 - configures `Subsystem sftp /usr/libexec/sftp-server` (required for daemon upload)
 
@@ -105,8 +105,10 @@ What it does:
 4. Exports:
    - `OPENCAN_DAEMON_BUNDLE_TARGETS=linux-amd64,darwin-<local-arch>`
    - `OPENCAN_TEST_AGENT_COMMAND=~/.opencan/bin/mock-acp-server`
+   - `OPENCAN_TEST_DOTENV_PATH=<temp file>` (generated per run, leaves your existing `.env` untouched)
 5. Runs:
-   - default (`OPENCAN_INTEGRATION_TEST_MODE=smoke`): only `testIntegrationSendMessage`
+   - default (`OPENCAN_INTEGRATION_TEST_MODE=smoke`): only `testIntegrationSmoke`
+     - override smoke entrypoint with `OPENCAN_INTEGRATION_SMOKE_TEST=<TestMethodName>`
    - optional (`OPENCAN_INTEGRATION_TEST_MODE=full`): full `OpenCANUIIntegrationTests` target
 
 If the script started sshd, it stops it on exit.
@@ -133,4 +135,5 @@ tail -f "$CONTAINER/Documents/opencan.log"
 
 - macOS may require enabling **Remote Login** (System Settings > General > Sharing).
 - Port `22222` is configurable via `OPENCAN_LOCAL_SSH_PORT` when running scripts.
+- `setup-local-ssh.sh` leaves its test key in `~/.ssh/authorized_keys`; the script prints a removal command.
 - This validates local macOS-hosted SSH flows; it is not a substitute for Linux remote compatibility tests.

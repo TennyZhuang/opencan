@@ -119,15 +119,15 @@ struct UnifiedSession: Identifiable {
         self.agentCommand = agentCommand
     }
 
-    var displayState: String { daemonState ?? "history" }
-    /// Even dead daemon sessions are resumable via history recovery.
+    var displayState: String { daemonState ?? "dead" }
+    /// Session rows stay actionable so takeover/recovery flows can be initiated in-UI.
     var isResumable: Bool { true }
     /// Placeholder sessions with no title/events are typically accidental.
     var isEmptyPlaceholder: Bool {
         let hasLocalTitle = !(title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         let hasDaemonTitle = !(daemonTitle?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         let hasEvents = (lastEventSeq ?? 0) > 0
-        let state = daemonState ?? "history"
+        let state = daemonState ?? "dead"
         let isRunning = state == "starting" || state == "prompting" || state == "draining"
         let isExternal = state == "external"
         return !hasLocalTitle && !hasDaemonTitle && !hasEvents && !isRunning && !isExternal

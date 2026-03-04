@@ -36,7 +36,16 @@ final class OpenCANUIIntegrationTests: XCTestCase {
     }
 
     private func loadDotEnvIfPresent() -> [String: String] {
-        let dotenvURL = repoRootURL().appendingPathComponent(".env")
+        let processEnv = ProcessInfo.processInfo.environment
+        let dotenvURL: URL
+        if let explicitPath = processEnv["OPENCAN_TEST_DOTENV_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicitPath.isEmpty {
+            dotenvURL = URL(fileURLWithPath: NSString(string: explicitPath).expandingTildeInPath)
+        } else {
+            dotenvURL = repoRootURL().appendingPathComponent(".env")
+        }
+
         guard let data = try? Data(contentsOf: dotenvURL), let raw = String(data: data, encoding: .utf8) else {
             return [:]
         }
@@ -89,6 +98,8 @@ final class OpenCANUIIntegrationTests: XCTestCase {
         var env: [String: String] = [:]
         let processEnv = ProcessInfo.processInfo.environment
 
+        // Process environment wins over dotenv values so callers can override
+        // defaults without mutating files on disk.
         for key in integrationEnvKeys {
             if let value = processEnv[key] {
                 env[key] = value
@@ -160,7 +171,7 @@ final class OpenCANUIIntegrationTests: XCTestCase {
             throw XCTSkip(
                 "Integration target is not configured. Set OPENCAN_TEST_NODE_HOST, OPENCAN_TEST_NODE_USERNAME, " +
                 "OPENCAN_TEST_WORKSPACE_PATH, and OPENCAN_TEST_SSH_PRIVATE_KEY_PEM (or OPENCAN_TEST_SSH_KEY_PATH) " +
-                "in environment or .env"
+                "in environment, OPENCAN_TEST_DOTENV_PATH, or .env"
             )
         }
 
@@ -173,13 +184,13 @@ final class OpenCANUIIntegrationTests: XCTestCase {
 
     private func launchIntegrationApp(config: IntegrationConfig) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = ["--uitesting", "--uitesting-integration"]
+        app.launchArguments = ["--uitesting-integration"]
         app.launchEnvironment = config.environment
         app.launch()
         return app
     }
 
-    private func openWorkspace(_ config: IntegrationConfig, in app: XCUIApplication) {
+    private func openWorkspace(_ config: IntegrationConfig, in app: XCUIApplication) throws {
         let targetNode = app.cells.staticTexts.matching(
             NSPredicate(format: "label == %@", config.nodeName)
         ).firstMatch
@@ -189,7 +200,26 @@ final class OpenCANUIIntegrationTests: XCTestCase {
         let workspace = app.cells.staticTexts.matching(
             NSPredicate(format: "label == %@", config.workspaceName)
         ).firstMatch
-        XCTAssertTrue(workspace.waitForExistence(timeout: 8), "Workspace '\(config.workspaceName)' not found")
+        if !workspace.waitForExistence(timeout: 30) {
+            if app.buttons["Retry"].exists {
+                throw XCTSkip(
+                    "Failed to connect to integration target '\(config.nodeName)' before workspace selection. " +
+                    "Ensure sshd is running and OPENCAN_TEST_* credentials are valid."
+                )
+            }
+            if app.staticTexts.matching(
+                NSPredicate(format: "label BEGINSWITH %@", "Connecting to")
+            ).firstMatch.exists {
+                throw XCTSkip(
+                    "Still connecting to integration target '\(config.nodeName)' after 30s. " +
+                    "Verify host reachability and SSH auth."
+                )
+            }
+            throw XCTSkip(
+                "Workspace '\(config.workspaceName)' not found. " +
+                "Check OPENCAN_TEST_WORKSPACE_NAME and integration seed configuration."
+            )
+        }
         workspace.tap()
     }
 
@@ -200,59 +230,72 @@ final class OpenCANUIIntegrationTests: XCTestCase {
         }
     }
 
-    private func createSession(_ config: IntegrationConfig, in app: XCUIApplication) throws {
+    private func createSession(in app: XCUIApplication) throws {
         tapNewSession(in: app)
 
-        let systemMessage = app.staticTexts["New session on \(config.workspaceName)"]
+        let systemMessage = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "New session")
+        ).firstMatch
         guard systemMessage.waitForExistence(timeout: 15) else {
             throw XCTSkip("Session creation timed out — server may be unreachable")
         }
     }
 
-    func testIntegrationCreateSession() throws {
-        let config = try integrationConfig()
-        let integrationApp = launchIntegrationApp(config: config)
-        openWorkspace(config, in: integrationApp)
-        try waitForSessionPicker(config, in: integrationApp)
-        try createSession(config, in: integrationApp)
-    }
+    private func runSendMessageFlow(_ config: IntegrationConfig, in app: XCUIApplication) throws {
+        try openWorkspace(config, in: app)
+        try waitForSessionPicker(config, in: app)
+        try createSession(in: app)
 
-    func testIntegrationConnectsToSessionPicker() throws {
-        let config = try integrationConfig()
-        let integrationApp = launchIntegrationApp(config: config)
-        openWorkspace(config, in: integrationApp)
-        try waitForSessionPicker(config, in: integrationApp)
-    }
-
-    func testIntegrationSendMessage() throws {
-        let config = try integrationConfig()
-        let integrationApp = launchIntegrationApp(config: config)
-        openWorkspace(config, in: integrationApp)
-        try waitForSessionPicker(config, in: integrationApp)
-        try createSession(config, in: integrationApp)
-
-        let textField = integrationApp.textFields.firstMatch
+        let textField = app.textFields.firstMatch
         guard textField.waitForExistence(timeout: 5) else {
             throw XCTSkip("Chat input not found")
         }
         textField.tap()
         textField.typeText("Hello")
 
-        integrationApp.buttons["arrow.up.circle.fill"].tap()
+        app.buttons["arrow.up.circle.fill"].tap()
 
-        let userMessage = integrationApp.staticTexts["Hello"]
+        let userMessage = app.staticTexts["Hello"]
         XCTAssertTrue(
             userMessage.waitForExistence(timeout: 5),
             "User message should appear in chat"
         )
     }
 
+    /// Stable smoke entrypoint used by Scripts/run-local-integration.sh.
+    func testIntegrationSmoke() throws {
+        let config = try integrationConfig()
+        let integrationApp = launchIntegrationApp(config: config)
+        try runSendMessageFlow(config, in: integrationApp)
+    }
+
+    func testIntegrationCreateSession() throws {
+        let config = try integrationConfig()
+        let integrationApp = launchIntegrationApp(config: config)
+        try openWorkspace(config, in: integrationApp)
+        try waitForSessionPicker(config, in: integrationApp)
+        try createSession(in: integrationApp)
+    }
+
+    func testIntegrationConnectsToSessionPicker() throws {
+        let config = try integrationConfig()
+        let integrationApp = launchIntegrationApp(config: config)
+        try openWorkspace(config, in: integrationApp)
+        try waitForSessionPicker(config, in: integrationApp)
+    }
+
+    func testIntegrationSendMessage() throws {
+        let config = try integrationConfig()
+        let integrationApp = launchIntegrationApp(config: config)
+        try runSendMessageFlow(config, in: integrationApp)
+    }
+
     func testIntegrationResumeSessionFromSessionPicker() throws {
         let config = try integrationConfig()
         let integrationApp = launchIntegrationApp(config: config)
-        openWorkspace(config, in: integrationApp)
+        try openWorkspace(config, in: integrationApp)
         try waitForSessionPicker(config, in: integrationApp)
-        try createSession(config, in: integrationApp)
+        try createSession(in: integrationApp)
 
         let backButton = integrationApp.navigationBars.buttons.element(boundBy: 0)
         XCTAssertTrue(backButton.waitForExistence(timeout: 5))

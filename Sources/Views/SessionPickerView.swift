@@ -58,38 +58,12 @@ private func normalizedRemotePathKey(_ rawPath: String) -> String? {
 }
 
 /// Build merged session rows for a workspace by combining daemon + local records.
-/// External daemon sessions are suppressed when they are already tracked as
-/// history sources of a local recovered session to avoid duplicate list items.
 func mergeWorkspaceSessions(
     workspacePath: String,
     username: String?,
     daemonSessions: [DaemonSessionInfo],
     localSessions: [Session]
 ) -> [UnifiedSession] {
-    let recoveredHistorySourceIDs: Set<String> = Set(localSessions.compactMap { local in
-        guard let historySessionId = normalizedSessionID(local.historySessionId),
-              historySessionId != local.sessionId else {
-            return nil
-        }
-        return historySessionId
-    })
-
-    var daemonByID: [String: DaemonSessionInfo] = [:]
-    for daemonSession in daemonSessions {
-        guard workspacePathMatchesSessionCwd(
-            workspacePath: workspacePath,
-            sessionCwd: daemonSession.cwd,
-            username: username
-        ) else {
-            continue
-        }
-        if daemonSession.state == "external",
-           recoveredHistorySourceIDs.contains(daemonSession.sessionId) {
-            continue
-        }
-        daemonByID[daemonSession.sessionId] = daemonSession
-    }
-
     var localByID: [String: Session] = [:]
     for localSession in localSessions {
         if let existing = localByID[localSession.sessionId],
@@ -97,6 +71,19 @@ func mergeWorkspaceSessions(
             continue
         }
         localByID[localSession.sessionId] = localSession
+    }
+
+    var daemonByID: [String: DaemonSessionInfo] = [:]
+    for daemonSession in daemonSessions {
+        let isKnownLocalSession = localByID[daemonSession.sessionId] != nil
+        guard isKnownLocalSession || workspacePathMatchesSessionCwd(
+            workspacePath: workspacePath,
+            sessionCwd: daemonSession.cwd,
+            username: username
+        ) else {
+            continue
+        }
+        daemonByID[daemonSession.sessionId] = daemonSession
     }
 
     let allIds = Set(daemonByID.keys).union(localByID.keys)
@@ -127,13 +114,6 @@ func mergeWorkspaceSessions(
         let rhsDate = rhs.effectiveLastUsedAt ?? .distantPast
         return lhsDate > rhsDate
     }
-}
-
-private func normalizedSessionID(_ value: String?) -> String? {
-    guard let value else { return nil }
-    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return nil }
-    return trimmed
 }
 
 struct SessionPickerView: View {
@@ -363,7 +343,6 @@ struct SessionStateBadge: View {
         case "completed": "Done"
         case "dead": "Dead"
         case "starting": "Starting"
-        case "history": "History"
         case "external": "External"
         default: state.capitalized
         }
@@ -377,7 +356,6 @@ struct SessionStateBadge: View {
         case "completed": .green
         case "dead": .red
         case "starting": .yellow
-        case "history": .secondary
         case "external": .purple
         default: .gray
         }

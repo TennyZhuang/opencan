@@ -1055,6 +1055,82 @@ func TestDaemon_SessionAttachAllowsSameClientIDReclaim(t *testing.T) {
 	}
 }
 
+func TestDaemon_SessionLoadUnknownSessionIDRoutesToSoleAttachedProxy(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Create and attach one managed session.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.create",
+		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
+	})
+	resp := readResponseWithID(t, scanner, 1)
+	if resp["error"] != nil {
+		t.Fatalf("session.create error: %v", resp["error"])
+	}
+	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.attach",
+		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
+	})
+	resp = readResponseWithID(t, scanner, 2)
+	if resp["error"] != nil {
+		t.Fatalf("session.attach error: %v", resp["error"])
+	}
+
+	// session/load with an unknown sessionId should route to the sole attached proxy.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "session/load",
+		"params": map[string]interface{}{
+			"sessionId":  "external-session-id",
+			"cwd":        "/tmp",
+			"mcpServers": []interface{}{},
+		},
+	})
+	resp = readResponseWithID(t, scanner, 3)
+	if resp["error"] != nil {
+		t.Fatalf("session/load should route via fallback, got error: %v", resp["error"])
+	}
+
+	// The fallback must remain load-only; prompt for unknown sessionId is still rejected.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      4,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": "external-session-id",
+			"prompt": []map[string]interface{}{
+				{"type": "text", "text": "should-fail"},
+			},
+		},
+	})
+	resp = readResponseWithID(t, scanner, 4)
+	if resp["error"] == nil {
+		t.Fatal("expected prompt rejection for unknown sessionId")
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: external-session-id") {
+		t.Fatalf("unexpected prompt error: %v", resp["error"])
+	}
+}
+
 func TestDaemon_IdleTimeoutRearmsWhileSessionBusy(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {
@@ -1116,143 +1192,6 @@ func TestDaemon_IdleTimeoutRearmsWhileSessionBusy(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("daemon did not stop after idle timeout while no clients were connected")
-}
-
-func TestDaemon_SessionLoadRouteToSession(t *testing.T) {
-	mockBin := findMockBin(t)
-	if mockBin == "" {
-		t.Skip("mock-acp-server binary not found")
-	}
-
-	d, sockPath := testDaemon(t)
-	defer d.Stop()
-
-	conn := connectToDaemon(t, sockPath)
-	defer conn.Close()
-
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
-	// Create a session (this will be the "new" session we route to)
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.create",
-		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
-	})
-	resp := readJSONWithScanner(t, scanner)
-	newSessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
-
-	// Attach to the new session
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "daemon/session.attach",
-		"params":  map[string]interface{}{"sessionId": newSessionID, "lastEventSeq": 0},
-	})
-	resp = readResponseWithID(t, scanner, 2)
-	if resp["error"] != nil {
-		t.Fatalf("attach error: %v", resp["error"])
-	}
-
-	// Send session/load with a fake "old" sessionId but __routeToSession pointing
-	// to the new session. The daemon should route this to the new session's ACP proxy.
-	oldSessionID := "old-session-that-doesnt-exist"
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1001,
-		"method":  "session/load",
-		"params": map[string]interface{}{
-			"sessionId":        oldSessionID,
-			"cwd":              "/tmp",
-			"mcpServers":       []interface{}{},
-			"__routeToSession": newSessionID,
-		},
-	})
-
-	resp = readResponseWithID(t, scanner, 1001)
-
-	// Should succeed — the daemon routed to the new session's proxy
-	if resp["error"] != nil {
-		t.Fatalf("session/load with __routeToSession should succeed, got error: %v", resp["error"])
-	}
-	if resp["id"].(float64) != 1001 {
-		t.Fatalf("expected response id 1001, got %v", resp["id"])
-	}
-	t.Logf("session/load with __routeToSession succeeded")
-
-	// session/prompt should support the same routing override so recovered
-	// sessions can continue on their original sessionId.
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1003,
-		"method":  "session/prompt",
-		"params": map[string]interface{}{
-			"sessionId":        oldSessionID,
-			"prompt":           []map[string]interface{}{{"type": "text", "text": "continue history"}},
-			"__routeToSession": newSessionID,
-		},
-	})
-
-	resp = readResponseWithID(t, scanner, 1003)
-	if resp["error"] != nil {
-		t.Fatalf("session/prompt with __routeToSession should succeed, got error: %v", resp["error"])
-	}
-	t.Logf("session/prompt with __routeToSession succeeded")
-
-	// Without routing override, prompts for unknown sessions should still fail.
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1004,
-		"method":  "session/prompt",
-		"params": map[string]interface{}{
-			"sessionId": oldSessionID,
-			"prompt":    []map[string]interface{}{{"type": "text", "text": "should fail"}},
-		},
-	})
-
-	resp = readResponseWithID(t, scanner, 1004)
-	if resp["error"] == nil {
-		t.Fatal("session/prompt for unknown session without __routeToSession should fail")
-	}
-	t.Logf("session/prompt without __routeToSession correctly failed: %v", resp["error"])
-
-	// __routeToSession should be ignored for unsupported methods.
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1005,
-		"method":  "session/list",
-		"params": map[string]interface{}{
-			"sessionId":        oldSessionID,
-			"__routeToSession": newSessionID,
-		},
-	})
-	resp = readResponseWithID(t, scanner, 1005)
-	if resp["error"] == nil {
-		t.Fatal("session/list with __routeToSession should fail (override not allowed)")
-	}
-	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: "+oldSessionID) {
-		t.Fatalf("expected not-attached error for original session id, got: %v", resp["error"])
-	}
-
-	// Also verify that session/load WITHOUT __routeToSession fails for the old ID
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1002,
-		"method":  "session/load",
-		"params": map[string]interface{}{
-			"sessionId":  oldSessionID,
-			"cwd":        "/tmp",
-			"mcpServers": []interface{}{},
-		},
-	})
-
-	resp = readJSONWithScanner(t, scanner)
-	if resp["error"] == nil {
-		t.Fatal("session/load for unknown session without __routeToSession should fail")
-	}
-	t.Logf("session/load without __routeToSession correctly failed: %v", resp["error"])
 }
 
 func findMockBin(t *testing.T) string {

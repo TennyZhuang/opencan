@@ -416,18 +416,16 @@ actor SSHConnectionManager {
     }
 
     private func bundledDaemonBinary(remoteTarget: String?) throws -> (name: String, url: URL) {
-        if let remoteTarget {
+        let fallbackName = "opencan-daemon-linux-amd64"
+        if let remoteTarget, remoteTarget != "linux-amd64" {
             let preferredName = "opencan-daemon-\(remoteTarget)"
-            if let preferredURL = Bundle.main.url(forResource: preferredName, withExtension: nil) {
-                return (preferredName, preferredURL)
-            }
-            if remoteTarget != "linux-amd64" {
+            guard let preferredURL = Bundle.main.url(forResource: preferredName, withExtension: nil) else {
                 Log.toFile("[SSH] Missing bundled daemon for remote target \(remoteTarget)")
                 throw SSHError.daemonBinaryNotFound
             }
+            return (preferredName, preferredURL)
         }
 
-        let fallbackName = "opencan-daemon-linux-amd64"
         guard let fallbackURL = Bundle.main.url(forResource: fallbackName, withExtension: nil) else {
             throw SSHError.daemonBinaryNotFound
         }
@@ -435,18 +433,40 @@ actor SSHConnectionManager {
     }
 
     private func detectRemoteDaemonTarget(client: SSHClient) async throws -> String? {
+        let osMarker = "__opencan_os__"
+        let archMarker = "__opencan_arch__"
         do {
-            let output = try await client.executeCommand("uname -s 2>/dev/null; uname -m 2>/dev/null")
+            let output = try await client.executeCommand(
+                """
+                os="$(uname -s 2>/dev/null || true)"
+                arch="$(uname -m 2>/dev/null || true)"
+                printf '\(osMarker)%s\\n\(archMarker)%s\\n' "$os" "$arch"
+                """
+            )
             let lines = String(buffer: output)
                 .split(whereSeparator: \.isNewline)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
-            guard lines.count >= 2 else {
+
+            var rawOS: String?
+            var rawArch: String?
+            for line in lines {
+                if line.hasPrefix(osMarker) {
+                    rawOS = String(line.dropFirst(osMarker.count))
+                } else if line.hasPrefix(archMarker) {
+                    rawArch = String(line.dropFirst(archMarker.count))
+                }
+            }
+
+            guard
+                let rawOS, !rawOS.isEmpty,
+                let rawArch, !rawArch.isEmpty
+            else {
                 return nil
             }
 
-            guard let os = normalizeRemoteOS(lines[0]), let arch = normalizeRemoteArch(lines[1]) else {
-                Log.toFile("[SSH] Unsupported remote platform: os='\(lines[0])' arch='\(lines[1])'")
+            guard let os = normalizeRemoteOS(rawOS), let arch = normalizeRemoteArch(rawArch) else {
+                Log.toFile("[SSH] Unsupported remote platform: os='\(rawOS)' arch='\(rawArch)'")
                 return nil
             }
             return "\(os)-\(arch)"

@@ -253,28 +253,6 @@ func TestExtractSessionID_Missing(t *testing.T) {
 	}
 }
 
-func TestExtractRouteToSession(t *testing.T) {
-	params := json.RawMessage(`{"sessionId":"old","__routeToSession":"new"}`)
-	msg := &Message{Params: &params}
-	if got := ExtractRouteToSession(msg); got != "new" {
-		t.Fatalf("expected routeToSession 'new', got %q", got)
-	}
-}
-
-func TestExtractRouteToSession_MissingOrInvalid(t *testing.T) {
-	tests := []json.RawMessage{
-		json.RawMessage(`{"sessionId":"old"}`),
-		json.RawMessage(`{"__routeToSession":123}`),
-		json.RawMessage(`[]`),
-	}
-	for _, params := range tests {
-		msg := &Message{Params: &params}
-		if got := ExtractRouteToSession(msg); got != "" {
-			t.Fatalf("expected empty routeToSession for %s, got %q", string(params), got)
-		}
-	}
-}
-
 func TestExtractTraceID(t *testing.T) {
 	params := json.RawMessage(`{"sessionId":"sess-123","_meta":{"traceId":"trace-abc"}}`)
 	msg := &Message{Params: &params}

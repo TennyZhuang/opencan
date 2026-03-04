@@ -393,29 +393,31 @@ func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 		return
 	}
 
-	// Support __routeToSession only for methods that intentionally decouple
-	// the logical sessionId from the attached proxy session.
-	routeID := sessionID
-	if override := protocol.ExtractRouteToSession(msg); override != "" {
-		if msg.Method == protocol.MethodSessionLoad || msg.Method == protocol.MethodSessionPrompt {
-			routeID = override
-			logger.Info("routing override", "method", msg.Method, "sessionId", sessionID, "routeToSession", routeID)
-		} else {
-			logger.Warn("ignoring routing override for unsupported method", "method", msg.Method, "sessionId", sessionID)
+	p, ok := h.attachedProxies[sessionID]
+	// For session/load, treat unknown sessionId as a history reference and route
+	// to the sole attached proxy when there is exactly one.
+	if !ok && msg.Method == protocol.MethodSessionLoad && len(h.attachedProxies) == 1 {
+		for attachedSessionID, attachedProxy := range h.attachedProxies {
+			p = attachedProxy
+			ok = true
+			logger.Info(
+				"routing session/load to attached proxy",
+				"requestedSessionId", sessionID,
+				"attachedSessionId", attachedSessionID,
+			)
+			break
 		}
 	}
-
-	p, ok := h.attachedProxies[routeID]
 	if !ok {
 		if msg.ID != nil {
-			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+routeID))
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+sessionID))
 		}
 		return
 	}
 	if p.GetClient() != h {
-		logger.Warn("rejecting request from stale session owner", "sessionId", routeID, "method", msg.Method)
+		logger.Warn("rejecting request from stale session owner", "sessionId", sessionID, "method", msg.Method)
 		if msg.ID != nil {
-			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+routeID))
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+sessionID))
 		}
 		return
 	}

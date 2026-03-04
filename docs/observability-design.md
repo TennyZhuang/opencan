@@ -46,9 +46,8 @@ func sendRequest(method: String, params: JSONValue?, traceId: String? = nil) asy
 添加 `currentTraceId` 属性和 `newTraceId()` 方法。在五个用户操作入口调用：
 - `connect(node:)` — SSH + daemon 握手
 - `createNewSession()` — 创建 session
-- `resumeSession()` — 恢复 session (包括 attach, load, history recovery)
+- `resumeSession()` — 恢复 session (包括 attach, load)
 - `sendMessage()` — 发送 prompt
-- `resumeHistorySession()` — 历史恢复 (内部子操作，继承或新建 traceId)
 
 每处将 `traceId` 传入 daemon/service 调用，同时写入 `Log.log()` 以便 iOS 日志也携带。
 

@@ -42,14 +42,13 @@ final class SessionPickerPathMatchingTests: XCTestCase {
         )
     }
 
-    func testMergeWorkspaceSessionsSuppressesExternalHistorySourceDuplicate() {
-        let recovered = Session(
+    func testMergeWorkspaceSessionsKeepsManagedAndExternalSessions() {
+        let managed = Session(
             sessionId: "managed-session",
-            sessionCwd: "/home/tz/repo",
-            historySessionId: "external-source"
+            sessionCwd: "/home/tz/repo"
         )
-        recovered.title = "Recovered"
-        recovered.lastUsedAt = Date(timeIntervalSince1970: 200)
+        managed.title = "Managed"
+        managed.lastUsedAt = Date(timeIntervalSince1970: 200)
 
         let daemonSessions = [
             DaemonSessionInfo(
@@ -76,12 +75,12 @@ final class SessionPickerPathMatchingTests: XCTestCase {
             workspacePath: "/home/tz/repo",
             username: "tz",
             daemonSessions: daemonSessions,
-            localSessions: [recovered]
+            localSessions: [managed]
         )
 
         XCTAssertEqual(
             Set(merged.map(\.sessionId)),
-            Set(["managed-session", "external-other"])
+            Set(["managed-session", "external-source", "external-other"])
         )
     }
 
@@ -116,5 +115,37 @@ final class SessionPickerPathMatchingTests: XCTestCase {
             Set(merged.map(\.sessionId)),
             Set(["managed-session", "external-source"])
         )
+    }
+
+    func testMergeWorkspaceSessionsIncludesKnownLocalSessionEvenWhenDaemonCwdDiffers() {
+        let local = Session(
+            sessionId: "legacy-session",
+            sessionCwd: "/home/tz/repo"
+        )
+        local.title = "Legacy"
+        local.lastUsedAt = Date(timeIntervalSince1970: 200)
+
+        let daemonSessions = [
+            DaemonSessionInfo(
+                sessionId: "legacy-session",
+                cwd: "/tmp/other-project",
+                state: "external",
+                lastEventSeq: 30,
+                command: nil,
+                title: "Recovered elsewhere",
+                updatedAt: Date(timeIntervalSince1970: 210)
+            ),
+        ]
+
+        let merged = mergeWorkspaceSessions(
+            workspacePath: "/home/tz/repo",
+            username: "tz",
+            daemonSessions: daemonSessions,
+            localSessions: [local]
+        )
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged.first?.sessionId, "legacy-session")
+        XCTAssertEqual(merged.first?.daemonState, "external")
     }
 }

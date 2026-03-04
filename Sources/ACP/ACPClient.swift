@@ -260,6 +260,16 @@ enum ACPError: Error, LocalizedError {
         return combined.contains("session already attached by another client")
     }
 
+    /// True when upstream closed the in-flight query before producing a response.
+    /// This is typically terminal for the current routed backend and should not
+    /// trigger repeated cwd retries.
+    var isQueryClosedBeforeResponse: Bool {
+        guard case .rpcError(_, let message, let data) = self else { return false }
+        let details = data?["details"]?.stringValue ?? ""
+        let combined = "\(message) \(details)".lowercased()
+        return combined.contains("query closed before response received")
+    }
+
     /// True when upstream model routing has no available backend provider.
     var isModelUnavailable: Bool {
         guard case .rpcError(_, let message, let data) = self else { return false }

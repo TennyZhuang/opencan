@@ -88,9 +88,6 @@ func (sm *SessionManager) GetSession(sessionID string) (*proxy.ACPProxy, bool) {
 	return nil, false
 }
 
-// maxExternalSessions is the hard cap on external sessions returned per list call.
-const maxExternalSessions = 50
-
 // ListSessions returns info about all sessions, including external sessions
 // discovered via ACP session/list that are not managed by this daemon.
 func (sm *SessionManager) ListSessions() []SessionInfo {
@@ -123,7 +120,11 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 		loadableIDs[s.SessionID] = struct{}{}
 	}
 
-	infos := make([]SessionInfo, 0, len(proxies)+maxExternalSessions)
+	estimatedCapacity := len(proxies)
+	if hasLoadableSet {
+		estimatedCapacity += len(loadableSessions)
+	}
+	infos := make([]SessionInfo, 0, estimatedCapacity)
 
 	// Daemon-managed sessions (with loadability filtering for idle/completed).
 	for _, p := range proxies {
@@ -150,11 +151,7 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 
 	// External sessions: in ACP list but not daemon-managed.
 	if hasLoadableSet {
-		externalCount := 0
 		for _, ls := range loadableSessions {
-			if externalCount >= maxExternalSessions {
-				break
-			}
 			if _, isDaemon := daemonIDs[ls.SessionID]; isDaemon {
 				continue
 			}
@@ -165,7 +162,6 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 				Title:     ls.Title,
 				UpdatedAt: ls.UpdatedAt,
 			})
-			externalCount++
 		}
 	}
 
@@ -241,7 +237,7 @@ func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD stri
 	wg.Wait()
 
 	seen := make(map[string]struct{})
-	merged := make([]proxy.LoadableSession, 0, maxExternalSessions)
+	merged := make([]proxy.LoadableSession, 0)
 	var lastErr error
 	succeeded := false
 

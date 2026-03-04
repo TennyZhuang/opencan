@@ -32,19 +32,21 @@ actor MockACPTransport: ACPTransport {
     /// Specific (sessionId, cwd) pairs that should fail on session/load.
     /// Format: "\(sessionId)|\(cwd)".
     var mockLoadFailSessionCwdPairs: Set<String> = []
+    /// Optional one-shot error injected for the next session/load request.
+    var nextLoadError: (code: Int, message: String, data: JSONValue?)?
     /// Tracks the most recent session/load params for assertions.
     var lastLoadSessionId: String?
-    var lastLoadRouteToSessionId: String?
     var lastLoadCwd: String?
     /// Tracks the most recent daemon/session.create parameters.
     var lastCreateCwd: String?
     var lastCreateCommand: String?
+    /// Tracks all daemon/session.create commands in order.
+    var createCommands: [String] = []
     /// Tracks the most recent daemon/session.attach params.
     var lastAttachSessionId: String?
     var lastAttachLastEventSeq: UInt64?
     /// Tracks the most recent session/prompt content blocks.
     var lastPromptSessionId: String?
-    var lastPromptRouteToSessionId: String?
     var lastPromptBlocks: [JSONValue]?
 
     /// Track last received method for test assertions.
@@ -135,6 +137,9 @@ actor MockACPTransport: ACPTransport {
         case DaemonMethods.sessionCreate:
             lastCreateCwd = params?["cwd"]?.stringValue
             lastCreateCommand = params?["command"]?.stringValue
+            if let cmd = lastCreateCommand {
+                createCommands.append(cmd)
+            }
             let sessionId = "mock-sess-\(UUID().uuidString.prefix(8))"
             self.mockSessionId = sessionId
             let result: JSONValue = .object([
@@ -212,9 +217,7 @@ actor MockACPTransport: ACPTransport {
         // ACP passthrough (daemon forwards transparently)
         case ACPMethods.sessionPrompt:
             let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
-            let routeToSessionId = params?["__routeToSession"]?.stringValue
             lastPromptSessionId = sessionId
-            lastPromptRouteToSessionId = routeToSessionId
             lastPromptBlocks = params?["prompt"]?.arrayValue
             if mockPromptShouldHang {
                 return
@@ -241,11 +244,21 @@ actor MockACPTransport: ACPTransport {
 
         case ACPMethods.sessionLoad:
             let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
-            let routeToSessionId = params?["__routeToSession"]?.stringValue
             let cwd = params?["cwd"]?.stringValue ?? ""
             lastLoadSessionId = sessionId
-            lastLoadRouteToSessionId = routeToSessionId
             lastLoadCwd = cwd
+            if let nextLoadError {
+                self.nextLoadError = nil
+                messageContinuation.yield(
+                    .error(
+                        id: id,
+                        code: nextLoadError.code,
+                        message: nextLoadError.message,
+                        data: nextLoadError.data
+                    )
+                )
+                return
+            }
             let failSessionIDs = mockLoadFailSessionIDs
             let failSessionCwdPairs = mockLoadFailSessionCwdPairs
             let steps = mockLoadSteps
@@ -450,6 +463,10 @@ actor MockACPTransport: ACPTransport {
         self.mockLoadFailSessionCwdPairs = pairs
     }
 
+    func setNextLoadError(code: Int, message: String, data: JSONValue?) {
+        nextLoadError = (code: code, message: message, data: data)
+    }
+
     func setMockAgentAvailabilityByID(_ availability: [String: Bool]) {
         self.mockAgentAvailabilityByID = availability
     }
@@ -462,10 +479,6 @@ actor MockACPTransport: ACPTransport {
         lastLoadSessionId
     }
 
-    func getLastLoadRouteToSessionId() -> String? {
-        lastLoadRouteToSessionId
-    }
-
     func getLastLoadCwd() -> String? {
         lastLoadCwd
     }
@@ -476,6 +489,10 @@ actor MockACPTransport: ACPTransport {
 
     func getLastCreateCwd() -> String? {
         lastCreateCwd
+    }
+
+    func getCreateCommands() -> [String] {
+        createCommands
     }
 
     func getLastAttachSessionId() -> String? {
@@ -492,10 +509,6 @@ actor MockACPTransport: ACPTransport {
 
     func getLastPromptSessionId() -> String? {
         lastPromptSessionId
-    }
-
-    func getLastPromptRouteToSessionId() -> String? {
-        lastPromptRouteToSessionId
     }
 
     func getReceivedMethods() -> [String] {

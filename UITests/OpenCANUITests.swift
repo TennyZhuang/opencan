@@ -195,6 +195,14 @@ final class OpenCANUITests: XCTestCase {
         // First create a session
         createSessionAndEnterChat()
 
+        // Add one user message so the session is not discarded as empty.
+        let textField = app.textFields.firstMatch
+        XCTAssertTrue(textField.waitForExistence(timeout: 5), "Chat input should exist")
+        textField.tap()
+        textField.typeText("Resume marker message")
+        app.buttons["arrow.up.circle.fill"].tap()
+        XCTAssertTrue(app.staticTexts["Resume marker message"].waitForExistence(timeout: 5))
+
         // Navigate back to session picker
         app.navigationBars.buttons.element(boundBy: 0).tap()
 

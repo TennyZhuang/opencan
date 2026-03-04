@@ -256,21 +256,6 @@ func ExtractSessionID(msg *Message) string {
 	return params.SessionID
 }
 
-// ExtractRouteToSession extracts the __routeToSession override from params.
-// Used by daemon request routing for methods that support routing overrides.
-func ExtractRouteToSession(msg *Message) string {
-	if msg.Params == nil {
-		return ""
-	}
-	var params struct {
-		RouteToSession string `json:"__routeToSession"`
-	}
-	if err := json.Unmarshal(*msg.Params, &params); err != nil {
-		return ""
-	}
-	return params.RouteToSession
-}
-
 // ExtractTraceID extracts params._meta.traceId from the message.
 func ExtractTraceID(msg *Message) string {
 	if msg.Params == nil {
