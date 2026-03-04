@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"testing"
+
+	"github.com/anthropics/opencan-daemon/internal/ioutils"
 )
 
 type shortWriteBuffer struct {
@@ -30,8 +32,8 @@ func TestWriteAllHandlesShortWrites(t *testing.T) {
 	w := &shortWriteBuffer{maxChunk: 3}
 	payload := []byte("abcdefghijklmnopqrstuvwxyz")
 
-	if err := writeAll(w, payload); err != nil {
-		t.Fatalf("writeAll failed: %v", err)
+	if err := ioutils.WriteAll(w, payload); err != nil {
+		t.Fatalf("WriteAll failed: %v", err)
 	}
 	if got := w.buf.Bytes(); !bytes.Equal(got, payload) {
 		t.Fatalf("unexpected payload written: got=%q want=%q", got, payload)
@@ -39,7 +41,7 @@ func TestWriteAllHandlesShortWrites(t *testing.T) {
 }
 
 func TestWriteAllDetectsZeroProgress(t *testing.T) {
-	err := writeAll(zeroWriteBuffer{}, []byte("abc"))
+	err := ioutils.WriteAll(zeroWriteBuffer{}, []byte("abc"))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

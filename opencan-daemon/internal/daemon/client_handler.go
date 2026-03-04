@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"sync"
 
+	"github.com/anthropics/opencan-daemon/internal/ioutils"
 	"github.com/anthropics/opencan-daemon/internal/protocol"
 	"github.com/anthropics/opencan-daemon/internal/proxy"
 )
@@ -133,7 +133,7 @@ func (h *ClientHandler) Send(msg *protocol.Message) error {
 	if h.closed {
 		return fmt.Errorf("client connection closed")
 	}
-	return writeAll(h.conn, data)
+	return ioutils.WriteAll(h.conn, data)
 }
 
 func (h *ClientHandler) loggerForMessage(msg *protocol.Message) *slog.Logger {
@@ -142,22 +142,6 @@ func (h *ClientHandler) loggerForMessage(msg *protocol.Message) *slog.Logger {
 		return h.logger
 	}
 	return h.logger.With("traceId", traceID)
-}
-
-func writeAll(w io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := w.Write(data)
-		if n > 0 {
-			data = data[n:]
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
 }
 
 func previewLine(line []byte, max int) string {

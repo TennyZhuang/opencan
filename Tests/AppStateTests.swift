@@ -588,7 +588,7 @@ final class AppStateTests: XCTestCase {
             return
         }
 
-        appState.promptResponseTimeoutSeconds = 0.2
+        appState.configurePromptTimeoutsForTesting(responseTimeoutSeconds: 0.2)
         await transport.setMockPromptShouldHang(true)
 
         let firstAccepted = appState.sendMessage("First message will hang")
@@ -626,7 +626,7 @@ final class AppStateTests: XCTestCase {
             return
         }
 
-        appState.promptResponseTimeoutSeconds = 1.0
+        appState.configurePromptTimeoutsForTesting(responseTimeoutSeconds: 1.0)
         await transport.setMockDropPromptResponse(true)
 
         appState.sendMessage("Response will be dropped after prompt_complete")
@@ -656,7 +656,7 @@ final class AppStateTests: XCTestCase {
             return
         }
 
-        appState.promptResponseTimeoutSeconds = 0.2
+        appState.configurePromptTimeoutsForTesting(responseTimeoutSeconds: 0.2)
         await transport.setMockPromptShouldHang(true)
 
         let accepted = appState.sendMessage("keep prompt alive with updates")
@@ -708,8 +708,10 @@ final class AppStateTests: XCTestCase {
             return
         }
 
-        appState.promptResponseTimeoutSeconds = 0.2
-        appState.promptResponseMaxWaitSeconds = 2.0
+        appState.configurePromptTimeoutsForTesting(
+            responseTimeoutSeconds: 0.2,
+            maxWaitSeconds: 2.0
+        )
         await transport.setMockPromptShouldHang(true)
         await transport.setMockSessionList([
             [
@@ -1467,6 +1469,45 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(
             appState.messages.contains { $0.role == .assistant && $0.content.contains("Recovered with alternate command.") }
         )
+    }
+
+    func testResumeExternalSessionTakeoverCleansCreatedSessionWhenAttachFails() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string("external-attach-fail"),
+                "cwd": .string("/test/path"),
+                "state": .string("external"),
+                "lastEventSeq": .int(0),
+            ]
+        ])
+        await appState.refreshDaemonSessions()
+
+        await transport.setNextAttachError(
+            code: -32000,
+            message: "attach failed",
+            data: nil
+        )
+
+        do {
+            try await appState.resumeSession(sessionId: "external-attach-fail", modelContext: modelContext)
+            XCTFail("Expected resumeSession to fail when takeover attach fails")
+        } catch {
+            // expected
+        }
+
+        let methods = await transport.getReceivedMethods()
+        XCTAssertTrue(methods.contains(DaemonMethods.sessionCreate))
+        XCTAssertTrue(methods.contains(DaemonMethods.sessionKill), "Failed takeover attach should cleanup created session")
+
+        let killed = await transport.getKilledSessionIds()
+        XCTAssertEqual(killed.count, 1, "Exactly one created takeover session should be killed")
     }
 
     func testRefreshDaemonSessionsUpdatesSnapshot() async throws {

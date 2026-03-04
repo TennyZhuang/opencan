@@ -11,9 +11,9 @@ final class AppState {
     /// Stable per-install ID used to reclaim daemon session ownership after reconnect.
     private let daemonAttachClientID = AppState.loadOrCreateDaemonAttachClientID()
     /// Fallback timeout when session/prompt never returns a terminal response.
-    var promptResponseTimeoutSeconds: TimeInterval = 45
+    private(set) var promptResponseTimeoutSeconds: TimeInterval = 45
     /// Absolute cap for unresolved prompts to avoid hanging forever on stale daemon state.
-    var promptResponseMaxWaitSeconds: TimeInterval = 15 * 60
+    private(set) var promptResponseMaxWaitSeconds: TimeInterval = 15 * 60
     /// Poll cadence while waiting for terminal `session/prompt` response.
     private let promptResponsePollIntervalSeconds: TimeInterval = 1
     private static let mentionRegex = try! NSRegularExpression(pattern: #"@[A-Za-z0-9_-]+"#)
@@ -29,6 +29,17 @@ final class AppState {
         let generated = UUID().uuidString.lowercased()
         defaults.set(generated, forKey: daemonAttachClientIDDefaultsKey)
         return generated
+    }
+
+    /// Test-only knob for prompt watchdog timings.
+    func configurePromptTimeoutsForTesting(
+        responseTimeoutSeconds: TimeInterval,
+        maxWaitSeconds: TimeInterval? = nil
+    ) {
+        promptResponseTimeoutSeconds = responseTimeoutSeconds
+        if let maxWaitSeconds {
+            promptResponseMaxWaitSeconds = maxWaitSeconds
+        }
     }
 
     // Active connection context
@@ -1719,6 +1730,17 @@ final class AppState {
                     )
                 }
             } catch {
+                do {
+                    try await daemon.killSession(sessionId: newSessionId, traceId: traceId)
+                } catch {
+                    Log.log(
+                        level: "warning",
+                        component: "AppState",
+                        "failed to cleanup takeover attach-failure session \(newSessionId): \(error.localizedDescription)",
+                        traceId: traceId,
+                        sessionId: newSessionId
+                    )
+                }
                 await restorePreviousAttachmentIfNeeded(
                     previousSessionId: previousSessionId,
                     previousSessionAttachSeq: previousSessionAttachSeq,
@@ -2103,7 +2125,10 @@ final class AppState {
         }
 
         do {
-            let sessions = try await daemon.listSessions(traceId: traceId)
+            let sessions = try await fetchDaemonSessionsForPromptWatchdog(
+                daemon: daemon,
+                traceId: traceId
+            )
             if let refreshed = sessions.first(where: { $0.sessionId == sessionId }) {
                 if let index = daemonSessions.firstIndex(where: { $0.sessionId == sessionId }) {
                     daemonSessions[index] = refreshed
@@ -2134,6 +2159,15 @@ final class AppState {
             )
             return cachedBusy
         }
+    }
+
+    /// Execute daemon session list outside MainActor isolation so prompt polling
+    /// does not run transport RPC work on the UI actor.
+    nonisolated private func fetchDaemonSessionsForPromptWatchdog(
+        daemon: DaemonClient,
+        traceId: String?
+    ) async throws -> [DaemonSessionInfo] {
+        try await daemon.listSessions(traceId: traceId)
     }
 
     private func isBusyDaemonSessionState(_ state: String?) -> Bool {

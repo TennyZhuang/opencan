@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anthropics/opencan-daemon/internal/ioutils"
 	"github.com/anthropics/opencan-daemon/internal/protocol"
 )
 
@@ -437,24 +438,29 @@ func (p *ACPProxy) TryAttachClient(c ClientConn) (SessionState, bool) {
 func (p *ACPProxy) TryAttachClientWithOwner(c ClientConn, ownerID string) (SessionState, bool) {
 	for {
 		current := p.client.Load()
-		if current != nil {
-			if current.conn != c {
-				if ownerID != "" && current.ownerID != "" && current.ownerID == ownerID {
-					p.client.Store(&clientWrapper{conn: c, ownerID: ownerID})
-					p.logger.Info("transferred session ownership to reconnected client", "session", p.SessionID)
-				} else {
-					return p.State(), false
-				}
-			}
-		} else {
-			if !p.client.CompareAndSwap(nil, &clientWrapper{conn: c, ownerID: ownerID}) {
+		desired := &clientWrapper{conn: c, ownerID: ownerID}
+
+		if current == nil {
+			if !p.client.CompareAndSwap(nil, desired) {
 				// Lost a race; re-check ownership.
 				continue
 			}
+		} else if current.conn == c {
+			// Same connection re-attached: refresh owner metadata if changed.
+			if current.ownerID != ownerID && !p.client.CompareAndSwap(current, desired) {
+				continue
+			}
+		} else {
+			if !(ownerID != "" && current.ownerID != "" && current.ownerID == ownerID) {
+				return p.State(), false
+			}
+			if !p.client.CompareAndSwap(current, desired) {
+				// Lost a race while transferring ownership; re-check.
+				continue
+			}
+			p.logger.Info("transferred session ownership to reconnected client", "session", p.SessionID)
 		}
 
-		// Keep behavior identical to AttachClient for valid attaches.
-		p.client.Store(&clientWrapper{conn: c, ownerID: ownerID})
 		state := p.State()
 		switch state {
 		case StateCompleted:
@@ -685,23 +691,7 @@ func (p *ACPProxy) writeMessage(msg *protocol.Message) error {
 	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	return writeAll(p.stdin, data)
-}
-
-func writeAll(w io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := w.Write(data)
-		if n > 0 {
-			data = data[n:]
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
+	return ioutils.WriteAll(p.stdin, data)
 }
 
 func isPromptComplete(msg *protocol.Message) bool {

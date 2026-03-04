@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -119,10 +120,11 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 	for _, s := range loadableSessions {
 		loadableIDs[s.SessionID] = struct{}{}
 	}
+	externalLimit := externalSessionLimit()
 
 	estimatedCapacity := len(proxies)
 	if hasLoadableSet {
-		estimatedCapacity += len(loadableSessions)
+		estimatedCapacity += min(len(loadableSessions), externalLimit)
 	}
 	infos := make([]SessionInfo, 0, estimatedCapacity)
 
@@ -151,7 +153,11 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 
 	// External sessions: in ACP list but not daemon-managed.
 	if hasLoadableSet {
+		externalCount := 0
 		for _, ls := range loadableSessions {
+			if externalCount >= externalLimit {
+				break
+			}
 			if _, isDaemon := daemonIDs[ls.SessionID]; isDaemon {
 				continue
 			}
@@ -162,6 +168,7 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 				Title:     ls.Title,
 				UpdatedAt: ls.UpdatedAt,
 			})
+			externalCount++
 		}
 	}
 
@@ -240,6 +247,7 @@ func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD stri
 	merged := make([]proxy.LoadableSession, 0)
 	var lastErr error
 	succeeded := false
+	externalLimit := externalSessionLimit()
 
 	for _, r := range results {
 		if r.err != nil {
@@ -255,6 +263,9 @@ func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD stri
 
 		succeeded = true
 		for _, s := range r.sessions {
+			if len(merged) >= externalLimit {
+				break
+			}
 			if s.SessionID == "" {
 				continue
 			}
@@ -273,6 +284,25 @@ func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD stri
 		return nil, lastErr
 	}
 	return merged, nil
+}
+
+func externalSessionLimit() int {
+	const (
+		defaultLimit = 2000
+		hardLimit    = 20000
+	)
+	raw := strings.TrimSpace(os.Getenv("OPENCAN_MAX_EXTERNAL_SESSIONS"))
+	if raw == "" {
+		return defaultLimit
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultLimit
+	}
+	if n > hardLimit {
+		return hardLimit
+	}
+	return n
 }
 
 func discoveryProbeCommands() []string {
