@@ -472,6 +472,87 @@ func TestDaemon_SessionList_DiscoversExternalWithoutManagedSessions(t *testing.T
 	}
 }
 
+func TestDaemon_SessionList_ManagedProxyAlsoProbesOtherDiscoveryCommands(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found, run 'make mock-acp' first")
+	}
+
+	// Simulate command-specific session/list behavior:
+	// - emptyCmd (managed proxy) returns no loadable sessions.
+	// - richCmd (extra discovery command) returns an external session.
+	tmpDir := t.TempDir()
+	emptyCmd := writeMockWrapperCommand(t, filepath.Join(tmpDir, "mock-empty.sh"), mockBin, "")
+	richCmd := writeMockWrapperCommand(t, filepath.Join(tmpDir, "mock-rich.sh"), mockBin, "external-rich")
+
+	t.Setenv("OPENCAN_DISCOVERY_COMMANDS", emptyCmd+","+richCmd)
+	t.Setenv("MOCK_LIST_OMIT_CREATED", "1")
+	t.Setenv("MOCK_LIST_SESSIONS", "")
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Create a managed session using the "empty" command so proxy-based probing
+	// alone would return no loadable sessions.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.create",
+		"params": map[string]interface{}{
+			"cwd":     "/tmp",
+			"command": emptyCmd,
+		},
+	})
+	resp := readResponseWithID(t, scanner, 1)
+	if resp["error"] != nil {
+		t.Fatalf("session.create error: %v", resp["error"])
+	}
+
+	// session.list should still include externally discovered sessions from the
+	// additional command.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.list",
+		"params":  map[string]interface{}{},
+	})
+	resp = readResponseWithID(t, scanner, 2)
+	if resp["error"] != nil {
+		t.Fatalf("session.list error: %v", resp["error"])
+	}
+
+	result := resp["result"].(map[string]interface{})
+	sessions := result["sessions"].([]interface{})
+
+	foundExternal := false
+	for _, raw := range sessions {
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		id, _ := item["sessionId"].(string)
+		if id != "external-rich" {
+			continue
+		}
+		state, _ := item["state"].(string)
+		if state != "external" {
+			t.Fatalf("expected external-rich state=external, got %q", state)
+		}
+		foundExternal = true
+		break
+	}
+	if !foundExternal {
+		t.Fatalf("expected external-rich in session.list, got %v", sessions)
+	}
+}
+
 func TestDaemon_SessionList_DeadManagedLoadableSessionShownAsExternal(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {
@@ -1344,6 +1425,19 @@ func findMockBin(t *testing.T) string {
 	}
 
 	return ""
+}
+
+func writeMockWrapperCommand(t *testing.T, path, mockBin, configuredListSessions string) string {
+	t.Helper()
+	content := fmt.Sprintf(
+		"#!/bin/sh\nexport MOCK_LIST_SESSIONS=%q\nexec %q \"$@\"\n",
+		configuredListSessions,
+		mockBin,
+	)
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("write wrapper command %s: %v", path, err)
+	}
+	return path
 }
 
 func init() {

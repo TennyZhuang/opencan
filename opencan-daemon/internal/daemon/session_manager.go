@@ -202,54 +202,101 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 }
 
 func (sm *SessionManager) loadableSessions(proxies []*proxy.ACPProxy, discoveryCWD string) ([]proxy.LoadableSession, bool) {
-	var probe *proxy.ACPProxy
-	for _, p := range proxies {
-		state := p.State()
-		hasClient := p.GetClient() != nil
-		if (state == proxy.StateIdle || state == proxy.StateCompleted) && !hasClient {
-			probe = p
-			break
-		}
-		if probe == nil && state != proxy.StateDead && !hasClient {
-			probe = p
-		}
-	}
-	if probe == nil {
-		for _, p := range proxies {
-			if p.State() != proxy.StateDead {
-				probe = p
-				break
+	timeout := discoveryProbeTimeout()
+	externalLimit := externalSessionLimit()
+
+	seen := make(map[string]struct{}, externalLimit)
+	merged := make([]proxy.LoadableSession, 0, externalLimit)
+	appendSessions := func(items []proxy.LoadableSession) {
+		for _, s := range items {
+			if len(merged) >= externalLimit {
+				return
 			}
+			if s.SessionID == "" {
+				continue
+			}
+			if _, ok := seen[s.SessionID]; ok {
+				continue
+			}
+			seen[s.SessionID] = struct{}{}
+			merged = append(merged, s)
 		}
 	}
 
-	if probe == nil {
-		sessions, err := sm.discoverExternalSessionsWithoutProxy(discoveryCWD)
+	probeByCommand := selectProxyProbeCandidates(proxies)
+	proxyProbeSucceeded := false
+	for _, p := range probeByCommand {
+		sessions, err := p.LoadableSessionsForCWD(timeout, discoveryCWD)
 		if err != nil {
 			sm.logger.Warn(
-				"session/loadability probe failed without managed sessions; returning managed list only",
+				"session/loadability probe via managed proxy failed",
+				"error", err,
+				"cwd", discoveryCWD,
+				"command", p.Command,
+			)
+			continue
+		}
+		proxyProbeSucceeded = true
+		appendSessions(sessions)
+	}
+
+	commandsToProbe := make([]string, 0)
+	if !proxyProbeSucceeded {
+		// If managed-proxy probing failed (or there are no proxies), probe all
+		// configured commands directly.
+		commandsToProbe = append(commandsToProbe, discoveryProbeCommands()...)
+	} else {
+		// Managed proxies only represent one ACP command each; probe the rest.
+		for _, command := range discoveryProbeCommands() {
+			if _, ok := probeByCommand[commandSignature(command)]; ok {
+				continue
+			}
+			commandsToProbe = append(commandsToProbe, command)
+		}
+	}
+
+	if len(commandsToProbe) > 0 && len(merged) < externalLimit {
+		discovered, err := sm.discoverExternalSessionsWithCommands(discoveryCWD, commandsToProbe, timeout)
+		if err != nil {
+			if !proxyProbeSucceeded {
+				sm.logger.Warn(
+					"session/loadability probe failed without managed sessions; returning managed list only",
+					"error", err,
+					"cwd", discoveryCWD,
+				)
+				return nil, false
+			}
+			sm.logger.Debug(
+				"additional discovery probe commands failed; using managed-proxy results only",
 				"error", err,
 				"cwd", discoveryCWD,
 			)
-			return nil, false
+		} else {
+			appendSessions(discovered)
 		}
-		return sessions, true
 	}
 
-	sessions, err := probe.LoadableSessionsForCWD(1200*time.Millisecond, discoveryCWD)
-	if err != nil {
-		sm.logger.Warn(
-			"session/loadability probe failed; returning unfiltered list",
-			"error", err,
-			"cwd", discoveryCWD,
-		)
+	if !proxyProbeSucceeded && len(merged) == 0 {
 		return nil, false
 	}
-	return sessions, true
+	return merged, true
 }
 
 func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD string) ([]proxy.LoadableSession, error) {
-	commands := discoveryProbeCommands()
+	return sm.discoverExternalSessionsWithCommands(discoveryCWD, discoveryProbeCommands(), discoveryProbeTimeout())
+}
+
+func (sm *SessionManager) discoverExternalSessionsWithCommands(
+	discoveryCWD string,
+	commands []string,
+	timeout time.Duration,
+) ([]proxy.LoadableSession, error) {
+	if len(commands) == 0 {
+		return nil, fmt.Errorf("no discovery commands configured")
+	}
+	if timeout <= 0 {
+		timeout = discoveryProbeTimeout()
+	}
 
 	type probeResult struct {
 		sessions []proxy.LoadableSession
@@ -263,7 +310,7 @@ func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD stri
 		wg.Add(1)
 		go func(idx int, cmd string) {
 			defer wg.Done()
-			sessions, err := proxy.ProbeLoadableSessionsForCWD(cmd, discoveryCWD, 1200*time.Millisecond, sm.logger)
+			sessions, err := proxy.ProbeLoadableSessionsForCWD(cmd, discoveryCWD, timeout, sm.logger)
 			results[idx] = probeResult{sessions: sessions, err: err, command: cmd}
 		}(i, command)
 	}
@@ -316,6 +363,55 @@ resultsLoop:
 	return merged, nil
 }
 
+func selectProxyProbeCandidates(proxies []*proxy.ACPProxy) map[string]*proxy.ACPProxy {
+	selected := make(map[string]*proxy.ACPProxy)
+	selectedScore := make(map[string]int)
+	for _, p := range proxies {
+		score := proxyProbeScore(p)
+		if score <= 0 {
+			continue
+		}
+		key := commandSignature(p.Command)
+		if current, ok := selectedScore[key]; ok && current >= score {
+			continue
+		}
+		selected[key] = p
+		selectedScore[key] = score
+	}
+	return selected
+}
+
+func proxyProbeScore(p *proxy.ACPProxy) int {
+	if p == nil {
+		return 0
+	}
+	state := p.State()
+	if state == proxy.StateDead {
+		return 0
+	}
+	hasClient := p.GetClient() != nil
+	if (state == proxy.StateIdle || state == proxy.StateCompleted) && !hasClient {
+		return 3
+	}
+	if !hasClient {
+		return 2
+	}
+	return 1
+}
+
+func commandSignature(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := proxy.ParseLaunchCommand(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	parts := append([]string{parsed.Executable}, parsed.Args...)
+	return strings.Join(parts, " ")
+}
+
 func externalSessionLimit() int {
 	const (
 		defaultLimit = 2000
@@ -361,6 +457,31 @@ func discoveryProbeCommands() []string {
 		return []string{"claude-agent-acp", "codex-acp"}
 	}
 	return commands
+}
+
+func discoveryProbeTimeout() time.Duration {
+	const (
+		defaultMs = 2500
+		minMs     = 500
+		maxMs     = 30000
+	)
+
+	raw := strings.TrimSpace(os.Getenv("OPENCAN_DISCOVERY_TIMEOUT_MS"))
+	if raw == "" {
+		return defaultMs * time.Millisecond
+	}
+
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return defaultMs * time.Millisecond
+	}
+	if ms < minMs {
+		ms = minMs
+	}
+	if ms > maxMs {
+		ms = maxMs
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func shouldFilterSessionFromList(state proxy.SessionState, hasNoAttachedClient bool) bool {
