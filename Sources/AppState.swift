@@ -555,6 +555,27 @@ final class AppState {
 
         let traceId = newTraceId()
 
+        if let externalDaemonSession = daemonSessions.first(where: { $0.sessionId == sessionId }),
+           externalDaemonSession.state == "external",
+           let mappedManagedSession = mappedManagedSessionForExternal(
+               externalSessionId: sessionId,
+               workspace: workspace,
+               modelContext: modelContext
+           ),
+           mappedManagedSession.sessionId != sessionId,
+           let mappedDaemonSession = daemonSessions.first(where: { $0.sessionId == mappedManagedSession.sessionId }),
+           mappedDaemonSession.state != "dead",
+           mappedDaemonSession.state != "external" {
+            Log.log(
+                component: "AppState",
+                "redirecting external session \(sessionId) to existing managed session \(mappedManagedSession.sessionId)",
+                traceId: traceId,
+                sessionId: sessionId
+            )
+            try await resumeSession(sessionId: mappedManagedSession.sessionId, modelContext: modelContext)
+            return
+        }
+
         let sessionDescriptor = FetchDescriptor<Session>(
             predicate: #Predicate { $0.sessionId == sessionId }
         )
@@ -657,6 +678,7 @@ final class AppState {
             }
 
             if shouldTreatAttachFailureAsSessionMissing(error) {
+                let takeoverSessionReference = existingSession?.canonicalSessionId ?? sessionId
                 Log.log(
                     level: "warning",
                     component: "AppState",
@@ -666,7 +688,7 @@ final class AppState {
                 )
                 do {
                     try await takeOverExternalSession(
-                        externalSessionId: sessionId,
+                        externalSessionId: takeoverSessionReference,
                         externalSessionCwd: daemonKnownCwd ?? existingSession?.sessionCwd ?? workspace.path,
                         workspace: workspace,
                         agentID: sessionAgent.id,
@@ -687,7 +709,7 @@ final class AppState {
                         traceId: traceId
                     )
                     markSessionDead(sessionId: sessionId, modelContext: modelContext)
-                    throw AppStateError.sessionNotRecoverable(sessionId)
+                    throw AppStateError.sessionNotRecoverable(takeoverSessionReference)
                 }
             }
 
@@ -1527,6 +1549,26 @@ final class AppState {
         return trimmed
     }
 
+    /// Resolve a previously recovered managed session for an external history id.
+    /// Returns the most recently used local mapping in the same workspace.
+    private func mappedManagedSessionForExternal(
+        externalSessionId: String,
+        workspace: Workspace,
+        modelContext: ModelContext
+    ) -> Session? {
+        let descriptor = FetchDescriptor<Session>(
+            predicate: #Predicate { $0.canonicalSessionId == externalSessionId }
+        )
+        guard let mapped = try? modelContext.fetch(descriptor), !mapped.isEmpty else {
+            return nil
+        }
+        let workspaceID = workspace.persistentModelID
+        return mapped
+            .filter { $0.workspace?.persistentModelID == workspaceID }
+            .sorted { $0.lastUsedAt > $1.lastUsedAt }
+            .first
+    }
+
     /// Build a deduplicated list of cwd candidates for session/load.
     private func loadCwdCandidates(preferred: [String?], workspace: Workspace) -> [String] {
         var candidates: [String] = []
@@ -1979,11 +2021,20 @@ final class AppState {
         }
 
         let resolvedSessionCwd = loadResult.loadedCwd ?? externalSessionCwd
-        let descriptor = FetchDescriptor<Session>(
+        let directDescriptor = FetchDescriptor<Session>(
             predicate: #Predicate { $0.sessionId == externalSessionId }
         )
-        if let existing = try? modelContext.fetch(descriptor).first {
+        let canonicalDescriptor = FetchDescriptor<Session>(
+            predicate: #Predicate { $0.canonicalSessionId == externalSessionId }
+        )
+        let existingBySessionID = try? modelContext.fetch(directDescriptor).first
+        let existingByCanonical = (try? modelContext.fetch(canonicalDescriptor))?
+            .sorted { $0.lastUsedAt > $1.lastUsedAt }
+            .first
+
+        if let existing = existingBySessionID ?? existingByCanonical {
             existing.sessionId = managedSessionId
+            existing.canonicalSessionId = externalSessionId
             existing.sessionCwd = resolvedSessionCwd
             existing.agentID = existing.agentID ?? agentID
             existing.agentCommand = normalizeAgentCommand(
@@ -1995,6 +2046,7 @@ final class AppState {
         } else {
             let session = Session(
                 sessionId: managedSessionId,
+                canonicalSessionId: externalSessionId,
                 sessionCwd: resolvedSessionCwd,
                 agentID: agentID,
                 agentCommand: managedCommand,

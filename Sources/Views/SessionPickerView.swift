@@ -65,16 +65,43 @@ func mergeWorkspaceSessions(
     localSessions: [Session]
 ) -> [UnifiedSession] {
     var localByID: [String: Session] = [:]
+    var managedByCanonicalExternalID: [String: Session] = [:]
     for localSession in localSessions {
         if let existing = localByID[localSession.sessionId],
            existing.lastUsedAt >= localSession.lastUsedAt {
-            continue
+            // Keep scanning to preserve canonical mapping candidates from
+            // the most recently used local records.
+        } else {
+            localByID[localSession.sessionId] = localSession
         }
-        localByID[localSession.sessionId] = localSession
+        if let canonical = localSession.canonicalSessionId?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !canonical.isEmpty,
+           canonical != localSession.sessionId {
+            if let existing = managedByCanonicalExternalID[canonical],
+               existing.lastUsedAt >= localSession.lastUsedAt {
+                continue
+            }
+            managedByCanonicalExternalID[canonical] = localSession
+        }
+    }
+
+    var daemonByRawID: [String: DaemonSessionInfo] = [:]
+    for daemonSession in daemonSessions {
+        daemonByRawID[daemonSession.sessionId] = daemonSession
     }
 
     var daemonByID: [String: DaemonSessionInfo] = [:]
     for daemonSession in daemonSessions {
+        if daemonSession.state == "external",
+           let managedLocal = managedByCanonicalExternalID[daemonSession.sessionId],
+           let managedDaemon = daemonByRawID[managedLocal.sessionId],
+           managedDaemon.state != "dead" {
+            // External history already has a live managed takeover row.
+            // Hide the duplicate external entry to avoid reopening it and
+            // spawning additional managed sessions repeatedly.
+            continue
+        }
         let isKnownLocalSession = localByID[daemonSession.sessionId] != nil
         guard isKnownLocalSession || workspacePathMatchesSessionCwd(
             workspacePath: workspacePath,

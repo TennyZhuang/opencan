@@ -117,6 +117,46 @@ final class SessionPickerPathMatchingTests: XCTestCase {
         )
     }
 
+    func testMergeWorkspaceSessionsHidesExternalWhenRecoveredManagedSessionIsLive() {
+        let managed = Session(
+            sessionId: "managed-session",
+            canonicalSessionId: "external-source",
+            sessionCwd: "/home/tz/repo"
+        )
+        managed.title = "Recovered"
+        managed.lastUsedAt = Date(timeIntervalSince1970: 200)
+
+        let daemonSessions = [
+            DaemonSessionInfo(
+                sessionId: "external-source",
+                cwd: "/home/tz/repo",
+                state: "external",
+                lastEventSeq: 20,
+                command: nil,
+                title: "External",
+                updatedAt: Date(timeIntervalSince1970: 100)
+            ),
+            DaemonSessionInfo(
+                sessionId: "managed-session",
+                cwd: "/home/tz/repo",
+                state: "idle",
+                lastEventSeq: 25,
+                command: nil,
+                title: nil,
+                updatedAt: Date(timeIntervalSince1970: 210)
+            ),
+        ]
+
+        let merged = mergeWorkspaceSessions(
+            workspacePath: "/home/tz/repo",
+            username: "tz",
+            daemonSessions: daemonSessions,
+            localSessions: [managed]
+        )
+
+        XCTAssertEqual(Set(merged.map(\.sessionId)), Set(["managed-session"]))
+    }
+
     func testMergeWorkspaceSessionsIncludesKnownLocalSessionEvenWhenDaemonCwdDiffers() {
         let local = Session(
             sessionId: "legacy-session",
