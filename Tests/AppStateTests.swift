@@ -1616,7 +1616,7 @@ final class AppStateTests: XCTestCase {
             agentID: nil,
             agentCommand: nil
         )
-        XCTAssertEqual(u2.displayState, "dead")
+        XCTAssertEqual(u2.displayState, "external")
         XCTAssertTrue(u2.isResumable)
         XCTAssertEqual(u2.displayTitle, "My Session")
 

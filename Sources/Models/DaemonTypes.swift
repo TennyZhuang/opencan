@@ -119,7 +119,9 @@ struct UnifiedSession: Identifiable {
         self.agentCommand = agentCommand
     }
 
-    var displayState: String { daemonState ?? "dead" }
+    /// If daemon snapshot misses a local session ID, keep it resumable-looking.
+    /// Some ACP backends can still load history even when session/list omits it.
+    var displayState: String { daemonState ?? "external" }
     /// Session rows stay actionable so takeover/recovery flows can be initiated in-UI.
     var isResumable: Bool { true }
     /// Placeholder sessions with no title/events are typically accidental.
