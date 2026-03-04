@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,10 +26,13 @@ type ClientConn interface {
 
 // PendingRequest tracks a forwarded request so the response can be routed back.
 type PendingRequest struct {
-	OriginalID *protocol.JSONRPCID
-	Client     ClientConn
-	Method     string
-	ResponseCh chan *protocol.Message
+	OriginalID         *protocol.JSONRPCID
+	Client             ClientConn
+	Method             string
+	ResponseCh         chan *protocol.Message
+	TraceID            string
+	RequestedSessionID string
+	StartedAt          time.Time
 }
 
 // ACPProxy manages a single claude-agent-acp child process and its event buffer.
@@ -281,6 +285,11 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 		p.logger.Warn("response for unknown request", "id", internalID)
 		return
 	}
+	durationMs := int64(0)
+	if !pr.StartedAt.IsZero() {
+		durationMs = time.Since(pr.StartedAt).Milliseconds()
+	}
+	p.logRequestOutcome(pr, msg, durationMs)
 
 	fwd := msg.Clone()
 	fwd.ID = pr.OriginalID
@@ -304,6 +313,61 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 	if pr.Method == protocol.MethodSessionPrompt && (msg.IsResponse() || msg.IsError()) {
 		p.handlePromptTerminalResponse()
 	}
+}
+
+func (p *ACPProxy) logRequestOutcome(pr PendingRequest, msg *protocol.Message, durationMs int64) {
+	if pr.Method != protocol.MethodSessionLoad {
+		return
+	}
+	logger := p.logger
+	if pr.TraceID != "" {
+		logger = logger.With("traceId", pr.TraceID)
+	}
+	requestedSessionID := pr.RequestedSessionID
+	if requestedSessionID == "" {
+		requestedSessionID = p.SessionID
+	}
+	if msg.IsError() && msg.Error != nil {
+		logger.Warn(
+			"session/load upstream error",
+			"session", p.SessionID,
+			"command", p.Command,
+			"requestedSessionId", requestedSessionID,
+			"durationMs", durationMs,
+			"code", msg.Error.Code,
+			"message", msg.Error.Message,
+			"data", rpcErrorDataSummary(msg.Error.Data),
+		)
+		return
+	}
+	logger.Info(
+		"session/load upstream success",
+		"session", p.SessionID,
+		"command", p.Command,
+		"requestedSessionId", requestedSessionID,
+		"durationMs", durationMs,
+	)
+}
+
+func rpcErrorDataSummary(raw *json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	text := strings.TrimSpace(string(*raw))
+	if text == "" || text == "null" {
+		return ""
+	}
+	var details struct {
+		Details string `json:"details"`
+	}
+	if err := json.Unmarshal(*raw, &details); err == nil && details.Details != "" {
+		return details.Details
+	}
+	var asString string
+	if err := json.Unmarshal(*raw, &asString); err == nil {
+		return asString
+	}
+	return text
 }
 
 func (p *ACPProxy) handleServerRequest(msg *protocol.Message) {
@@ -519,9 +583,12 @@ func (p *ACPProxy) ForwardFromClient(msg *protocol.Message, client ClientConn) e
 		internalID := p.nextInternalID.Add(1)
 		p.pendingMu.Lock()
 		p.pendingRequests[internalID] = PendingRequest{
-			OriginalID: msg.ID,
-			Client:     client,
-			Method:     msg.Method,
+			OriginalID:         msg.ID,
+			Client:             client,
+			Method:             msg.Method,
+			TraceID:            protocol.ExtractTraceID(msg),
+			RequestedSessionID: protocol.ExtractSessionID(msg),
+			StartedAt:          time.Now(),
 		}
 		p.pendingMu.Unlock()
 
@@ -637,6 +704,7 @@ func (p *ACPProxy) callACPRequest(method string, params interface{}, timeout tim
 	p.pendingRequests[internalID] = PendingRequest{
 		Method:     method,
 		ResponseCh: respCh,
+		StartedAt:  time.Now(),
 	}
 	p.pendingMu.Unlock()
 

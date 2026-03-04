@@ -388,6 +388,7 @@ func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 				"routing session/load to attached proxy",
 				"requestedSessionId", sessionID,
 				"attachedSessionId", attachedSessionID,
+				"attachedCommand", attachedProxy.Command,
 			)
 			break
 		}

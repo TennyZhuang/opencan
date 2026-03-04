@@ -1554,7 +1554,7 @@ final class AppState {
         }
         var sawNotFound = false
         var lastError: Error?
-        for cwd in candidateCwds {
+        for (index, cwd) in candidateCwds.enumerated() {
             do {
                 try await Log.timed(
                     "session/load",
@@ -1568,6 +1568,18 @@ final class AppState {
                         traceId: traceId
                     )
                 }
+                Log.log(
+                    component: "AppState",
+                    "session/load succeeded for \(sessionId) (cwd: \(cwd))",
+                    traceId: traceId,
+                    sessionId: sessionId,
+                    extra: sessionLoadObservabilityExtra(
+                        error: nil,
+                        cwd: cwd,
+                        candidateIndex: index,
+                        candidateCount: candidateCwds.count
+                    )
+                )
                 return SessionLoadResult(loadedCwd: cwd, sawNotFound: sawNotFound, lastError: nil)
             } catch {
                 lastError = error
@@ -1579,10 +1591,29 @@ final class AppState {
                     component: "AppState",
                     "session/load failed for \(sessionId) (cwd: \(cwd)): \(error.localizedDescription)",
                     traceId: traceId,
-                    sessionId: sessionId
+                    sessionId: sessionId,
+                    extra: sessionLoadObservabilityExtra(
+                        error: error,
+                        cwd: cwd,
+                        candidateIndex: index,
+                        candidateCount: candidateCwds.count
+                    )
                 )
                 // "Session not found" is often cwd-dependent, so keep trying candidates.
                 if shouldStopSessionLoadRetries(after: error) {
+                    Log.log(
+                        level: "warning",
+                        component: "AppState",
+                        "stopping further session/load cwd retries after terminal load error",
+                        traceId: traceId,
+                        sessionId: sessionId,
+                        extra: sessionLoadObservabilityExtra(
+                            error: error,
+                            cwd: cwd,
+                            candidateIndex: index,
+                            candidateCount: candidateCwds.count
+                        )
+                    )
                     break
                 }
             }
@@ -1599,6 +1630,52 @@ final class AppState {
     private func shouldTreatSessionLoadFailureAsNotFound(_ error: Error) -> Bool {
         guard let acpError = error as? ACPError else { return false }
         return acpError.isSessionNotFound || acpError.isResourceNotFound
+    }
+
+    /// Structured diagnostics for session/load attempts.
+    /// Keep keys stable so we can grep/analyze logs across real-device runs.
+    private func sessionLoadObservabilityExtra(
+        error: Error?,
+        cwd: String,
+        candidateIndex: Int,
+        candidateCount: Int
+    ) -> [String: String] {
+        var extra: [String: String] = [
+            "cwd": cwd,
+            "candidateIndex": "\(candidateIndex + 1)",
+            "candidateCount": "\(candidateCount)"
+        ]
+        extra.merge(acpErrorObservabilityExtra(error)) { current, _ in current }
+        return extra
+    }
+
+    private func acpErrorObservabilityExtra(_ error: Error?) -> [String: String] {
+        guard let error else { return [:] }
+        var extra: [String: String] = [
+            "errorType": String(describing: type(of: error))
+        ]
+        if let acpError = error as? ACPError {
+            if let rpcCode = acpError.rpcCode {
+                extra["rpcCode"] = "\(rpcCode)"
+            }
+            if let details = acpError.details, !details.isEmpty {
+                extra["details"] = truncateLogField(details)
+            }
+            if let backendRequestID = acpError.backendRequestID {
+                extra["backendRequestId"] = backendRequestID
+            }
+            extra["isSessionNotFound"] = acpError.isSessionNotFound ? "true" : "false"
+            extra["isResourceNotFound"] = acpError.isResourceNotFound ? "true" : "false"
+            extra["isQueryClosedBeforeResponse"] = acpError.isQueryClosedBeforeResponse ? "true" : "false"
+            extra["isNotAttached"] = acpError.isNotAttached ? "true" : "false"
+        }
+        return extra
+    }
+
+    private func truncateLogField(_ value: String, limit: Int = 300) -> String {
+        guard value.count > limit else { return value }
+        let end = value.index(value.startIndex, offsetBy: limit)
+        return String(value[..<end]) + "...(truncated)"
     }
 
     /// Build ordered takeover command candidates, starting with the session's
@@ -1783,12 +1860,18 @@ final class AppState {
                 && index < commandCandidates.count - 1
 
             if shouldRetryWithAlternateCommand {
+                var retryExtra = acpErrorObservabilityExtra(loadResult.lastError)
+                retryExtra["candidateCommand"] = candidateCommand
+                retryExtra["takeoverAttempt"] = "\(index + 1)"
+                retryExtra["takeoverAttemptCount"] = "\(commandCandidates.count)"
+                retryExtra["externalSessionCwd"] = externalSessionCwd
                 Log.log(
                     level: "warning",
                     component: "AppState",
                     "external takeover load failed for command \(candidateCommand); retrying alternate command",
                     traceId: traceId,
-                    sessionId: externalSessionId
+                    sessionId: externalSessionId,
+                    extra: retryExtra
                 )
                 do {
                     try await daemon.killSession(sessionId: newSessionId, traceId: traceId)

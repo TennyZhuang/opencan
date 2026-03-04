@@ -249,3 +249,31 @@ func TestSetState_DeadIsTerminal(t *testing.T) {
 		t.Fatalf("proxy state = %v, want %v", p.State(), StateDead)
 	}
 }
+
+func TestRPCErrorDataSummary_DetailsObject(t *testing.T) {
+	raw := json.RawMessage(`{"details":"Query closed before response received"}`)
+	got := rpcErrorDataSummary(&raw)
+	want := "Query closed before response received"
+	if got != want {
+		t.Fatalf("rpcErrorDataSummary() = %q, want %q", got, want)
+	}
+}
+
+func TestRPCErrorDataSummary_StringPayload(t *testing.T) {
+	raw := json.RawMessage(`"missing field mcpServers"`)
+	got := rpcErrorDataSummary(&raw)
+	want := "missing field mcpServers"
+	if got != want {
+		t.Fatalf("rpcErrorDataSummary() = %q, want %q", got, want)
+	}
+}
+
+func TestRPCErrorDataSummary_Empty(t *testing.T) {
+	if got := rpcErrorDataSummary(nil); got != "" {
+		t.Fatalf("rpcErrorDataSummary(nil) = %q, want empty", got)
+	}
+	raw := json.RawMessage(`null`)
+	if got := rpcErrorDataSummary(&raw); got != "" {
+		t.Fatalf("rpcErrorDataSummary(null) = %q, want empty", got)
+	}
+}
