@@ -472,6 +472,119 @@ func TestDaemon_SessionList_DiscoversExternalWithoutManagedSessions(t *testing.T
 	}
 }
 
+func TestDaemon_SessionList_DeadManagedLoadableSessionShownAsExternal(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found, run 'make mock-acp' first")
+	}
+
+	t.Setenv("OPENCAN_DISCOVERY_COMMANDS", mockBin)
+	t.Setenv("MOCK_CRASH_AFTER", "1")
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Create a managed session.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.create",
+		"params": map[string]interface{}{
+			"cwd":     "/tmp",
+			"command": mockBin,
+		},
+	})
+	resp := readResponseWithID(t, scanner, 1)
+	if resp["error"] != nil {
+		t.Fatalf("session.create error: %v", resp["error"])
+	}
+	sessionID, _ := resp["result"].(map[string]interface{})["sessionId"].(string)
+	if sessionID == "" {
+		t.Fatalf("missing sessionId in create response: %v", resp["result"])
+	}
+
+	// Attach so session/prompt can be routed.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.attach",
+		"params": map[string]interface{}{
+			"sessionId":    sessionID,
+			"lastEventSeq": 0,
+			"clientId":     "test-client",
+		},
+	})
+	resp = readResponseWithID(t, scanner, 2)
+	if resp["error"] != nil {
+		t.Fatalf("session.attach error: %v", resp["error"])
+	}
+
+	// Trigger mock ACP crash so daemon marks managed proxy dead.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": sessionID,
+			"prompt": []map[string]interface{}{
+				{
+					"type": "text",
+					"text": "crash",
+				},
+			},
+		},
+	})
+
+	// Expose the same session ID via external discovery.
+	t.Setenv("MOCK_LIST_SESSIONS", sessionID)
+
+	deadline := time.Now().Add(5 * time.Second)
+	var lastState string
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		reqID := float64(100 + attempt)
+		sendJSON(conn, map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      reqID,
+			"method":  "daemon/session.list",
+			"params":  map[string]interface{}{},
+		})
+
+		resp = readResponseWithID(t, scanner, reqID)
+		if resp["error"] != nil {
+			t.Fatalf("session.list error: %v", resp["error"])
+		}
+
+		result, _ := resp["result"].(map[string]interface{})
+		items, _ := result["sessions"].([]interface{})
+		lastState = ""
+		for _, raw := range items {
+			item, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			id, _ := item["sessionId"].(string)
+			if id != sessionID {
+				continue
+			}
+			lastState, _ = item["state"].(string)
+			break
+		}
+		if lastState == "external" {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("expected %s to be listed as external after managed death; lastState=%q", sessionID, lastState)
+}
+
 func TestDaemon_SessionCreate(t *testing.T) {
 	// This test requires the mock-acp-server binary
 	mockBin := findMockBin(t)

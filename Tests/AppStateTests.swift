@@ -1471,6 +1471,56 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testResumeExternalSessionTakeoverRetriesAlternateCommandAfterSessionNotFound() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAgentAvailabilityByID([
+            "claude": true,
+            "codex": true,
+        ])
+        await appState.refreshAvailableAgents()
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string("external-session-notfound"),
+                "cwd": .string("/test/path"),
+                "state": .string("external"),
+                "lastEventSeq": .int(0),
+            ]
+        ])
+        await transport.setNextLoadError(
+            code: -32603,
+            message: "Internal error",
+            data: .object([
+                "details": .string("Session not found")
+            ])
+        )
+        await transport.setMockLoadSteps([
+            .userMessageChunk("External conversation"),
+            .textDelta("Recovered after not-found command retry."),
+            .promptComplete(.endTurn),
+        ])
+        await appState.refreshDaemonSessions()
+
+        try await appState.resumeSession(sessionId: "external-session-notfound", modelContext: modelContext)
+
+        let createCommands = await transport.getCreateCommands()
+        XCTAssertGreaterThanOrEqual(createCommands.count, 2, "Should retry takeover with another command when first loader reports not found")
+        XCTAssertEqual(createCommands.first, AgentCommandStore.command(for: .claude))
+        XCTAssertTrue(createCommands.contains(AgentCommandStore.command(for: .codex)))
+
+        let killed = await transport.getKilledSessionIds()
+        XCTAssertEqual(killed.count, 1, "Failed takeover attempt should be cleaned up")
+        XCTAssertTrue(
+            appState.messages.contains { $0.role == .assistant && $0.content.contains("Recovered after not-found command retry.") }
+        )
+    }
+
     func testResumeExternalSessionTakeoverCleansCreatedSessionWhenAttachFails() async throws {
         try await connectMock()
 

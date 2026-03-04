@@ -1632,6 +1632,8 @@ final class AppState {
     private func shouldRetryExternalTakeoverWithAlternateCommand(after error: Error?) -> Bool {
         guard let acpError = error as? ACPError else { return false }
         return acpError.isQueryClosedBeforeResponse
+            || acpError.isSessionNotFound
+            || acpError.isResourceNotFound
     }
 
     private struct SessionLoadResult {

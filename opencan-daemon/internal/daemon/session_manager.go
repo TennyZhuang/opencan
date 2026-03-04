@@ -105,11 +105,6 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 	sm.mu.RUnlock()
 
 	// Collect the set of daemon-managed session IDs.
-	daemonIDs := make(map[string]struct{}, len(proxies))
-	for _, p := range proxies {
-		daemonIDs[p.SessionID] = struct{}{}
-	}
-
 	// Always probe ACP session/list when we have any proxy available.
 	// The result serves two purposes:
 	//   1. Filter idle/completed daemon sessions that are no longer loadable.
@@ -122,6 +117,30 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 	}
 	externalLimit := externalSessionLimit()
 
+	// Dead managed entries can outlive their ACP process while the same session
+	// remains loadable from backend storage. In that case, show it as External
+	// instead of masking it as Dead.
+	deadLoadableIDs := make(map[string]struct{})
+	if hasLoadableSet {
+		for _, p := range proxies {
+			if p.State() != proxy.StateDead {
+				continue
+			}
+			if _, ok := loadableIDs[p.SessionID]; ok {
+				deadLoadableIDs[p.SessionID] = struct{}{}
+			}
+		}
+	}
+
+	// Collect daemon-managed IDs that should suppress external rows.
+	daemonIDs := make(map[string]struct{}, len(proxies))
+	for _, p := range proxies {
+		if _, deadLoadable := deadLoadableIDs[p.SessionID]; deadLoadable {
+			continue
+		}
+		daemonIDs[p.SessionID] = struct{}{}
+	}
+
 	estimatedCapacity := len(proxies)
 	if hasLoadableSet {
 		estimatedCapacity += min(len(loadableSessions), externalLimit)
@@ -130,6 +149,13 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 
 	// Daemon-managed sessions (with loadability filtering for idle/completed).
 	for _, p := range proxies {
+		if _, deadLoadable := deadLoadableIDs[p.SessionID]; deadLoadable {
+			sm.logger.Debug(
+				"session is dead in daemon but loadable externally; exposing as external",
+				"sessionId", p.SessionID,
+			)
+			continue
+		}
 		state := p.State()
 		if shouldFilterSessionFromList(state, p.GetClient() == nil) && hasLoadableSet {
 			if _, ok := loadableIDs[p.SessionID]; !ok {
