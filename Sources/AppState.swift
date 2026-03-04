@@ -16,6 +16,8 @@ final class AppState {
     private(set) var promptResponseMaxWaitSeconds: TimeInterval = 15 * 60
     /// Poll cadence while waiting for terminal `session/prompt` response.
     private let promptResponsePollIntervalSeconds: TimeInterval = 1
+    /// Per-attempt timeout for `session/load` so resume never waits forever.
+    private(set) var sessionLoadTimeoutSeconds: TimeInterval = 12
     private static let mentionRegex = try! NSRegularExpression(pattern: #"@[A-Za-z0-9_-]+"#)
     private static let daemonAttachClientIDDefaultsKey = "opencan.daemonAttachClientID"
 
@@ -40,6 +42,11 @@ final class AppState {
         if let maxWaitSeconds {
             promptResponseMaxWaitSeconds = maxWaitSeconds
         }
+    }
+
+    /// Test-only knob for `session/load` timeout.
+    func configureSessionLoadTimeoutForTesting(seconds: TimeInterval) {
+        sessionLoadTimeoutSeconds = max(0.05, seconds)
     }
 
     // Active connection context
@@ -711,41 +718,42 @@ final class AppState {
         var didObserveHistoryNotFound = false
 
         if isRunning {
-            // Running session: always trigger a history load pass so resume does
-            // not depend solely on replay buffer density.
+            // Running session: replay daemon buffer first. In-flight prompts can
+            // keep ACP busy and block concurrent session/load for a long time,
+            // so we only run blocking load backfill when replay produced no
+            // renderable transcript.
             isPrompting = true
-            isLoadingHistory = true
-            defer { isLoadingHistory = false }
-            Log.toFile("[AppState] Loading history via session/load for running session \(sessionId)...")
-            let primaryCwds = loadCwdCandidates(
-                preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
-                workspace: workspace
-            )
-            let primaryLoadResult = await loadSessionFromCandidates(
-                sessionId: sessionId,
-                traceId: traceId,
-                candidateCwds: primaryCwds
-            )
-            didAttemptHistoryBackfill = true
-            didObserveHistoryNotFound = primaryLoadResult.sawNotFound
-            if let loadedPrimaryCwd = primaryLoadResult.loadedCwd {
-                didSucceedHistoryBackfill = true
-                resolvedSessionCwd = loadedPrimaryCwd
+            for buffered in result.bufferedEvents {
+                if let event = SessionUpdateParser.parse(buffered.event) {
+                    handleSessionEvent(event, sessionId: sessionId)
+                }
+                lastEventSeq[sessionId] = buffered.seq
             }
 
-            if didSucceedHistoryBackfill {
-                for buffered in result.bufferedEvents {
-                    let existingSeq = lastEventSeq[sessionId] ?? 0
-                    lastEventSeq[sessionId] = max(existingSeq, buffered.seq)
+            let hasVisibleReplay = hasRenderableConversation()
+            if !hasVisibleReplay {
+                isLoadingHistory = true
+                defer { isLoadingHistory = false }
+                Log.toFile("[AppState] Loading history via session/load for running session \(sessionId)...")
+                let primaryCwds = loadCwdCandidates(
+                    preferred: [existingSession?.sessionCwd, daemonKnownCwd, workspace.path],
+                    workspace: workspace
+                )
+                let primaryLoadResult = await loadSessionFromCandidates(
+                    sessionId: sessionId,
+                    traceId: traceId,
+                    candidateCwds: primaryCwds
+                )
+                didAttemptHistoryBackfill = true
+                didObserveHistoryNotFound = primaryLoadResult.sawNotFound
+                if let loadedPrimaryCwd = primaryLoadResult.loadedCwd {
+                    didSucceedHistoryBackfill = true
+                    resolvedSessionCwd = loadedPrimaryCwd
                 }
             } else {
-                // Fallback to replay when session/load failed.
-                for buffered in result.bufferedEvents {
-                    if let event = SessionUpdateParser.parse(buffered.event) {
-                        handleSessionEvent(event, sessionId: sessionId)
-                    }
-                    lastEventSeq[sessionId] = buffered.seq
-                }
+                Log.toFile(
+                    "[AppState] Resumed running session \(sessionId) via buffered replay (\(result.bufferedEvents.count) events), skipping blocking session/load"
+                )
             }
 
             // Always clear isPrompting after resume to avoid locking input.
@@ -1555,6 +1563,18 @@ final class AppState {
         var sawNotFound = false
         var lastError: Error?
         for (index, cwd) in candidateCwds.enumerated() {
+            Log.log(
+                component: "AppState",
+                "session/load attempt started",
+                traceId: traceId,
+                sessionId: sessionId,
+                extra: sessionLoadObservabilityExtra(
+                    error: nil,
+                    cwd: cwd,
+                    candidateIndex: index,
+                    candidateCount: candidateCwds.count
+                )
+            )
             do {
                 try await Log.timed(
                     "session/load",
@@ -1562,11 +1582,13 @@ final class AppState {
                     traceId: traceId,
                     sessionId: sessionId
                 ) {
-                    try await service.loadSession(
-                        sessionId: sessionId,
-                        cwd: cwd,
-                        traceId: traceId
-                    )
+                    try await withThrowingTimeout(seconds: max(1, sessionLoadTimeoutSeconds)) {
+                        try await service.loadSession(
+                            sessionId: sessionId,
+                            cwd: cwd,
+                            traceId: traceId
+                        )
+                    }
                 }
                 Log.log(
                     component: "AppState",
@@ -1623,6 +1645,10 @@ final class AppState {
 
     /// Whether we should stop trying more cwd candidates for session/load.
     private func shouldStopSessionLoadRetries(after error: Error) -> Bool {
+        if let appStateError = error as? AppStateError,
+           case .timeout = appStateError {
+            return true
+        }
         guard let acpError = error as? ACPError else { return false }
         return acpError.isNotAttached || acpError.isQueryClosedBeforeResponse
     }
@@ -2454,14 +2480,92 @@ func withThrowingTimeout<T: Sendable>(
     seconds: TimeInterval,
     operation: @escaping @Sendable () async throws -> T
 ) async throws -> T {
-    try await withThrowingTaskGroup(of: T.self) { group in
-        group.addTask { try await operation() }
-        group.addTask {
-            try await Task.sleep(for: .seconds(seconds))
-            throw AppStateError.timeout
+    let timeoutSeconds = max(0.001, seconds)
+    let box = TimeoutRaceBox<T>()
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+            box.installContinuation(continuation)
+
+            let operationTask = Task {
+                do {
+                    let value = try await operation()
+                    box.resolve(.success(value))
+                } catch {
+                    box.resolve(.failure(error))
+                }
+            }
+
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(for: .seconds(timeoutSeconds))
+                } catch {
+                    // Canceled because the operation completed first.
+                    return
+                }
+                box.resolve(.failure(AppStateError.timeout))
+            }
+
+            box.installTasks(operationTask: operationTask, timeoutTask: timeoutTask)
         }
-        let result = try await group.next()!
-        group.cancelAll()
-        return result
+    } onCancel: {
+        box.resolve(.failure(CancellationError()))
+    }
+}
+
+/// Coordinates timeout-vs-operation races without waiting for canceled tasks to
+/// cooperatively finish. This avoids hangs when the canceled operation is stuck
+/// in a non-cancellation-aware await.
+private final class TimeoutRaceBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Error>?
+    private var operationTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+    private var resolved = false
+
+    func installContinuation(_ continuation: CheckedContinuation<T, Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !resolved else {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        self.continuation = continuation
+    }
+
+    func installTasks(operationTask: Task<Void, Never>, timeoutTask: Task<Void, Never>) {
+        lock.lock()
+        if resolved {
+            lock.unlock()
+            operationTask.cancel()
+            timeoutTask.cancel()
+            return
+        }
+        self.operationTask = operationTask
+        self.timeoutTask = timeoutTask
+        lock.unlock()
+    }
+
+    func resolve(_ result: Result<T, Error>) {
+        let continuation: CheckedContinuation<T, Error>?
+        let operationTask: Task<Void, Never>?
+        let timeoutTask: Task<Void, Never>?
+
+        lock.lock()
+        if resolved {
+            lock.unlock()
+            return
+        }
+        resolved = true
+        continuation = self.continuation
+        self.continuation = nil
+        operationTask = self.operationTask
+        self.operationTask = nil
+        timeoutTask = self.timeoutTask
+        self.timeoutTask = nil
+        lock.unlock()
+
+        operationTask?.cancel()
+        timeoutTask?.cancel()
+        continuation?.resume(with: result)
     }
 }
