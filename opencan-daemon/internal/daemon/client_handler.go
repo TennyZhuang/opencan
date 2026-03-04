@@ -25,6 +25,7 @@ type ClientHandler struct {
 	conn            net.Conn
 	scanner         *bufio.Scanner
 	attachedProxies map[string]*proxy.ACPProxy
+	attachedMu      sync.RWMutex
 	daemon          *Daemon
 	logger          *slog.Logger
 
@@ -110,16 +111,77 @@ func (h *ClientHandler) Serve() {
 
 func (h *ClientHandler) cleanup() {
 	// Detach from all sessions but don't kill them
-	for sid, p := range h.attachedProxies {
+	for sid, p := range h.snapshotAttachedProxies() {
 		p.DetachClient(h)
 		h.logger.Info("detached from session", "sessionId", sid)
 	}
+	h.attachedMu.Lock()
 	h.attachedProxies = nil
+	h.attachedMu.Unlock()
 	h.writeMu.Lock()
 	h.closed = true
 	h.writeMu.Unlock()
 	h.conn.Close()
 	h.daemon.clientDisconnected(h)
+}
+
+func (h *ClientHandler) snapshotAttachedProxies() map[string]*proxy.ACPProxy {
+	h.attachedMu.RLock()
+	defer h.attachedMu.RUnlock()
+	if len(h.attachedProxies) == 0 {
+		return map[string]*proxy.ACPProxy{}
+	}
+	out := make(map[string]*proxy.ACPProxy, len(h.attachedProxies))
+	for sid, p := range h.attachedProxies {
+		out[sid] = p
+	}
+	return out
+}
+
+func (h *ClientHandler) getAttachedProxy(sessionID string) (*proxy.ACPProxy, bool) {
+	h.attachedMu.RLock()
+	defer h.attachedMu.RUnlock()
+	p, ok := h.attachedProxies[sessionID]
+	return p, ok
+}
+
+func (h *ClientHandler) setAttachedProxy(sessionID string, p *proxy.ACPProxy) {
+	h.attachedMu.Lock()
+	defer h.attachedMu.Unlock()
+	if h.attachedProxies == nil {
+		return
+	}
+	h.attachedProxies[sessionID] = p
+}
+
+func (h *ClientHandler) removeAttachedProxy(sessionID string) (*proxy.ACPProxy, bool) {
+	h.attachedMu.Lock()
+	defer h.attachedMu.Unlock()
+	if h.attachedProxies == nil {
+		return nil, false
+	}
+	p, ok := h.attachedProxies[sessionID]
+	if ok {
+		delete(h.attachedProxies, sessionID)
+	}
+	return p, ok
+}
+
+func (h *ClientHandler) removeAttachedProxyIfMatches(sessionID string, expected *proxy.ACPProxy) bool {
+	h.attachedMu.Lock()
+	defer h.attachedMu.Unlock()
+	if h.attachedProxies == nil {
+		return false
+	}
+	current, ok := h.attachedProxies[sessionID]
+	if !ok {
+		return false
+	}
+	if expected != nil && current != expected {
+		return false
+	}
+	delete(h.attachedProxies, sessionID)
+	return true
 }
 
 // Send sends a message to the client (implements proxy.ClientConn).
@@ -200,7 +262,10 @@ func (h *ClientHandler) handleAgentProbe(msg *protocol.Message) {
 		Agents []AgentProbeRequest `json:"agents"`
 	}
 	if msg.Params != nil {
-		json.Unmarshal(*msg.Params, &params)
+		if err := json.Unmarshal(*msg.Params, &params); err != nil {
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "invalid params: "+err.Error()))
+			return
+		}
 	}
 
 	results := ProbeAgentCommands(params.Agents)
@@ -260,12 +325,23 @@ func (h *ClientHandler) handleSessionAttach(msg *protocol.Message) {
 	}
 
 	// Attach client (single owner per session)
+	previousClient := p.GetClient()
 	state, attached := p.TryAttachClientWithOwner(h, params.ClientID)
 	if !attached {
 		h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "session already attached by another client: "+params.SessionID))
 		return
 	}
-	h.attachedProxies[params.SessionID] = p
+	h.setAttachedProxy(params.SessionID, p)
+
+	// Same-owner reclaim transfers ACPProxy ownership to this handler, so prune
+	// stale cache entries from the old handler immediately.
+	if previousClient != nil && previousClient != h {
+		if previousHandler, ok := previousClient.(*ClientHandler); ok {
+			if previousHandler.removeAttachedProxyIfMatches(params.SessionID, p) {
+				logger.Info("pruned stale attached proxy entry from previous owner", "sessionId", params.SessionID)
+			}
+		}
+	}
 
 	// Get buffered events since lastEventSeq
 	buffered := p.EventBuf().Since(params.LastEventSeq)
@@ -286,9 +362,8 @@ func (h *ClientHandler) handleSessionDetach(msg *protocol.Message) {
 		json.Unmarshal(*msg.Params, &params)
 	}
 
-	if p, ok := h.attachedProxies[params.SessionID]; ok {
+	if p, ok := h.removeAttachedProxy(params.SessionID); ok {
 		p.DetachClient(h)
-		delete(h.attachedProxies, params.SessionID)
 	}
 
 	result, _ := json.Marshal(map[string]interface{}{})
@@ -321,9 +396,8 @@ func (h *ClientHandler) handleSessionKill(msg *protocol.Message) {
 	}
 
 	// Detach if attached
-	if p, ok := h.attachedProxies[params.SessionID]; ok {
+	if p, ok := h.removeAttachedProxy(params.SessionID); ok {
 		p.DetachClient(h)
-		delete(h.attachedProxies, params.SessionID)
 	}
 
 	if err := h.daemon.sessions.KillSession(params.SessionID); err != nil {
@@ -369,50 +443,100 @@ func (h *ClientHandler) handleLogs(msg *protocol.Message) {
 // handleACPRequest forwards non-daemon requests to the appropriate ACPProxy.
 func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 	logger := h.loggerForMessage(msg)
-	sessionID := protocol.ExtractSessionID(msg)
-	if sessionID == "" {
+	requestedSessionID := protocol.ExtractSessionID(msg)
+	if requestedSessionID == "" {
 		if msg.ID != nil {
 			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "sessionId required in params"))
 		}
 		return
 	}
 
-	p, ok := h.attachedProxies[sessionID]
+	resolvedSessionID := requestedSessionID
+	p, ok := h.getAttachedProxy(requestedSessionID)
+
 	// For session/load, treat unknown sessionId as a history reference and route
-	// to the sole attached proxy when there is exactly one.
-	if !ok && msg.Method == protocol.MethodSessionLoad && len(h.attachedProxies) == 1 {
-		for attachedSessionID, attachedProxy := range h.attachedProxies {
+	// to the sole live attached proxy when there is exactly one.
+	// iOS external-takeover flow relies on this contract.
+	if !ok && msg.Method == protocol.MethodSessionLoad {
+		if attachedSessionID, attachedProxy, routeable := h.selectSoleRoutableProxyForSessionLoad(logger); routeable {
+			resolvedSessionID = attachedSessionID
 			p = attachedProxy
 			ok = true
 			logger.Info(
 				"routing session/load to attached proxy",
-				"requestedSessionId", sessionID,
+				"requestedSessionId", requestedSessionID,
 				"attachedSessionId", attachedSessionID,
 				"attachedCommand", attachedProxy.Command,
 			)
-			break
 		}
 	}
+
 	if !ok {
 		if msg.ID != nil {
-			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+sessionID))
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+requestedSessionID))
 		}
 		return
 	}
-	if p.GetClient() != h {
-		logger.Warn("rejecting request from stale session owner", "sessionId", sessionID, "method", msg.Method)
+
+	if p.State() == proxy.StateDead {
+		h.removeAttachedProxyIfMatches(resolvedSessionID, p)
+		logger.Warn("rejecting request for dead session", "sessionId", resolvedSessionID, "method", msg.Method)
 		if msg.ID != nil {
-			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+sessionID))
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "session is dead: "+resolvedSessionID))
+		}
+		return
+	}
+
+	if p.GetClient() != h {
+		h.removeAttachedProxyIfMatches(resolvedSessionID, p)
+		logger.Warn("rejecting request from stale session owner", "sessionId", resolvedSessionID, "method", msg.Method)
+		if msg.ID != nil {
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+requestedSessionID))
 		}
 		return
 	}
 
 	if err := p.ForwardFromClient(msg, h); err != nil {
-		logger.Error("forward to ACP", "error", err, "sessionId", sessionID)
+		logger.Error("forward to ACP", "error", err, "sessionId", resolvedSessionID)
 		if msg.ID != nil {
 			h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "failed to forward: "+err.Error()))
 		}
 	}
+}
+
+func (h *ClientHandler) selectSoleRoutableProxyForSessionLoad(logger *slog.Logger) (string, *proxy.ACPProxy, bool) {
+	attached := h.snapshotAttachedProxies()
+	var selectedSessionID string
+	var selectedProxy *proxy.ACPProxy
+
+	for sessionID, p := range attached {
+		if p == nil {
+			h.removeAttachedProxyIfMatches(sessionID, nil)
+			continue
+		}
+		if p.State() == proxy.StateDead {
+			if h.removeAttachedProxyIfMatches(sessionID, p) {
+				logger.Warn("pruned dead attached proxy entry", "sessionId", sessionID)
+			}
+			continue
+		}
+		if p.GetClient() != h {
+			if h.removeAttachedProxyIfMatches(sessionID, p) {
+				logger.Warn("pruned stale attached proxy entry after ownership change", "sessionId", sessionID)
+			}
+			continue
+		}
+		if selectedProxy != nil {
+			return "", nil, false
+		}
+		selectedSessionID = sessionID
+		selectedProxy = p
+	}
+
+	if selectedProxy == nil {
+		return "", nil, false
+	}
+	return selectedSessionID, selectedProxy, true
 }
 
 // ForwardServerRequest rewrites the ID of a server-initiated request and tracks the

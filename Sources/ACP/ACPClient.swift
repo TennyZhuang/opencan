@@ -230,44 +230,38 @@ enum ACPError: Error, LocalizedError {
 
     /// True for terminal lookup misses where retrying different cwd is pointless.
     var isSessionNotFound: Bool {
-        guard case .rpcError(_, let message, let data) = self else { return false }
-        let details = data?["details"]?.stringValue ?? ""
-        let combined = "\(message) \(details)".lowercased()
-        return combined.contains("session not found")
+        matchesMessageOrDetails(phrase: "session not found")
     }
 
     /// True when upstream reports the requested history/session resource is missing.
     var isResourceNotFound: Bool {
-        guard case .rpcError(_, let message, let data) = self else { return false }
-        let details = data?["details"]?.stringValue ?? ""
-        let combined = "\(message) \(details)".lowercased()
-        return combined.contains("resource not found")
+        matchesMessageOrDetails(phrase: "resource not found")
+    }
+
+    /// `session/load` specific resource-missing signal.
+    /// Keep this narrower than generic `isResourceNotFound` to avoid unrelated
+    /// resource errors triggering takeover retries.
+    var isSessionLoadResourceNotFound: Bool {
+        guard case .rpcError(let code, _, _) = self else { return false }
+        guard code == -32002 || code == -32603 else { return false }
+        return isResourceNotFound
     }
 
     /// True when the request was routed to a proxy we're not attached to.
     var isNotAttached: Bool {
-        guard case .rpcError(_, let message, let data) = self else { return false }
-        let details = data?["details"]?.stringValue ?? ""
-        let combined = "\(message) \(details)".lowercased()
-        return combined.contains("not attached to session")
+        matchesMessageOrDetails(phrase: "not attached to session")
     }
 
     /// True when daemon/session.attach failed because another client owns it.
     var isSessionAlreadyAttachedByAnotherClient: Bool {
-        guard case .rpcError(_, let message, let data) = self else { return false }
-        let details = data?["details"]?.stringValue ?? ""
-        let combined = "\(message) \(details)".lowercased()
-        return combined.contains("session already attached by another client")
+        matchesMessageOrDetails(phrase: "session already attached by another client")
     }
 
     /// True when upstream closed the in-flight query before producing a response.
     /// This is typically terminal for the current routed backend and should not
     /// trigger repeated cwd retries.
     var isQueryClosedBeforeResponse: Bool {
-        guard case .rpcError(_, let message, let data) = self else { return false }
-        let details = data?["details"]?.stringValue ?? ""
-        let combined = "\(message) \(details)".lowercased()
-        return combined.contains("query closed before response received")
+        matchesMessageOrDetails(phrase: "query closed before response received")
     }
 
     /// True when upstream model routing has no available backend provider.
@@ -306,5 +300,23 @@ enum ACPError: Error, LocalizedError {
             return String(text[range])
         }
         return nil
+    }
+
+    private func matchesMessageOrDetails(phrase: String) -> Bool {
+        guard case .rpcError(_, let message, let data) = self else { return false }
+        let details = data?["details"]?.stringValue ?? ""
+        return ACPError.containsStandalonePhrase(phrase, in: message)
+            || ACPError.containsStandalonePhrase(phrase, in: details)
+    }
+
+    private static func containsStandalonePhrase(_ phrase: String, in text: String) -> Bool {
+        let normalizedPhrase = phrase.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedText = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedPhrase.isEmpty, !normalizedText.isEmpty else { return false }
+        let escaped = NSRegularExpression.escapedPattern(for: normalizedPhrase)
+        let pattern = "(?<![a-z0-9])\(escaped)(?![a-z0-9])"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
+        let range = NSRange(normalizedText.startIndex..<normalizedText.endIndex, in: normalizedText)
+        return regex.firstMatch(in: normalizedText, options: [], range: range) != nil
     }
 }

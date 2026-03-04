@@ -1254,6 +1254,46 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(lastAttachSessionId, previousSessionId)
     }
 
+    func testResumeAttachFailureAndRestoreFailureClearsCurrentSessionId() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let previousSessionId = try XCTUnwrap(appState.currentSessionId)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAttachError(
+            code: -32603,
+            message: "Internal error while attaching",
+            data: nil
+        )
+
+        let busySession = Session(sessionId: "busy-session-restore-fails", workspace: workspace)
+        modelContext.insert(busySession)
+        try modelContext.save()
+
+        do {
+            try await appState.resumeSession(sessionId: "busy-session-restore-fails", modelContext: modelContext)
+            XCTFail("Expected resumeSession to fail")
+        } catch {
+            // expected
+        }
+
+        XCTAssertNil(
+            appState.currentSessionId,
+            "When target+restore attach both fail, currentSessionId must be cleared to avoid stale detached pointer"
+        )
+
+        let methods = await transport.getReceivedMethods()
+        let attachCalls = methods.filter { $0 == DaemonMethods.sessionAttach }.count
+        XCTAssertGreaterThanOrEqual(attachCalls, 2, "Should attempt rollback attach")
+
+        let lastAttachSessionId = await transport.getLastAttachSessionId()
+        XCTAssertEqual(lastAttachSessionId, previousSessionId)
+    }
+
     func testResumeSessionAlreadyAttachedByAnotherClientDoesNotRecover() async throws {
         try await connectMock()
 

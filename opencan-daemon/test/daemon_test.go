@@ -364,6 +364,33 @@ func TestDaemon_AgentProbe(t *testing.T) {
 	}
 }
 
+func TestDaemon_AgentProbeMalformedParamsReturnsInvalidParams(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/agent.probe",
+		"params":  "malformed",
+	})
+
+	resp := readJSON(t, conn)
+	if resp["error"] == nil {
+		t.Fatalf("expected invalid params error, got response: %#v", resp)
+	}
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error object, got %#v", resp["error"])
+	}
+	if code := errObj["code"].(float64); code != -32602 {
+		t.Fatalf("expected -32602 invalid params, got %v", code)
+	}
+}
+
 func TestDaemon_DaemonNotificationWithoutIDDoesNotCrash(t *testing.T) {
 	d, sockPath := testDaemon(t)
 	defer d.Stop()
@@ -1246,6 +1273,121 @@ func TestDaemon_SessionAttachAllowsSameClientIDReclaim(t *testing.T) {
 	resp = readResponseWithID(t, scanner3, 1)
 	if resp["error"] == nil {
 		t.Fatal("expected attach rejection for different clientId")
+	}
+}
+
+func TestDaemon_SessionAttachReclaimPrunesPreviousHandlerCache(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	defer conn1.Close()
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Client1 creates and attaches a session.
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.create",
+		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
+	})
+	resp := readResponseWithID(t, scanner1, 1)
+	if resp["error"] != nil {
+		t.Fatalf("session.create error: %v", resp["error"])
+	}
+	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.attach",
+		"params": map[string]interface{}{
+			"sessionId":    sessionID,
+			"lastEventSeq": 0,
+			"clientId":     "ios-app-1",
+		},
+	})
+	resp = readResponseWithID(t, scanner1, 2)
+	if resp["error"] != nil {
+		t.Fatalf("session.attach error: %v", resp["error"])
+	}
+
+	// Client2 reclaims ownership of session A using same clientId.
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn2, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/session.attach",
+		"params": map[string]interface{}{
+			"sessionId":    sessionID,
+			"lastEventSeq": 0,
+			"clientId":     "ios-app-1",
+		},
+	})
+	resp = readResponseWithID(t, scanner2, 1)
+	if resp["error"] != nil {
+		t.Fatalf("client2 reclaim attach error: %v", resp["error"])
+	}
+
+	// Old connection should no longer route session/load via stale local cache.
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "session/load",
+		"params": map[string]interface{}{
+			"sessionId":  "external-session-id",
+			"cwd":        "/tmp",
+			"mcpServers": []interface{}{},
+		},
+	})
+	resp = readResponseWithID(t, scanner1, 3)
+	if resp["error"] == nil {
+		t.Fatal("expected stale owner session/load rejection")
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: external-session-id") {
+		t.Fatalf("unexpected stale owner session/load error: %v", resp["error"])
+	}
+
+	// Verify reclaim path emitted explicit stale-cache prune observability.
+	sendJSON(conn2, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/logs",
+		"params": map[string]interface{}{
+			"count": 200,
+		},
+	})
+	resp = readResponseWithID(t, scanner2, 2)
+	if resp["error"] != nil {
+		t.Fatalf("daemon/logs error: %v", resp["error"])
+	}
+	entries := resp["result"].(map[string]interface{})["entries"].([]interface{})
+	foundPruneLog := false
+	for _, raw := range entries {
+		entry, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if !strings.Contains(fmt.Sprint(entry), "pruned stale attached proxy entry from previous owner") {
+			continue
+		}
+		foundPruneLog = true
+		break
+	}
+	if !foundPruneLog {
+		t.Fatal("expected reclaim path to log stale attached proxy prune")
 	}
 }
 

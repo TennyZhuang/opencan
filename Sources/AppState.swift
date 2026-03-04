@@ -1629,7 +1629,7 @@ final class AppState {
 
     private func shouldTreatSessionLoadFailureAsNotFound(_ error: Error) -> Bool {
         guard let acpError = error as? ACPError else { return false }
-        return acpError.isSessionNotFound || acpError.isResourceNotFound
+        return acpError.isSessionNotFound || acpError.isSessionLoadResourceNotFound
     }
 
     /// Structured diagnostics for session/load attempts.
@@ -1710,7 +1710,7 @@ final class AppState {
         guard let acpError = error as? ACPError else { return false }
         return acpError.isQueryClosedBeforeResponse
             || acpError.isSessionNotFound
-            || acpError.isResourceNotFound
+            || acpError.isSessionLoadResourceNotFound
     }
 
     private struct SessionLoadResult {
@@ -1845,6 +1845,10 @@ final class AppState {
                 msg.isStreaming = false
             }
 
+            // Coupled with daemon `session/load` fallback routing:
+            // we intentionally send the external history sessionId while attached
+            // to the new managed proxy, and daemon routes this load request to the
+            // sole live attached proxy for this client.
             let loadResult = await loadSessionFromCandidates(
                 sessionId: externalSessionId,
                 traceId: traceId,
@@ -2010,6 +2014,11 @@ final class AppState {
                 sessionId: previousSessionId
             )
         } catch {
+            // Both target attach and rollback attach failed. Clear stale active
+            // attachment pointer so UI does not think the detached session is live.
+            if currentSessionId == previousSessionId || currentSessionId == failedTargetSessionId {
+                currentSessionId = nil
+            }
             Log.log(
                 level: "warning",
                 component: "AppState",
@@ -2288,8 +2297,9 @@ final class AppState {
         }
     }
 
-    /// Execute daemon session list outside MainActor isolation so prompt polling
-    /// does not run transport RPC work on the UI actor.
+    /// Nonisolated helper for prompt watchdog polling.
+    /// `DaemonClient` is its own actor; this just avoids implicitly binding the
+    /// polling helper itself to MainActor.
     nonisolated private func fetchDaemonSessionsForPromptWatchdog(
         daemon: DaemonClient,
         traceId: String?

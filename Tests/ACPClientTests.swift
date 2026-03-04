@@ -163,4 +163,38 @@ final class ACPClientTests: XCTestCase {
         await transport.yield(.response(id: id, result: .object([:])))
         _ = try await pending.value
     }
+
+    func testACPErrorSessionAndResourceNotFoundClassificationUsesWordBoundaries() {
+        let sessionNotFound = ACPError.rpcError(
+            code: -32603,
+            message: "Internal error",
+            data: .object(["details": .string("Session not found")])
+        )
+        XCTAssertTrue(sessionNotFound.isSessionNotFound)
+
+        let resourceNotFound = ACPError.rpcError(
+            code: -32002,
+            message: "Resource not found",
+            data: nil
+        )
+        XCTAssertTrue(resourceNotFound.isResourceNotFound)
+        XCTAssertTrue(resourceNotFound.isSessionLoadResourceNotFound)
+
+        let falsePositive = ACPError.rpcError(
+            code: -32002,
+            message: "Internal error",
+            data: .object(["details": .string("resource not foundry artifact")])
+        )
+        XCTAssertFalse(falsePositive.isResourceNotFound)
+    }
+
+    func testACPErrorSessionLoadResourceNotFoundIsCodeScoped() {
+        let nonLoadResourceError = ACPError.rpcError(
+            code: -32000,
+            message: "Resource not found",
+            data: nil
+        )
+        XCTAssertTrue(nonLoadResourceError.isResourceNotFound)
+        XCTAssertFalse(nonLoadResourceError.isSessionLoadResourceNotFound)
+    }
 }
