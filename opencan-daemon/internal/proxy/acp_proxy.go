@@ -486,12 +486,18 @@ func (p *ACPProxy) CurrentOwnerID() string {
 
 // DetachClient removes the client if it matches.
 func (p *ACPProxy) DetachClient(c ClientConn) {
-	current := p.client.Load()
-	if current != nil && current.conn == c {
-		p.client.Store(nil)
+	for {
+		current := p.client.Load()
+		if current == nil || current.conn != c {
+			return
+		}
+		if !p.client.CompareAndSwap(current, nil) {
+			continue
+		}
 		if p.State() == StatePrompting {
 			p.setState(StateDraining)
 		}
+		return
 	}
 }
 

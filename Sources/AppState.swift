@@ -1732,11 +1732,11 @@ final class AppState {
             } catch {
                 do {
                     try await daemon.killSession(sessionId: newSessionId, traceId: traceId)
-                } catch {
+                } catch let killError {
                     Log.log(
                         level: "warning",
                         component: "AppState",
-                        "failed to cleanup takeover attach-failure session \(newSessionId): \(error.localizedDescription)",
+                        "failed to cleanup takeover attach-failure session \(newSessionId): \(killError.localizedDescription)",
                         traceId: traceId,
                         sessionId: newSessionId
                     )

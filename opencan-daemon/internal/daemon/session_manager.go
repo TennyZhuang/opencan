@@ -249,7 +249,11 @@ func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD stri
 	succeeded := false
 	externalLimit := externalSessionLimit()
 
+resultsLoop:
 	for _, r := range results {
+		if len(merged) >= externalLimit {
+			break
+		}
 		if r.err != nil {
 			lastErr = r.err
 			sm.logger.Debug(
@@ -264,7 +268,7 @@ func (sm *SessionManager) discoverExternalSessionsWithoutProxy(discoveryCWD stri
 		succeeded = true
 		for _, s := range r.sessions {
 			if len(merged) >= externalLimit {
-				break
+				break resultsLoop
 			}
 			if s.SessionID == "" {
 				continue
