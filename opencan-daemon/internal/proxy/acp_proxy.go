@@ -241,6 +241,12 @@ func (p *ACPProxy) readLoop() {
 			p.handleServerRequest(msg)
 		}
 	}
+
+	if err := p.scanner.Err(); err != nil {
+		p.logger.Warn("acp stdout scanner stopped", "session", p.SessionID, "error", err)
+	} else {
+		p.logger.Info("acp stdout closed", "session", p.SessionID)
+	}
 }
 
 func (p *ACPProxy) handleNotification(msg *protocol.Message) {
@@ -316,7 +322,7 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 }
 
 func (p *ACPProxy) logRequestOutcome(pr PendingRequest, msg *protocol.Message, durationMs int64) {
-	if pr.Method != protocol.MethodSessionLoad {
+	if pr.Method != protocol.MethodSessionLoad && pr.Method != protocol.MethodSessionPrompt {
 		return
 	}
 	logger := p.logger
@@ -328,10 +334,15 @@ func (p *ACPProxy) logRequestOutcome(pr PendingRequest, msg *protocol.Message, d
 		requestedSessionID = p.SessionID
 	}
 	if msg.IsError() && msg.Error != nil {
+		logMsg := "session/load upstream error"
+		if pr.Method == protocol.MethodSessionPrompt {
+			logMsg = "session/prompt upstream terminal error"
+		}
 		logger.Warn(
-			"session/load upstream error",
+			logMsg,
 			"session", p.SessionID,
 			"command", p.Command,
+			"method", pr.Method,
 			"requestedSessionId", requestedSessionID,
 			"durationMs", durationMs,
 			"code", msg.Error.Code,
@@ -340,10 +351,15 @@ func (p *ACPProxy) logRequestOutcome(pr PendingRequest, msg *protocol.Message, d
 		)
 		return
 	}
+	logMsg := "session/load upstream success"
+	if pr.Method == protocol.MethodSessionPrompt {
+		logMsg = "session/prompt upstream terminal success"
+	}
 	logger.Info(
-		"session/load upstream success",
+		logMsg,
 		"session", p.SessionID,
 		"command", p.Command,
+		"method", pr.Method,
 		"requestedSessionId", requestedSessionID,
 		"durationMs", durationMs,
 	)
@@ -581,16 +597,34 @@ func (p *ACPProxy) ForwardFromClient(msg *protocol.Message, client ClientConn) e
 			return fmt.Errorf("session is dead")
 		}
 		internalID := p.nextInternalID.Add(1)
+		traceID := protocol.ExtractTraceID(msg)
+		requestedSessionID := protocol.ExtractSessionID(msg)
 		p.pendingMu.Lock()
 		p.pendingRequests[internalID] = PendingRequest{
 			OriginalID:         msg.ID,
 			Client:             client,
 			Method:             msg.Method,
-			TraceID:            protocol.ExtractTraceID(msg),
-			RequestedSessionID: protocol.ExtractSessionID(msg),
+			TraceID:            traceID,
+			RequestedSessionID: requestedSessionID,
 			StartedAt:          time.Now(),
 		}
 		p.pendingMu.Unlock()
+
+		if msg.Method == protocol.MethodSessionLoad || msg.Method == protocol.MethodSessionPrompt {
+			logger := p.logger
+			if traceID != "" {
+				logger = logger.With("traceId", traceID)
+			}
+			logger.Info(
+				"forwarding request upstream",
+				"session", p.SessionID,
+				"command", p.Command,
+				"method", msg.Method,
+				"internalId", internalID,
+				"requestedSessionId", requestedSessionID,
+				"state", p.State().String(),
+			)
+		}
 
 		fwd := msg.Clone()
 		newID := protocol.IntID(internalID)
@@ -599,6 +633,21 @@ func (p *ACPProxy) ForwardFromClient(msg *protocol.Message, client ClientConn) e
 			p.pendingMu.Lock()
 			delete(p.pendingRequests, internalID)
 			p.pendingMu.Unlock()
+			if msg.Method == protocol.MethodSessionLoad || msg.Method == protocol.MethodSessionPrompt {
+				logger := p.logger
+				if traceID != "" {
+					logger = logger.With("traceId", traceID)
+				}
+				logger.Warn(
+					"failed to forward request upstream",
+					"session", p.SessionID,
+					"command", p.Command,
+					"method", msg.Method,
+					"internalId", internalID,
+					"requestedSessionId", requestedSessionID,
+					"error", err,
+				)
+			}
 			return err
 		}
 		if msg.Method == protocol.MethodSessionPrompt {

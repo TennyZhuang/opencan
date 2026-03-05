@@ -556,24 +556,36 @@ final class AppState {
         let traceId = newTraceId()
 
         if let externalDaemonSession = daemonSessions.first(where: { $0.sessionId == sessionId }),
-           externalDaemonSession.state == "external",
-           let mappedManagedSession = mappedManagedSessionForExternal(
-               externalSessionId: sessionId,
-               workspace: workspace,
-               modelContext: modelContext
-           ),
-           mappedManagedSession.sessionId != sessionId,
-           let mappedDaemonSession = daemonSessions.first(where: { $0.sessionId == mappedManagedSession.sessionId }),
-           mappedDaemonSession.state != "dead",
-           mappedDaemonSession.state != "external" {
+           externalDaemonSession.state == "external" {
+            let mappedManagedSession = mappedManagedSessionForExternal(
+                externalSessionId: sessionId,
+                workspace: workspace,
+                modelContext: modelContext
+            )
+            if let mappedManagedSession, mappedManagedSession.sessionId != sessionId {
+                let mappedDaemonState = daemonSessions.first(where: { $0.sessionId == mappedManagedSession.sessionId })?.state
+                    ?? "missing"
+                Log.log(
+                    component: "AppState",
+                    "redirecting external session \(sessionId) to existing managed session \(mappedManagedSession.sessionId)",
+                    traceId: traceId,
+                    sessionId: sessionId,
+                    extra: [
+                        "mappedSessionId": mappedManagedSession.sessionId,
+                        "mappedDaemonState": mappedDaemonState
+                    ]
+                )
+                try await resumeSession(sessionId: mappedManagedSession.sessionId, modelContext: modelContext)
+                return
+            }
             Log.log(
                 component: "AppState",
-                "redirecting external session \(sessionId) to existing managed session \(mappedManagedSession.sessionId)",
+                mappedManagedSession == nil
+                    ? "external session has no local managed mapping; proceeding with takeover"
+                    : "external session mapping points to itself; proceeding with takeover",
                 traceId: traceId,
                 sessionId: sessionId
             )
-            try await resumeSession(sessionId: mappedManagedSession.sessionId, modelContext: modelContext)
-            return
         }
 
         let sessionDescriptor = FetchDescriptor<Session>(
@@ -853,7 +865,17 @@ final class AppState {
             modelContext.insert(session)
             self.activeSession = session
         }
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            Log.log(
+                level: "warning",
+                component: "AppState",
+                "failed to persist resumed session metadata: \(error.localizedDescription)",
+                traceId: traceId,
+                sessionId: sessionId
+            )
+        }
 
         let statusMsg: String
         if isRunning {
@@ -1318,7 +1340,11 @@ final class AppState {
         }
 
         modelContext.delete(session)
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            Log.toFile("[AppState] Failed to persist empty-session deletion \(sessionId): \(error)")
+        }
 
         if currentSessionId == sessionId {
             currentSessionId = nil

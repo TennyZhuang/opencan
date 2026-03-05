@@ -496,6 +496,17 @@ func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 		return
 	}
 
+	if msg.Method == protocol.MethodSessionLoad || msg.Method == protocol.MethodSessionPrompt {
+		logger.Info(
+			"forwarding request to ACP proxy",
+			"method", msg.Method,
+			"requestedSessionId", requestedSessionID,
+			"resolvedSessionId", resolvedSessionID,
+			"proxyState", p.State().String(),
+			"attachedOwnerId", p.CurrentOwnerID(),
+		)
+	}
+
 	if err := p.ForwardFromClient(msg, h); err != nil {
 		logger.Error("forward to ACP", "error", err, "sessionId", resolvedSessionID)
 		if msg.ID != nil {

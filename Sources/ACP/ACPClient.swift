@@ -6,6 +6,7 @@ actor ACPClient {
     private let transport: any ACPTransport
     private var nextId = 1000  // Start high to avoid collision with server-initiated request IDs
     private var pendingRequests: [JSONRPCMessage.JSONRPCID: CheckedContinuation<JSONValue, Error>] = [:]
+    private var pendingRequestMethods: [JSONRPCMessage.JSONRPCID: String] = [:]
     private let notificationContinuation: AsyncStream<JSONRPCMessage>.Continuation
     nonisolated let notifications: AsyncStream<JSONRPCMessage>
     private var readTask: Task<Void, Never>?
@@ -44,17 +45,56 @@ actor ACPClient {
         sentRequestIds.insert(id)
         let finalParams = injectTraceId(traceId, into: params)
         let message = JSONRPCMessage.request(id: id, method: method, params: finalParams)
+        let shouldLogLifecycle = shouldLogRequestLifecycle(method)
+        if shouldLogLifecycle {
+            Log.log(
+                component: "ACPClient",
+                "queueing request",
+                traceId: traceId,
+                extra: ["method": method, "requestId": "\(id)"]
+            )
+        }
         // Store continuation BEFORE sending so the response can't arrive first
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
                 pendingRequests[id] = cont
+                pendingRequestMethods[id] = method
                 Task { [weak self] in
                     guard let self else { return }
                     do {
+                        if shouldLogLifecycle {
+                            Log.log(
+                                component: "ACPClient",
+                                "sending request to transport",
+                                traceId: traceId,
+                                extra: ["method": method, "requestId": "\(id)"]
+                            )
+                        }
                         try await self.transport.send(message)
+                        if shouldLogLifecycle {
+                            Log.log(
+                                component: "ACPClient",
+                                "request sent to transport",
+                                traceId: traceId,
+                                extra: ["method": method, "requestId": "\(id)"]
+                            )
+                        }
                     } catch {
                         if let c = await self.removePending(id) {
                             c.resume(throwing: error)
+                        }
+                        if shouldLogLifecycle {
+                            Log.log(
+                                level: "warning",
+                                component: "ACPClient",
+                                "request send failed",
+                                traceId: traceId,
+                                extra: [
+                                    "method": method,
+                                    "requestId": "\(id)",
+                                    "error": "\(error)"
+                                ]
+                            )
                         }
                         await self.removeSentRequestId(id)
                     }
@@ -66,9 +106,22 @@ actor ACPClient {
                 if let c = await self.removePending(id) {
                     c.resume(throwing: CancellationError())
                 }
+                if shouldLogLifecycle {
+                    Log.log(
+                        level: "warning",
+                        component: "ACPClient",
+                        "request cancelled",
+                        traceId: traceId,
+                        extra: ["method": method, "requestId": "\(id)"]
+                    )
+                }
                 await self.removeSentRequestId(id)
             }
         }
+    }
+
+    private func shouldLogRequestLifecycle(_ method: String) -> Bool {
+        method == ACPMethods.sessionLoad || method == ACPMethods.sessionPrompt
     }
 
     private func injectTraceId(_ traceId: String?, into params: JSONValue?) -> JSONValue? {
@@ -103,7 +156,8 @@ actor ACPClient {
     }
 
     private func removePending(_ id: JSONRPCMessage.JSONRPCID) -> CheckedContinuation<JSONValue, Error>? {
-        pendingRequests.removeValue(forKey: id)
+        pendingRequestMethods.removeValue(forKey: id)
+        return pendingRequests.removeValue(forKey: id)
     }
 
     private func removeSentRequestId(_ id: JSONRPCMessage.JSONRPCID) {
@@ -120,14 +174,36 @@ actor ACPClient {
         switch message {
         case .response(let id, let result):
             sentRequestIds.remove(id)
+            let method = pendingRequestMethods.removeValue(forKey: id)
             if let c = pendingRequests.removeValue(forKey: id) {
                 c.resume(returning: result)
+            }
+            if let method, shouldLogRequestLifecycle(method) {
+                Log.log(
+                    component: "ACPClient",
+                    "received terminal response",
+                    extra: ["method": method, "requestId": "\(id)"]
+                )
             }
         case .error(let id, let code, let msg, let data):
             if let id {
                 sentRequestIds.remove(id)
+                let method = pendingRequestMethods.removeValue(forKey: id)
                 if let c = pendingRequests.removeValue(forKey: id) {
                     c.resume(throwing: ACPError.rpcError(code: code, message: msg, data: data))
+                }
+                if let method, shouldLogRequestLifecycle(method) {
+                    Log.log(
+                        level: "warning",
+                        component: "ACPClient",
+                        "received terminal error",
+                        extra: [
+                            "method": method,
+                            "requestId": "\(id)",
+                            "rpcCode": "\(code)",
+                            "rpcMessage": msg
+                        ]
+                    )
                 }
             }
         case .notification(_, _):
@@ -193,6 +269,7 @@ actor ACPClient {
             c.resume(throwing: CancellationError())
         }
         pendingRequests.removeAll()
+        pendingRequestMethods.removeAll()
     }
 
     private func finishNotifications() {

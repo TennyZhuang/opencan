@@ -1129,9 +1129,6 @@ final class AppStateTests: XCTestCase {
         appState.sendMessage("New message")
         XCTAssertTrue(appState.isPrompting, "Should be able to send to draining session")
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
-
-        let methods = await transport.getReceivedMethods()
-        XCTAssertTrue(methods.contains(ACPMethods.sessionLoad), "Running resume should always trigger session/load")
     }
 
     func testResumeDrainingPromptCompleteInBuffer() async throws {
@@ -1159,7 +1156,7 @@ final class AppStateTests: XCTestCase {
         )
     }
 
-    func testResumeRunningSessionAlwaysLoadsHistory() async throws {
+    func testResumeRunningSessionLoadsHistoryWhenReplayIsEmpty() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -1168,10 +1165,7 @@ final class AppStateTests: XCTestCase {
         }
 
         await transport.setMockAttachState("prompting")
-        let bufferedEvents = buildBufferedEvents([
-            .textDelta("buffer replay content"),
-        ])
-        await transport.setMockAttachBufferedEvents(bufferedEvents)
+        await transport.setMockAttachBufferedEvents([])
         await transport.setMockLoadSteps([
             .userMessageChunk("history question"),
             .textDelta("history answer"),
@@ -1186,6 +1180,92 @@ final class AppStateTests: XCTestCase {
             appState.messages.contains { $0.role == .assistant && $0.content.contains("history answer") },
             "Running resume should apply loaded history content"
         )
+    }
+
+    func testResumeRunningSessionSkipsBlockingLoadWhenReplayIsAvailable() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAttachState("prompting")
+        await transport.setMockAttachBufferedEvents(
+            buildBufferedEvents([
+                .textDelta("Buffered fallback after load timeout."),
+                .promptComplete(.endTurn)
+            ])
+        )
+        await transport.setMockLoadShouldHang(true)
+
+        let sessionId = "running-load-hang"
+        let session = Session(sessionId: sessionId, workspace: workspace)
+        modelContext.insert(session)
+        try modelContext.save()
+
+        let startedAt = Date()
+        try await appState.resumeSession(sessionId: sessionId, modelContext: modelContext)
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        XCTAssertLessThan(
+            elapsed,
+            2.0,
+            "Running resume should not block on session/load when replay already has visible history"
+        )
+        XCTAssertFalse(appState.isLoadingHistory)
+        XCTAssertFalse(appState.isPrompting)
+        XCTAssertTrue(
+            appState.messages.contains { $0.role == .assistant && $0.content.contains("Buffered fallback after load timeout.") },
+            "Should replay buffered history when session/load times out"
+        )
+        let methods = await transport.getReceivedMethods()
+        XCTAssertFalse(
+            methods.contains(ACPMethods.sessionLoad),
+            "Running resume with visible buffered replay should not issue blocking session/load"
+        )
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("Session resumed (still running)")
+            },
+            "Should surface a non-blocking running resume status"
+        )
+    }
+
+    func testResumeRunningSessionLoadTimeoutDoesNotBlockForeverWhenReplayEmpty() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        appState.configureSessionLoadTimeoutForTesting(seconds: 0.2)
+        await transport.setMockAttachState("prompting")
+        await transport.setMockAttachBufferedEvents([])
+        await transport.setMockLoadShouldHang(true)
+
+        let sessionId = "running-load-timeout"
+        let session = Session(sessionId: sessionId, workspace: workspace)
+        modelContext.insert(session)
+        try modelContext.save()
+
+        let startedAt = Date()
+        try await appState.resumeSession(sessionId: sessionId, modelContext: modelContext)
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        XCTAssertLessThan(
+            elapsed,
+            2.0,
+            "Running resume should stop waiting after session/load timeout when replay is empty"
+        )
+        let methods = await transport.getReceivedMethods()
+        XCTAssertTrue(
+            methods.contains(ACPMethods.sessionLoad),
+            "Should attempt session/load backfill when running replay is empty"
+        )
+        XCTAssertFalse(appState.isLoadingHistory)
+        XCTAssertFalse(appState.isPrompting)
     }
 
     func testResumeSameActiveSessionReusesInMemoryTranscript() async throws {
@@ -1458,6 +1538,58 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(methods.contains(ACPMethods.sessionLoad), "External takeover should load external history")
         XCTAssertTrue(
             appState.messages.contains { $0.role == .assistant && $0.content.contains("Continued on mobile.") }
+        )
+    }
+
+    func testResumeExternalSessionRedirectsToMappedManagedSessionWithoutDaemonManagedRow() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        let externalSessionId = "external-session-mapped"
+        let managedSessionId = "managed-session-local"
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string(externalSessionId),
+                "cwd": .string("/test/path"),
+                "state": .string("external"),
+                "lastEventSeq": .int(0),
+            ]
+        ])
+        await transport.setMockAttachState("idle")
+        await transport.setMockLoadSteps([
+            .userMessageChunk("External conversation"),
+            .textDelta("Reused mapped managed session."),
+            .promptComplete(.endTurn),
+        ])
+        await appState.refreshDaemonSessions()
+
+        let mapped = Session(
+            sessionId: managedSessionId,
+            canonicalSessionId: externalSessionId,
+            sessionCwd: "/test/path",
+            workspace: workspace
+        )
+        modelContext.insert(mapped)
+        try modelContext.save()
+
+        try await appState.resumeSession(sessionId: externalSessionId, modelContext: modelContext)
+
+        XCTAssertEqual(appState.currentSessionId, managedSessionId)
+        let lastAttachSessionId = await transport.getLastAttachSessionId()
+        XCTAssertEqual(lastAttachSessionId, managedSessionId)
+
+        let methods = await transport.getReceivedMethods()
+        XCTAssertFalse(
+            methods.contains(DaemonMethods.sessionCreate),
+            "Mapped external resume should not create a new takeover session"
+        )
+        XCTAssertTrue(
+            appState.messages.contains { $0.role == .assistant && $0.content.contains("Reused mapped managed session.") }
         )
     }
 

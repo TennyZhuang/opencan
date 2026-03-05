@@ -32,6 +32,8 @@ actor MockACPTransport: ACPTransport {
     /// Specific (sessionId, cwd) pairs that should fail on session/load.
     /// Format: "\(sessionId)|\(cwd)".
     var mockLoadFailSessionCwdPairs: Set<String> = []
+    /// If true, session/load receives no response (simulates upstream hang).
+    var mockLoadShouldHang = false
     /// Optional one-shot error injected for the next session/load request.
     var nextLoadError: (code: Int, message: String, data: JSONValue?)?
     /// Tracks the most recent session/load params for assertions.
@@ -247,6 +249,9 @@ actor MockACPTransport: ACPTransport {
             let cwd = params?["cwd"]?.stringValue ?? ""
             lastLoadSessionId = sessionId
             lastLoadCwd = cwd
+            if mockLoadShouldHang {
+                return
+            }
             if let nextLoadError {
                 self.nextLoadError = nil
                 messageContinuation.yield(
@@ -465,6 +470,10 @@ actor MockACPTransport: ACPTransport {
 
     func setNextLoadError(code: Int, message: String, data: JSONValue?) {
         nextLoadError = (code: code, message: message, data: data)
+    }
+
+    func setMockLoadShouldHang(_ shouldHang: Bool) {
+        mockLoadShouldHang = shouldHang
     }
 
     func setMockAgentAvailabilityByID(_ availability: [String: Bool]) {
