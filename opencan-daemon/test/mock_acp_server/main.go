@@ -24,6 +24,7 @@ var crashAfter = 0
 var includeToolCall = false
 var omitPromptComplete = false
 var omitCreatedFromList = false
+var loadErrorDetails = ""
 var sessions []string
 var configuredListSessions []string
 
@@ -46,6 +47,9 @@ func init() {
 	}
 	if os.Getenv("MOCK_LIST_OMIT_CREATED") == "1" {
 		omitCreatedFromList = true
+	}
+	if v := os.Getenv("MOCK_SESSION_LOAD_ERROR"); v != "" {
+		loadErrorDetails = strings.TrimSpace(v)
 	}
 	if v := os.Getenv("MOCK_LIST_SESSIONS"); v != "" {
 		for _, token := range strings.Split(v, ",") {
@@ -105,6 +109,21 @@ func respond(id *json.RawMessage, result interface{}) {
 		JSONRPC: "2.0",
 		ID:      id,
 		Result:  data,
+	}
+	out, _ := json.Marshal(msg)
+	fmt.Fprintln(os.Stdout, string(out))
+}
+
+func respondError(id *json.RawMessage, code int, message string, data interface{}) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"code":    code,
+		"message": message,
+		"data":    data,
+	})
+	msg := jsonrpcMessage{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error:   payload,
 	}
 	out, _ := json.Marshal(msg)
 	fmt.Fprintln(os.Stdout, string(out))
@@ -259,5 +278,32 @@ func handleSessionList(id *json.RawMessage) {
 }
 
 func handleSessionLoad(id *json.RawMessage, params json.RawMessage) {
+	var payload struct {
+		SessionID  string        `json:"sessionId"`
+		CWD        string        `json:"cwd"`
+		MCPServers []interface{} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(params, &payload); err != nil {
+		respondError(id, -32602, "Invalid params", err.Error())
+		return
+	}
+	if payload.SessionID == "" {
+		respondError(id, -32602, "Invalid params", "missing field `sessionId`")
+		return
+	}
+	if payload.CWD == "" {
+		respondError(id, -32602, "Invalid params", "missing field `cwd`")
+		return
+	}
+	if payload.MCPServers == nil {
+		respondError(id, -32602, "Invalid params", "missing field `mcpServers`")
+		return
+	}
+	if loadErrorDetails != "" {
+		respondError(id, -32603, "Internal error", map[string]interface{}{
+			"details": loadErrorDetails,
+		})
+		return
+	}
 	respond(id, map[string]interface{}{})
 }

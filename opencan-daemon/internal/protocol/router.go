@@ -2,14 +2,15 @@ package protocol
 
 // Daemon method constants.
 const (
-	MethodDaemonHello         = "daemon/hello"
-	MethodDaemonAgentProbe    = "daemon/agent.probe"
-	MethodDaemonSessionCreate = "daemon/session.create"
-	MethodDaemonSessionAttach = "daemon/session.attach"
-	MethodDaemonSessionDetach = "daemon/session.detach"
-	MethodDaemonSessionList   = "daemon/session.list"
-	MethodDaemonSessionKill   = "daemon/session.kill"
-	MethodDaemonLogs          = "daemon/logs"
+	MethodDaemonHello              = "daemon/hello"
+	MethodDaemonAgentProbe         = "daemon/agent.probe"
+	MethodDaemonSessionList        = "daemon/session.list"
+	MethodDaemonSessionKill        = "daemon/session.kill"
+	MethodDaemonConversationCreate = "daemon/conversation.create"
+	MethodDaemonConversationOpen   = "daemon/conversation.open"
+	MethodDaemonConversationDetach = "daemon/conversation.detach"
+	MethodDaemonConversationList   = "daemon/conversation.list"
+	MethodDaemonLogs               = "daemon/logs"
 )
 
 // ACP method constants (for daemon-internal use during session creation).

@@ -4,6 +4,10 @@ import SwiftData
 @Model
 final class Session {
     var sessionId: String
+    /// Stable logical conversation identity. For newly created conversations it
+    /// typically matches `sessionId`; after daemon restore it keeps the original
+    /// history ID while `sessionId` tracks the current runtime.
+    var conversationId: String?
     /// Original history session ID when this local record represents a managed
     /// takeover of an external ACP session.
     var canonicalSessionId: String?
@@ -21,6 +25,7 @@ final class Session {
 
     init(
         sessionId: String,
+        conversationId: String? = nil,
         canonicalSessionId: String? = nil,
         sessionCwd: String? = nil,
         agentID: String? = nil,
@@ -28,6 +33,7 @@ final class Session {
         workspace: Workspace? = nil
     ) {
         self.sessionId = sessionId
+        self.conversationId = conversationId
         self.canonicalSessionId = canonicalSessionId
         self.sessionCwd = sessionCwd
         self.createdAt = Date()
@@ -35,5 +41,15 @@ final class Session {
         self.agentID = agentID
         self.agentCommand = agentCommand
         self.workspace = workspace
+    }
+
+    var stableConversationId: String {
+        if let conversationId = conversationId?.trimmingCharacters(in: .whitespacesAndNewlines), !conversationId.isEmpty {
+            return conversationId
+        }
+        if let canonicalSessionId = canonicalSessionId?.trimmingCharacters(in: .whitespacesAndNewlines), !canonicalSessionId.isEmpty {
+            return canonicalSessionId
+        }
+        return sessionId
     }
 }

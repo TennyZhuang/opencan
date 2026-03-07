@@ -102,25 +102,4 @@ struct ACPService {
         }
     }
 
-    /// Load an existing session by ID.
-    /// - Parameters:
-    ///   - sessionId: The session to load from disk (ACP reads this session's history).
-    ///   - cwd: Working directory for the session.
-    func loadSession(
-        sessionId: String,
-        cwd: String,
-        traceId: String? = nil
-    ) async throws {
-        let params: JSONValue = .object([
-            "sessionId": .string(sessionId),
-            "cwd": .string(cwd),
-            "mcpServers": .array([])
-        ])
-        let result = try await client.sendRequest(
-            method: ACPMethods.sessionLoad,
-            params: params,
-            traceId: traceId
-        )
-        Log.toFile("[ACPService] session/load result: \(result)")
-    }
 }

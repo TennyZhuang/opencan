@@ -85,13 +85,13 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to configured
 
 2. **JSON-RPC** - `JSONRPCFramer` (actor) buffers PTY bytes, skips non-JSON noise, and extracts newline-delimited JSON messages. `JSONRPCMessage` preserves explicit `result: null` as `.null`. `JSONValue` is the generic JSON helper with subscript access.
 
-3. **Daemon** - `opencan-daemon` is a Go process on the remote server that owns ACP process lifecycle independent of SSH. `attach` bridges stdio to `~/.opencan/daemon.sock`. `daemon/` methods are handled locally (`hello`, `agent.probe`, `session.create`, `session.attach`, `session.detach`, `session.list`, `session.kill`, `logs`). Non-`daemon/` requests are forwarded to the attached proxy for that exact `sessionId`.
+3. **Daemon** - `opencan-daemon` is a Go process on the remote server that owns ACP process lifecycle independent of SSH. `attach` bridges stdio to `~/.opencan/daemon.sock`. `daemon/` methods are handled locally (`hello`, `agent.probe`, `conversation.create`, `conversation.open`, `conversation.detach`, `conversation.list`, `session.list`, `session.kill`, `logs`). Non-`daemon/` ACP requests are forwarded to the currently attached runtime, using the ACP wire `sessionId` that corresponds to the active `runtimeId`.
 
 4. **ACP** - `ACPClient` (actor) correlates request IDs, handles cancellation, dispatches notifications, filters PTY echoes via `sentRequestIds`, and auto-approves `session/request_permission`. `sendRequest()` injects `_meta.traceId` into object/nil params. `DaemonClient` provides typed daemon wrappers, including agent probe and daemon log fetch. `ACPService` wraps ACP passthrough (`sendPrompt`, `loadSession`) with structured prompt blocks (`PromptBlock.text`, `PromptBlock.resourceLink`). `SessionUpdateParser` maps `session/update` notifications to `SessionEvent`.
 
-5. **Persistence** - SwiftData models: `Node` (SSH host + optional jump server), `Workspace` (remote cwd), `Session` (daemon session binding + agent metadata), `SSHKeyPair` (RSA key data). `Session` stores `sessionCwd`, `agentID`, `agentCommand`. Cascade delete: Node -> Workspaces -> Sessions.
+5. **Persistence** - SwiftData models: `Node` (SSH host + optional jump server), `Workspace` (remote cwd), `Session` (local conversation record + agent metadata), `SSHKeyPair` (RSA key data). `Session` persists the stable conversation identity plus `sessionCwd`, `agentID`, and `agentCommand`; daemon runtimes remain ephemeral. Cascade delete: Node -> Workspaces -> Sessions.
 
-6. **AppState** - `@MainActor @Observable` coordinator. `connect(node:)` establishes SSH + daemon with 30s timeout (`daemon/hello`). `refreshAvailableAgents()` probes launcher availability and marks reliability (`hasReliableAgentAvailability`). `createNewSession()` picks preferred/fallback agent command. `resumeSession()` is strictly 1:1: attach/replay when daemon still owns the session, or mark the session dead when attach reports missing ownership (including external sessions). Before switching sessions, AppState detaches prior attachments via `daemon/session.detach`. `lastEventSeq` tracks replay cursors. `sendMessage()` supports image mentions (`@img_xxx`) by turning referenced uploads into ACP `resource_link` prompt blocks. AppState persists a stable per-install `daemonAttachClientID` in `UserDefaults` and sends it on `daemon/session.attach` so reconnects can reclaim ownership from stale transports. Unexpected transport exits call `markTransportInterrupted(...)` to preserve active node/workspace/session context while clearing runtime transport state; `recoverInterruptedSessionIfNeeded(...)` reconnects and resumes the same session on chat re-entry.
+6. **AppState** - `@MainActor @Observable` coordinator. `connect(node:)` establishes SSH + daemon with 30s timeout (`daemon/hello`). `refreshAvailableAgents()` probes launcher availability and marks reliability (`hasReliableAgentAvailability`). `createNewSession()` picks preferred/fallback agent command. `openSession(sessionId:)` is the single reopen/recover path: it reuses an existing managed runtime via `daemon/conversation.open`, restores from daemon-owned history when needed, or marks the conversation dead when reopen fails. Before switching sessions, AppState detaches the prior conversation via `daemon/conversation.detach`. `lastEventSeq` tracks replay cursors per conversation/runtime pairing. `sendMessage()` supports image mentions (`@img_xxx`) by turning referenced uploads into ACP `resource_link` prompt blocks. AppState persists a stable per-install `daemonAttachClientID` in `UserDefaults` and sends it as `ownerId` on `daemon/conversation.open` / `daemon/conversation.create` so reconnects can reclaim ownership from stale transports. Unexpected transport exits call `markTransportInterrupted(...)` to preserve active node/workspace/session context while clearing runtime transport state; `recoverInterruptedSessionIfNeeded(...)` reconnects and reopens the same conversation on chat re-entry.
 
 7. **SwiftUI/UIKit hybrid UI** - `ContentView` hosts `NavigationStack`: `NodeListView -> WorkspaceListView -> SessionPickerView -> ChatView`. Connection scope is node-level at `WorkspaceListView`. `NodeListView` gear menu includes **Agent Settings** and **Diagnostics**. `SessionPickerView` merges daemon + local sessions into `UnifiedSession`, applies workspace path normalization (tilde/home aliases), and shows state badges (`idle/prompting/draining/completed/dead/external`). `ChatMessageListView` uses ListViewKit (FlowDown-style timeline) for stable streaming updates; `InputBarView` supports PhotosPicker uploads and `@mention` autocomplete. `ChatView` triggers interrupted-session recovery on `onAppear` and when scene phase returns to active. `--uitesting-integration` implies UI testing mode, but `WorkspaceListView` still takes the real SSH path for integration runs (`isUITesting && !isUIIntegrationTesting` gate).
 
@@ -101,9 +101,9 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to configured
 - PTY echoes stdin writes on stdout; `ACPClient` ignores echoed requests by request ID.
 - Trace correlation uses `_meta.traceId` on requests; daemon extracts it into slog context.
 - `session/request_permission` is auto-approved when no client is attached (draining mode).
-- Daemon forwards `session/update` notifications with `__seq`; iOS persists per-session cursors for replay.
-- `daemon/session.attach` is single-owner with `clientId` reclaim semantics: one attached connection per daemon session, but a reconnect with the same `clientId` can atomically transfer ownership from a stale connection.
-- `daemon/session.list` supports optional `cwd` to scope external session discovery.
+- Daemon forwards `session/update` notifications with `__seq`; iOS persists replay cursors against the active conversation/runtime pair.
+- `daemon/conversation.open` is single-owner with `ownerId` reclaim semantics: one attached client per managed runtime, but a reconnect with the same `ownerId` can atomically transfer ownership from a stale connection.
+- `daemon/session.list` is a runtime-oriented diagnostic endpoint and supports optional `cwd` scoping for external history discovery.
 - `daemon/agent.probe` checks configured launcher commands on the remote host.
 - `daemon/logs` returns recent in-memory structured daemon logs (optional `traceId` filter).
 
@@ -125,13 +125,13 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
    - JSON-RPC error response for `session/prompt`, or
    - JSON-RPC success response for `session/prompt` (fallback when `prompt_complete` is missing).
 2. **No stale daemon running state:** after a terminal prompt signal, daemon state must not remain `prompting`/`draining`; it transitions to `idle` (attached client) or `completed` (detached/draining).
-3. **Delivery + replay ordering:** forwarded `session/update` notifications carry `__seq`; `daemon/session.attach(lastEventSeq)` replays buffered events with `seq > lastEventSeq` in order.
+3. **Delivery + replay ordering:** forwarded `session/update` notifications carry `__seq`; `daemon/conversation.open(lastEventSeq, lastRuntimeId)` replays buffered events with `seq > lastEventSeq` in order, or resets replay when the runtime changes during restore.
 4. **Scoped UI application:** AppState applies updates only for the active chat session ID.
 5. **Renderable output guarantee:** assistant/user/tool updates must mutate `AppState.messages` so visible transcript content survives live streaming and replay.
 
 **Contract regression tests to keep green:**
 - Daemon: `TestRouteResponse_PromptSuccessClearsRunningState`, `TestRouteResponse_PromptSuccessClearsDrainingStateWithoutClient`, `TestDaemon_PromptResponseWithoutPromptCompleteStillEndsPrompting`, `TestDaemon_LogsEndpointSupportsTraceFiltering`.
-- iOS AppState: `testNewSessionSendMessage`, `testSendMessageWithoutPromptCompleteStillClearsPrompting`, `testIgnoresNotificationsFromOtherSessions`, `testResumeDrainingPromptCompleteInBuffer`, `testResumeMissingSessionMarksDeadAndThrowsNotRecoverable`, `testResumeExternalSessionTakeover`, `testSendMessageWithImageMentionAddsResourceLinkPromptBlock`.
+- iOS AppState: `testNewSessionSendMessage`, `testSendMessageWithoutPromptCompleteStillClearsPrompting`, `testIgnoresNotificationsFromOtherSessions`, `testOpenDrainingConversationPromptCompleteInBuffer`, `testOpenMissingSessionMarksDeadDirectly`, `testOpenSessionUsesConversationOpenForRestorableConversation`, `testSendMessageWithImageMentionAddsResourceLinkPromptBlock`.
 - iOS ACP/Session helpers: `ACPClientTests` trace-id/cancellation coverage and `SessionPickerPathMatchingTests` path normalization coverage.
 
 **Chat list/scroll behavior:**
@@ -149,9 +149,9 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
 - **Structured logging:** prefer `Log.log(...)` and `Log.timed(...)` (JSON lines + in-memory ring buffer). `Log.toFile(...)` remains for legacy call sites.
 - **Diagnostics:** `DiagnosticView` can inspect iOS log ring buffer, fetch daemon logs (`daemon/logs`), inspect state snapshot, and export JSON.
 - **XcodeGen** (`project.yml`) generates `.xcodeproj`; run `xcodegen generate` after file list changes.
-- **Unit tests:** `AppStateTests` cover agent probing/fallback, image mention prompts, 1:1 session resume behavior, interrupted-session auto reconnect paths, detach-before-switch, cross-session filtering, dead-session handling, and empty-session pruning.
+- **Unit tests:** `AppStateTests` cover agent probing/fallback, image mention prompts, single-owner conversation reopen behavior, interrupted-session auto reconnect paths, detach-before-switch, cross-session filtering, dead-conversation handling, and empty-runtime pruning.
 - **Other tests:** `ACPClientTests`, `SessionPickerPathMatchingTests`, `SessionUpdateParserTests`, `JSONRPCMessageTests`.
-- **UI tests** (`OpenCANUITests`) cover mock-backed navigation, session creation, sending, resume, and loading state. SSH/daemon end-to-end coverage lives in `OpenCANUIIntegrationTests` (connect/create/send/resume flows). `testIntegrationSmoke` is the stable smoke entrypoint used by `run-local-integration.sh`.
+- **UI tests** (`OpenCANUITests`) cover mock-backed navigation, conversation creation, sending, reopening, and loading state. SSH/daemon end-to-end coverage lives in `OpenCANUIIntegrationTests` (connect/create/send/reopen flows). `testIntegrationSmoke` is the stable smoke entrypoint used by `run-local-integration.sh`.
 
 **Daemon architecture:**
 - `opencan-daemon/` contains the Go daemon source. See `docs/daemon-architecture.md` for protocol/lifecycle details.
@@ -159,8 +159,8 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
 - Daemon startup uses `slog.NewJSONHandler` and writes to `~/.opencan/daemon.log` (plus stderr in true foreground mode), with simple size rotation to `.prev` at 10MB.
 - Daemon logs are mirrored into an in-memory `LogRingBuffer` (default 2000 entries) via `BufferingHandler`, exposed by `daemon/logs`.
 - ACPProxy state machine: `Starting -> Idle -> Prompting -> Draining -> Completed -> Dead`, plus `External` for sessions discovered from ACP but unmanaged by daemon.
-- `daemon/session.list` returns managed sessions and external sessions (up to 50), optionally scoped by cwd. External discovery falls back to probing ACP directly (commands from `OPENCAN_DISCOVERY_COMMANDS`, default `claude-agent-acp,codex-acp`) when no managed proxy is available.
-- Event replay uses per-session `EventBuffer` (max 100000 in ACPProxy) with monotonic sequence numbers and copy-on-evict to avoid retaining old backing arrays.
-- `daemon/session.attach` returns buffered events since `lastEventSeq`; second concurrent attach is rejected unless it presents the same `clientId` (same owner reclaim).
+- `daemon/session.list` remains the runtime-oriented diagnostic view: it returns managed runtimes and external ACP history rows (up to 50), optionally scoped by cwd. External discovery falls back to probing ACP directly (commands from `OPENCAN_DISCOVERY_COMMANDS`, default `claude-agent-acp,codex-acp`) when no managed proxy is available.
+- Event replay uses per-runtime `EventBuffer` instances (max 100000 in `ACPProxy`) with monotonic sequence numbers and copy-on-evict to avoid retaining old backing arrays.
+- `daemon/conversation.open` returns buffered events since `lastEventSeq`; a second concurrent open is rejected unless it presents the same `ownerId` (same-owner reclaim).
 - Idle timeout re-arms while sessions remain busy/draining so daemon exits only after no clients and all sessions settle.
 - Agent launch commands are configured in Agent Settings (Claude/Codex defaults), validated through `daemon/agent.probe`, and used for new session creation.

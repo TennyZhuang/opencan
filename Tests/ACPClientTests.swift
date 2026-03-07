@@ -107,9 +107,10 @@ final class ACPClientTests: XCTestCase {
 
         let pending = Task {
             try await client.sendRequest(
-                method: DaemonMethods.sessionAttach,
+                method: DaemonMethods.conversationOpen,
                 params: .object([
-                    "sessionId": .string("sess-1")
+                    "conversationId": .string("conv-1"),
+                    "ownerId": .string("ios-owner")
                 ]),
                 traceId: "trace-abc"
             )

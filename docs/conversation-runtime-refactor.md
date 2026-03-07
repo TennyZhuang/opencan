@@ -2,9 +2,9 @@
 
 ## Status
 
-This document supersedes the narrower app-only split plan in `docs/refactor-resume-adopt-split.md`.
-That split is still a valid stopgap, but it does not remove the main source of complexity:
-**authority is still split across iOS, daemon, and ACP history state**.
+Implemented in the current codebase.
+
+This document captures the rationale behind the conversation/runtime split and remains useful as design background. Historical stopgap plans have been removed to avoid confusion.
 
 ## Why a bigger refactor
 
@@ -17,7 +17,7 @@ The current code has improved relative to the old dual-ID design, but it still c
 
 This keeps `AppState` large, keeps recovery paths branch-heavy, and forces the test suite to protect too many incidental flows.
 
-The goal of this refactor is not to make `resumeSession()` cleaner.
+The goal of this refactor is not merely to make the app-side open/recover path cleaner.
 The goal is to make **the daemon the only source of truth for conversation lifecycle**.
 
 ## Product invariants
@@ -491,7 +491,7 @@ Merge caches conservatively:
 ### iOS
 
 - `Sources/AppState.swift`
-  - replace `resumeSession` / `takeOverExternalSession` split with a single daemon-driven `openConversation`
+  - replace split reopen/adopt logic with the single daemon-driven `openSession` path
   - remove local restore orchestration helpers
 - `Sources/ACP/DaemonClient.swift`
   - add new typed conversation API

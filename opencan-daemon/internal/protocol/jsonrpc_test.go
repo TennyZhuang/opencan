@@ -224,7 +224,7 @@ func TestIsDaemonMethod(t *testing.T) {
 		want   bool
 	}{
 		{"daemon/hello", true},
-		{"daemon/session.create", true},
+		{"daemon/conversation.create", true},
 		{"session/prompt", false},
 		{"initialize", false},
 		{"", false},

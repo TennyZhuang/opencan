@@ -310,6 +310,11 @@ enum ACPError: Error, LocalizedError {
         matchesMessageOrDetails(phrase: "session not found")
     }
 
+    /// True when daemon-side conversation lookup failed.
+    var isConversationNotFound: Bool {
+        matchesMessageOrDetails(phrase: "conversation not found")
+    }
+
     /// True when upstream reports the requested history/session resource is missing.
     var isResourceNotFound: Bool {
         matchesMessageOrDetails(phrase: "resource not found")
@@ -329,9 +334,9 @@ enum ACPError: Error, LocalizedError {
         matchesMessageOrDetails(phrase: "not attached to session")
     }
 
-    /// True when daemon/session.attach failed because another client owns it.
+    /// True when daemon attach/open failed because another client owns it.
     var isSessionAlreadyAttachedByAnotherClient: Bool {
-        matchesMessageOrDetails(phrase: "session already attached by another client")
+        matchesMessageOrDetails(phrase: "attached by another client")
     }
 
     /// True when upstream closed the in-flight query before producing a response.

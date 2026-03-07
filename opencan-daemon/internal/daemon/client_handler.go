@@ -229,12 +229,14 @@ func (h *ClientHandler) handleDaemonMethod(msg *protocol.Message) {
 		h.handleHello(msg)
 	case protocol.MethodDaemonAgentProbe:
 		h.handleAgentProbe(msg)
-	case protocol.MethodDaemonSessionCreate:
-		h.handleSessionCreate(msg)
-	case protocol.MethodDaemonSessionAttach:
-		h.handleSessionAttach(msg)
-	case protocol.MethodDaemonSessionDetach:
-		h.handleSessionDetach(msg)
+	case protocol.MethodDaemonConversationCreate:
+		h.handleConversationCreate(msg)
+	case protocol.MethodDaemonConversationOpen:
+		h.handleConversationOpen(msg)
+	case protocol.MethodDaemonConversationDetach:
+		h.handleConversationDetach(msg)
+	case protocol.MethodDaemonConversationList:
+		h.handleConversationList(msg)
 	case protocol.MethodDaemonSessionList:
 		h.handleSessionList(msg)
 	case protocol.MethodDaemonSessionKill:
@@ -272,101 +274,6 @@ func (h *ClientHandler) handleAgentProbe(msg *protocol.Message) {
 	result, _ := json.Marshal(map[string]interface{}{
 		"agents": results,
 	})
-	h.Send(protocol.NewResponse(*msg.ID, result))
-}
-
-func (h *ClientHandler) handleSessionCreate(msg *protocol.Message) {
-	var params struct {
-		CWD     string `json:"cwd"`
-		Command string `json:"command"`
-	}
-	if msg.Params != nil {
-		json.Unmarshal(*msg.Params, &params)
-	}
-	if params.CWD == "" {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "cwd is required"))
-		return
-	}
-	if params.Command == "" {
-		params.Command = "claude-agent-acp"
-	}
-
-	p, err := h.daemon.sessions.CreateSession(params.CWD, params.Command)
-	if err != nil {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32000, err.Error()))
-		return
-	}
-
-	result, _ := json.Marshal(map[string]interface{}{
-		"sessionId": p.SessionID,
-	})
-	h.Send(protocol.NewResponse(*msg.ID, result))
-}
-
-func (h *ClientHandler) handleSessionAttach(msg *protocol.Message) {
-	logger := h.loggerForMessage(msg)
-	var params struct {
-		SessionID    string `json:"sessionId"`
-		LastEventSeq uint64 `json:"lastEventSeq"`
-		ClientID     string `json:"clientId"`
-	}
-	if msg.Params != nil {
-		json.Unmarshal(*msg.Params, &params)
-	}
-	if params.SessionID == "" {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "sessionId is required"))
-		return
-	}
-
-	p, ok := h.daemon.sessions.GetSession(params.SessionID)
-	if !ok {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "session not found: "+params.SessionID))
-		return
-	}
-
-	// Attach client (single owner per session)
-	previousClient := p.GetClient()
-	state, attached := p.TryAttachClientWithOwner(h, params.ClientID)
-	if !attached {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "session already attached by another client: "+params.SessionID))
-		return
-	}
-	h.setAttachedProxy(params.SessionID, p)
-
-	// Same-owner reclaim transfers ACPProxy ownership to this handler, so prune
-	// stale cache entries from the old handler immediately.
-	if previousClient != nil && previousClient != h {
-		if previousHandler, ok := previousClient.(*ClientHandler); ok {
-			if previousHandler.removeAttachedProxyIfMatches(params.SessionID, p) {
-				logger.Info("pruned stale attached proxy entry from previous owner", "sessionId", params.SessionID)
-			}
-		}
-	}
-
-	// Get buffered events since lastEventSeq
-	buffered := p.EventBuf().Since(params.LastEventSeq)
-
-	result, _ := json.Marshal(map[string]interface{}{
-		"state":          state.String(),
-		"bufferedEvents": buffered,
-	})
-	h.Send(protocol.NewResponse(*msg.ID, result))
-	logger.Info("attached to session", "sessionId", params.SessionID, "state", state, "bufferedEvents", len(buffered))
-}
-
-func (h *ClientHandler) handleSessionDetach(msg *protocol.Message) {
-	var params struct {
-		SessionID string `json:"sessionId"`
-	}
-	if msg.Params != nil {
-		json.Unmarshal(*msg.Params, &params)
-	}
-
-	if p, ok := h.removeAttachedProxy(params.SessionID); ok {
-		p.DetachClient(h)
-	}
-
-	result, _ := json.Marshal(map[string]interface{}{})
 	h.Send(protocol.NewResponse(*msg.ID, result))
 }
 
@@ -454,23 +361,6 @@ func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 	resolvedSessionID := requestedSessionID
 	p, ok := h.getAttachedProxy(requestedSessionID)
 
-	// For session/load, treat unknown sessionId as a history reference and route
-	// to the sole live attached proxy when there is exactly one.
-	// iOS external-takeover flow relies on this contract.
-	if !ok && msg.Method == protocol.MethodSessionLoad {
-		if attachedSessionID, attachedProxy, routeable := h.selectSoleRoutableProxyForSessionLoad(logger); routeable {
-			resolvedSessionID = attachedSessionID
-			p = attachedProxy
-			ok = true
-			logger.Info(
-				"routing session/load to attached proxy",
-				"requestedSessionId", requestedSessionID,
-				"attachedSessionId", attachedSessionID,
-				"attachedCommand", attachedProxy.Command,
-			)
-		}
-	}
-
 	if !ok {
 		if msg.ID != nil {
 			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+requestedSessionID))
@@ -513,41 +403,6 @@ func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 			h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "failed to forward: "+err.Error()))
 		}
 	}
-}
-
-func (h *ClientHandler) selectSoleRoutableProxyForSessionLoad(logger *slog.Logger) (string, *proxy.ACPProxy, bool) {
-	attached := h.snapshotAttachedProxies()
-	var selectedSessionID string
-	var selectedProxy *proxy.ACPProxy
-
-	for sessionID, p := range attached {
-		if p == nil {
-			h.removeAttachedProxyIfMatches(sessionID, nil)
-			continue
-		}
-		if p.State() == proxy.StateDead {
-			if h.removeAttachedProxyIfMatches(sessionID, p) {
-				logger.Warn("pruned dead attached proxy entry", "sessionId", sessionID)
-			}
-			continue
-		}
-		if p.GetClient() != h {
-			if h.removeAttachedProxyIfMatches(sessionID, p) {
-				logger.Warn("pruned stale attached proxy entry after ownership change", "sessionId", sessionID)
-			}
-			continue
-		}
-		if selectedProxy != nil {
-			return "", nil, false
-		}
-		selectedSessionID = sessionID
-		selectedProxy = p
-	}
-
-	if selectedProxy == nil {
-		return "", nil, false
-	}
-	return selectedSessionID, selectedProxy, true
 }
 
 // ForwardServerRequest rewrites the ID of a server-initiated request and tracks the

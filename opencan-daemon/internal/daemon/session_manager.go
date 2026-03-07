@@ -21,20 +21,26 @@ type SessionInfo struct {
 	Command      string             `json:"command,omitempty"`
 	Title        string             `json:"title,omitempty"`
 	UpdatedAt    string             `json:"updatedAt,omitempty"`
+	Attached     bool               `json:"attached,omitempty"`
+	OwnerID      string             `json:"ownerId,omitempty"`
 }
 
 // SessionManager manages all ACPProxy instances.
 type SessionManager struct {
-	mu       sync.RWMutex
-	sessions map[string]*proxy.ACPProxy
-	logger   *slog.Logger
+	mu                     sync.RWMutex
+	sessions               map[string]*proxy.ACPProxy
+	conversationRuntimeIDs map[string]string
+	runtimeConversationIDs map[string]string
+	logger                 *slog.Logger
 }
 
 // NewSessionManager creates a new SessionManager.
 func NewSessionManager(logger *slog.Logger) *SessionManager {
 	return &SessionManager{
-		sessions: make(map[string]*proxy.ACPProxy),
-		logger:   logger.With("component", "session_manager"),
+		sessions:               make(map[string]*proxy.ACPProxy),
+		conversationRuntimeIDs: make(map[string]string),
+		runtimeConversationIDs: make(map[string]string),
+		logger:                 logger.With("component", "session_manager"),
 	}
 }
 
@@ -55,6 +61,7 @@ func (sm *SessionManager) CreateSession(cwd, command string) (*proxy.ACPProxy, e
 
 	sm.mu.Lock()
 	sm.sessions[p.SessionID] = p
+	sm.assignConversationRuntimeLocked(p.SessionID, p.SessionID)
 	sm.mu.Unlock()
 
 	sm.logger.Info(
@@ -84,6 +91,7 @@ func (sm *SessionManager) GetSession(sessionID string) (*proxy.ACPProxy, bool) {
 	sm.mu.Lock()
 	if current, ok := sm.sessions[sessionID]; ok && current.State() == proxy.StateDead {
 		delete(sm.sessions, sessionID)
+		sm.removeRuntimeMappingLocked(sessionID)
 	}
 	sm.mu.Unlock()
 	return nil, false
@@ -174,6 +182,8 @@ func (sm *SessionManager) ListSessionsForCWD(cwd string) []SessionInfo {
 			LastEventSeq: p.EventBuf().LastSeq(),
 			Command:      p.Command,
 			UpdatedAt:    updatedAt,
+			Attached:     p.GetClient() != nil,
+			OwnerID:      p.CurrentOwnerID(),
 		})
 	}
 
@@ -497,6 +507,7 @@ func (sm *SessionManager) KillSession(sessionID string) error {
 	p, ok := sm.sessions[sessionID]
 	if ok {
 		delete(sm.sessions, sessionID)
+		sm.removeRuntimeMappingLocked(sessionID)
 	}
 	sm.mu.Unlock()
 
@@ -518,6 +529,7 @@ func (sm *SessionManager) RemoveDead() int {
 	for id, p := range sm.sessions {
 		if p.State() == proxy.StateDead {
 			delete(sm.sessions, id)
+			sm.removeRuntimeMappingLocked(id)
 			removed++
 		}
 	}

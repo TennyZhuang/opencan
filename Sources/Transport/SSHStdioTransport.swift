@@ -80,8 +80,9 @@ actor SSHStdioTransport: ACPTransport {
     }
 
     private func feedData(_ data: Data) async {
-        if let raw = String(data: data, encoding: .utf8) {
-            Log.toFile("[stdout] \(raw.prefix(500))")
+        if let raw = String(data: data, encoding: .utf8),
+           let snippet = Self.stdoutLogSnippet(from: raw) {
+            Log.toFile("[stdout] \(snippet)")
         }
         let parsed = await framer.feed(data)
         for msg in parsed {
@@ -92,6 +93,25 @@ actor SSHStdioTransport: ACPTransport {
             jsonReadySignal?.finish()
             jsonReadySignal = nil
         }
+    }
+
+    private static func stdoutLogSnippet(from raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard !trimmed.hasPrefix("{") else { return nil }
+        return truncatedLogSnippet(trimmed)
+    }
+
+    private static func stderrLogSnippet(from raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return truncatedLogSnippet(trimmed)
+    }
+
+    private static func truncatedLogSnippet(_ raw: String, limit: Int = 160) -> String {
+        guard raw.count > limit else { return raw }
+        let end = raw.index(raw.startIndex, offsetBy: limit)
+        return String(raw[..<end]) + "...(truncated)"
     }
 
     /// Run the PTY session. Blocks until the PTY closes.
@@ -134,7 +154,9 @@ actor SSHStdioTransport: ACPTransport {
                     let data = Data(buffer: buffer)
                     await self.feedData(data)
                 case .stderr(let buffer):
-                    Log.toFile("[stderr] \(String(buffer: buffer))")
+                    if let snippet = Self.stderrLogSnippet(from: String(buffer: buffer)) {
+                        Log.toFile("[stderr] \(snippet)")
+                    }
                 }
             }
         }
