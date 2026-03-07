@@ -7,10 +7,12 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/anthropics/opencan-daemon/internal/ioutils"
 	"github.com/anthropics/opencan-daemon/internal/protocol"
 )
 
@@ -24,10 +26,13 @@ type ClientConn interface {
 
 // PendingRequest tracks a forwarded request so the response can be routed back.
 type PendingRequest struct {
-	OriginalID *protocol.JSONRPCID
-	Client     ClientConn
-	Method     string
-	ResponseCh chan *protocol.Message
+	OriginalID         *protocol.JSONRPCID
+	Client             ClientConn
+	Method             string
+	ResponseCh         chan *protocol.Message
+	TraceID            string
+	RequestedSessionID string
+	StartedAt          time.Time
 }
 
 // ACPProxy manages a single claude-agent-acp child process and its event buffer.
@@ -36,8 +41,9 @@ type ACPProxy struct {
 	CWD       string
 	Command   string
 
-	mu    sync.RWMutex
-	state SessionState
+	mu             sync.RWMutex
+	state          SessionState
+	conversationID string
 
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
@@ -56,7 +62,8 @@ type ACPProxy struct {
 }
 
 type clientWrapper struct {
-	conn ClientConn
+	conn    ClientConn
+	ownerID string
 }
 
 // NewACPProxy spawns an ACP process, initializes the ACP protocol,
@@ -86,7 +93,8 @@ func NewACPProxy(cwd, command string, logger *slog.Logger) (*ACPProxy, error) {
 	}
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	// ACP updates/tool outputs can be large single-line JSON notifications.
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 
 	p := &ACPProxy{
 		CWD:             cwd,
@@ -111,6 +119,7 @@ func NewACPProxy(cwd, command string, logger *slog.Logger) (*ACPProxy, error) {
 		return nil, fmt.Errorf("ACP init: %w", err)
 	}
 	p.SessionID = sessionID
+	p.SetConversationID(sessionID)
 	p.setState(StateIdle)
 
 	// Start background read loop (continues using the same scanner)
@@ -234,6 +243,12 @@ func (p *ACPProxy) readLoop() {
 			p.handleServerRequest(msg)
 		}
 	}
+
+	if err := p.scanner.Err(); err != nil {
+		p.logger.Warn("acp stdout scanner stopped", "session", p.SessionID, "error", err)
+	} else {
+		p.logger.Info("acp stdout closed", "session", p.SessionID)
+	}
 }
 
 func (p *ACPProxy) handleNotification(msg *protocol.Message) {
@@ -250,11 +265,13 @@ func (p *ACPProxy) handleNotification(msg *protocol.Message) {
 		p.handlePromptComplete()
 	}
 
-	// Forward to attached client with __seq metadata
+	// Forward to attached client with daemon-side routing metadata.
 	if client := p.GetClient(); client != nil {
-		fwd := msg.Clone()
-		fwd.SetParam("__seq", seq)
-		client.Send(fwd)
+		fwd := p.decorateMessageForClient(msg, seq)
+		if err := client.Send(fwd); err != nil {
+			p.logger.Warn("forward notification to client failed", "session", p.SessionID, "error", err)
+			p.DetachClient(client)
+		}
 	}
 }
 
@@ -275,11 +292,25 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 		p.logger.Warn("response for unknown request", "id", internalID)
 		return
 	}
+	durationMs := int64(0)
+	if !pr.StartedAt.IsZero() {
+		durationMs = time.Since(pr.StartedAt).Milliseconds()
+	}
+	p.logRequestOutcome(pr, msg, durationMs)
 
 	fwd := msg.Clone()
 	fwd.ID = pr.OriginalID
 	if pr.Client != nil {
-		pr.Client.Send(fwd)
+		if err := pr.Client.Send(fwd); err != nil {
+			p.logger.Warn(
+				"forward response to client failed",
+				"session", p.SessionID,
+				"id", internalID,
+				"method", pr.Method,
+				"error", err,
+			)
+			p.DetachClient(pr.Client)
+		}
 	}
 	if pr.ResponseCh != nil {
 		pr.ResponseCh <- msg.Clone()
@@ -291,11 +322,79 @@ func (p *ACPProxy) routeResponse(msg *protocol.Message) {
 	}
 }
 
+func (p *ACPProxy) logRequestOutcome(pr PendingRequest, msg *protocol.Message, durationMs int64) {
+	if pr.Method != protocol.MethodSessionLoad && pr.Method != protocol.MethodSessionPrompt {
+		return
+	}
+	logger := p.logger
+	if pr.TraceID != "" {
+		logger = logger.With("traceId", pr.TraceID)
+	}
+	requestedSessionID := pr.RequestedSessionID
+	if requestedSessionID == "" {
+		requestedSessionID = p.SessionID
+	}
+	if msg.IsError() && msg.Error != nil {
+		logMsg := "session/load upstream error"
+		if pr.Method == protocol.MethodSessionPrompt {
+			logMsg = "session/prompt upstream terminal error"
+		}
+		logger.Warn(
+			logMsg,
+			"session", p.SessionID,
+			"command", p.Command,
+			"method", pr.Method,
+			"requestedSessionId", requestedSessionID,
+			"durationMs", durationMs,
+			"code", msg.Error.Code,
+			"message", msg.Error.Message,
+			"data", rpcErrorDataSummary(msg.Error.Data),
+		)
+		return
+	}
+	logMsg := "session/load upstream success"
+	if pr.Method == protocol.MethodSessionPrompt {
+		logMsg = "session/prompt upstream terminal success"
+	}
+	logger.Info(
+		logMsg,
+		"session", p.SessionID,
+		"command", p.Command,
+		"method", pr.Method,
+		"requestedSessionId", requestedSessionID,
+		"durationMs", durationMs,
+	)
+}
+
+func rpcErrorDataSummary(raw *json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	text := strings.TrimSpace(string(*raw))
+	if text == "" || text == "null" {
+		return ""
+	}
+	var details struct {
+		Details string `json:"details"`
+	}
+	if err := json.Unmarshal(*raw, &details); err == nil && details.Details != "" {
+		return details.Details
+	}
+	var asString string
+	if err := json.Unmarshal(*raw, &asString); err == nil {
+		return asString
+	}
+	return text
+}
+
 func (p *ACPProxy) handleServerRequest(msg *protocol.Message) {
 	if msg.Method == "session/request_permission" {
 		if client := p.GetClient(); client != nil {
-			client.ForwardServerRequest(msg, p)
-			return
+			if err := client.ForwardServerRequest(msg, p); err == nil {
+				return
+			}
+			p.logger.Warn("forward permission request to client failed, auto-approving", "session", p.SessionID)
+			p.DetachClient(client)
 		}
 		// No client — auto-approve
 		p.logger.Info("auto-approving permission (no client)", "session", p.SessionID)
@@ -309,6 +408,31 @@ func (p *ACPProxy) handleServerRequest(msg *protocol.Message) {
 	if msg.ID != nil {
 		p.writeMessage(protocol.NewErrorResponse(*msg.ID, -32601, "Method not found: "+msg.Method))
 	}
+}
+
+func (p *ACPProxy) decorateBufferedEvent(buffered BufferedEvent) BufferedEvent {
+	msg, err := protocol.ParseLine(buffered.Event)
+	if err != nil || msg == nil {
+		return buffered
+	}
+	decorated := p.decorateMessageForClient(msg, buffered.Seq)
+	raw, err := protocol.Serialize(decorated)
+	if err != nil {
+		return buffered
+	}
+	return BufferedEvent{Seq: buffered.Seq, Event: raw}
+}
+
+func (p *ACPProxy) decorateMessageForClient(msg *protocol.Message, seq uint64) *protocol.Message {
+	fwd := msg.Clone()
+	if seq > 0 {
+		_ = fwd.SetParam("__seq", seq)
+	}
+	if fwd.Method == protocol.MethodSessionUpdate {
+		_ = fwd.SetParam("runtimeId", p.SessionID)
+		_ = fwd.SetParam("conversationId", p.ConversationID())
+	}
+	return fwd
 }
 
 func (p *ACPProxy) buildAutoApproveResponse(msg *protocol.Message) *protocol.Message {
@@ -381,6 +505,21 @@ func (p *ACPProxy) State() SessionState {
 	return p.state
 }
 
+func (p *ACPProxy) ConversationID() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.conversationID != "" {
+		return p.conversationID
+	}
+	return p.SessionID
+}
+
+func (p *ACPProxy) SetConversationID(conversationID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.conversationID = strings.TrimSpace(conversationID)
+}
+
 func (p *ACPProxy) setState(s SessionState) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -401,30 +540,61 @@ func (p *ACPProxy) Done() <-chan struct{} { return p.doneCh }
 // EventBuf returns the proxy's event buffer.
 func (p *ACPProxy) EventBuf() *EventBuffer { return p.eventBuffer }
 
+// BufferedEventsSince returns replay events decorated with daemon metadata.
+func (p *ACPProxy) BufferedEventsSince(afterSeq uint64) []BufferedEvent {
+	events := p.eventBuffer.Since(afterSeq)
+	if len(events) == 0 {
+		return nil
+	}
+	out := make([]BufferedEvent, 0, len(events))
+	for _, buffered := range events {
+		out = append(out, p.decorateBufferedEvent(buffered))
+	}
+	return out
+}
+
 // AttachClient sets the active client. Returns the resulting state.
 func (p *ACPProxy) AttachClient(c ClientConn) SessionState {
-	state, _ := p.TryAttachClient(c)
+	state, _ := p.TryAttachClientWithOwner(c, "")
 	return state
 }
 
 // TryAttachClient attaches a client if no other client is attached.
 // Returns false when another client already owns the session.
 func (p *ACPProxy) TryAttachClient(c ClientConn) (SessionState, bool) {
+	return p.TryAttachClientWithOwner(c, "")
+}
+
+// TryAttachClientWithOwner attaches a client if no other client is attached.
+// If ownerID is provided and matches the current ownerID, ownership is
+// transferred to the new connection. This allows reconnect handoff while
+// preserving single-owner semantics for different clients.
+func (p *ACPProxy) TryAttachClientWithOwner(c ClientConn, ownerID string) (SessionState, bool) {
 	for {
 		current := p.client.Load()
-		if current != nil {
-			if current.conn != c {
-				return p.State(), false
-			}
-		} else {
-			if !p.client.CompareAndSwap(nil, &clientWrapper{conn: c}) {
+		desired := &clientWrapper{conn: c, ownerID: ownerID}
+
+		if current == nil {
+			if !p.client.CompareAndSwap(nil, desired) {
 				// Lost a race; re-check ownership.
 				continue
 			}
+		} else if current.conn == c {
+			// Same connection re-attached: refresh owner metadata if changed.
+			if current.ownerID != ownerID && !p.client.CompareAndSwap(current, desired) {
+				continue
+			}
+		} else {
+			if !(ownerID != "" && current.ownerID != "" && current.ownerID == ownerID) {
+				return p.State(), false
+			}
+			if !p.client.CompareAndSwap(current, desired) {
+				// Lost a race while transferring ownership; re-check.
+				continue
+			}
+			p.logger.Info("transferred session ownership to reconnected client", "session", p.SessionID)
 		}
 
-		// Keep behavior identical to AttachClient for valid attaches.
-		p.client.Store(&clientWrapper{conn: c})
 		state := p.State()
 		switch state {
 		case StateCompleted:
@@ -438,14 +608,30 @@ func (p *ACPProxy) TryAttachClient(c ClientConn) (SessionState, bool) {
 	}
 }
 
+// CurrentOwnerID returns the owner identity string for the attached client.
+// Empty string means no owner identity was provided.
+func (p *ACPProxy) CurrentOwnerID() string {
+	w := p.client.Load()
+	if w == nil {
+		return ""
+	}
+	return w.ownerID
+}
+
 // DetachClient removes the client if it matches.
 func (p *ACPProxy) DetachClient(c ClientConn) {
-	current := p.client.Load()
-	if current != nil && current.conn == c {
-		p.client.Store(nil)
+	for {
+		current := p.client.Load()
+		if current == nil || current.conn != c {
+			return
+		}
+		if !p.client.CompareAndSwap(current, nil) {
+			continue
+		}
 		if p.State() == StatePrompting {
 			p.setState(StateDraining)
 		}
+		return
 	}
 }
 
@@ -465,21 +651,63 @@ func (p *ACPProxy) ForwardFromClient(msg *protocol.Message, client ClientConn) e
 			return fmt.Errorf("session is dead")
 		}
 		internalID := p.nextInternalID.Add(1)
+		traceID := protocol.ExtractTraceID(msg)
+		requestedSessionID := protocol.ExtractSessionID(msg)
 		p.pendingMu.Lock()
 		p.pendingRequests[internalID] = PendingRequest{
-			OriginalID: msg.ID,
-			Client:     client,
-			Method:     msg.Method,
+			OriginalID:         msg.ID,
+			Client:             client,
+			Method:             msg.Method,
+			TraceID:            traceID,
+			RequestedSessionID: requestedSessionID,
+			StartedAt:          time.Now(),
 		}
 		p.pendingMu.Unlock()
+
+		if msg.Method == protocol.MethodSessionLoad || msg.Method == protocol.MethodSessionPrompt {
+			logger := p.logger
+			if traceID != "" {
+				logger = logger.With("traceId", traceID)
+			}
+			logger.Info(
+				"forwarding request upstream",
+				"session", p.SessionID,
+				"command", p.Command,
+				"method", msg.Method,
+				"internalId", internalID,
+				"requestedSessionId", requestedSessionID,
+				"state", p.State().String(),
+			)
+		}
 
 		fwd := msg.Clone()
 		newID := protocol.IntID(internalID)
 		fwd.ID = &newID
+		conversationID := p.ConversationID()
+		if requestedSessionID != "" && conversationID != "" && requestedSessionID != conversationID {
+			if err := fwd.SetParam("sessionId", conversationID); err != nil {
+				return fmt.Errorf("rewrite sessionId: %w", err)
+			}
+		}
 		if err := p.writeMessage(fwd); err != nil {
 			p.pendingMu.Lock()
 			delete(p.pendingRequests, internalID)
 			p.pendingMu.Unlock()
+			if msg.Method == protocol.MethodSessionLoad || msg.Method == protocol.MethodSessionPrompt {
+				logger := p.logger
+				if traceID != "" {
+					logger = logger.With("traceId", traceID)
+				}
+				logger.Warn(
+					"failed to forward request upstream",
+					"session", p.SessionID,
+					"command", p.Command,
+					"method", msg.Method,
+					"internalId", internalID,
+					"requestedSessionId", requestedSessionID,
+					"error", err,
+				)
+			}
 			return err
 		}
 		if msg.Method == protocol.MethodSessionPrompt {
@@ -567,6 +795,32 @@ func (p *ACPProxy) LoadableSessionIDs(timeout time.Duration) (map[string]struct{
 	return ids, nil
 }
 
+// LoadSession issues ACP session/load directly against this runtime.
+func (p *ACPProxy) LoadSession(sessionID, cwd string, timeout time.Duration) error {
+	params := map[string]interface{}{
+		"sessionId":  sessionID,
+		"mcpServers": []interface{}{},
+	}
+	if cwd != "" {
+		params["cwd"] = cwd
+	}
+	resp, err := p.callACPRequest(protocol.MethodSessionLoad, params, timeout)
+	if err != nil {
+		return err
+	}
+	if resp.Error != nil {
+		details := strings.TrimSpace(rpcErrorDataSummary(resp.Error.Data))
+		if details != "" && !strings.EqualFold(details, resp.Error.Message) {
+			return fmt.Errorf("session/load error: %s (%s)", resp.Error.Message, details)
+		}
+		if details != "" {
+			return fmt.Errorf("session/load error: %s", details)
+		}
+		return fmt.Errorf("session/load error: %s", resp.Error.Message)
+	}
+	return nil
+}
+
 func (p *ACPProxy) callACPRequest(method string, params interface{}, timeout time.Duration) (*protocol.Message, error) {
 	if p.State() == StateDead {
 		return nil, fmt.Errorf("session is dead")
@@ -585,6 +839,7 @@ func (p *ACPProxy) callACPRequest(method string, params interface{}, timeout tim
 	p.pendingRequests[internalID] = PendingRequest{
 		Method:     method,
 		ResponseCh: respCh,
+		StartedAt:  time.Now(),
 	}
 	p.pendingMu.Unlock()
 
@@ -645,8 +900,7 @@ func (p *ACPProxy) writeMessage(msg *protocol.Message) error {
 	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	_, err = p.stdin.Write(data)
-	return err
+	return ioutils.WriteAll(p.stdin, data)
 }
 
 func isPromptComplete(msg *protocol.Message) bool {

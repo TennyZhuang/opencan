@@ -76,6 +76,51 @@ func TestAttachClient_DrainingBecomesPrompting(t *testing.T) {
 	}
 }
 
+func TestTryAttachClientWithOwner_AllowsReclaimBySameOwnerID(t *testing.T) {
+	p := newTestProxy(StateIdle, nil)
+	first := &fakeClientConn{}
+	second := &fakeClientConn{}
+
+	state, attached := p.TryAttachClientWithOwner(first, "app-owner-1")
+	if !attached {
+		t.Fatal("first attach should succeed")
+	}
+	if state != StateIdle {
+		t.Fatalf("first attach state = %v, want %v", state, StateIdle)
+	}
+
+	state, attached = p.TryAttachClientWithOwner(second, "app-owner-1")
+	if !attached {
+		t.Fatal("same-owner reclaim should succeed")
+	}
+	if state != StateIdle {
+		t.Fatalf("reclaim attach state = %v, want %v", state, StateIdle)
+	}
+	if got := p.GetClient(); got != second {
+		t.Fatalf("attached client = %v, want second client", got)
+	}
+	if gotOwner := p.CurrentOwnerID(); gotOwner != "app-owner-1" {
+		t.Fatalf("ownerID = %q, want %q", gotOwner, "app-owner-1")
+	}
+}
+
+func TestTryAttachClientWithOwner_RejectsDifferentOwnerID(t *testing.T) {
+	p := newTestProxy(StateIdle, nil)
+	first := &fakeClientConn{}
+	second := &fakeClientConn{}
+
+	if _, attached := p.TryAttachClientWithOwner(first, "app-owner-1"); !attached {
+		t.Fatal("first attach should succeed")
+	}
+
+	if _, attached := p.TryAttachClientWithOwner(second, "app-owner-2"); attached {
+		t.Fatal("different owner should be rejected")
+	}
+	if got := p.GetClient(); got != first {
+		t.Fatalf("attached client should remain first, got %v", got)
+	}
+}
+
 func TestHandlePromptComplete_AttachedDrainingEndsIdle(t *testing.T) {
 	p := newTestProxy(StateDraining, nil)
 	client := &fakeClientConn{}
@@ -202,5 +247,33 @@ func TestSetState_DeadIsTerminal(t *testing.T) {
 
 	if p.State() != StateDead {
 		t.Fatalf("proxy state = %v, want %v", p.State(), StateDead)
+	}
+}
+
+func TestRPCErrorDataSummary_DetailsObject(t *testing.T) {
+	raw := json.RawMessage(`{"details":"Query closed before response received"}`)
+	got := rpcErrorDataSummary(&raw)
+	want := "Query closed before response received"
+	if got != want {
+		t.Fatalf("rpcErrorDataSummary() = %q, want %q", got, want)
+	}
+}
+
+func TestRPCErrorDataSummary_StringPayload(t *testing.T) {
+	raw := json.RawMessage(`"missing field mcpServers"`)
+	got := rpcErrorDataSummary(&raw)
+	want := "missing field mcpServers"
+	if got != want {
+		t.Fatalf("rpcErrorDataSummary() = %q, want %q", got, want)
+	}
+}
+
+func TestRPCErrorDataSummary_Empty(t *testing.T) {
+	if got := rpcErrorDataSummary(nil); got != "" {
+		t.Fatalf("rpcErrorDataSummary(nil) = %q, want empty", got)
+	}
+	raw := json.RawMessage(`null`)
+	if got := rpcErrorDataSummary(&raw); got != "" {
+		t.Fatalf("rpcErrorDataSummary(null) = %q, want empty", got)
 	}
 }

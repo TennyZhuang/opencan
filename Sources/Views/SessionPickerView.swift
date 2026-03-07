@@ -57,83 +57,114 @@ private func normalizedRemotePathKey(_ rawPath: String) -> String? {
     return parts.joined(separator: "/")
 }
 
-/// Build merged session rows for a workspace by combining daemon + local records.
-/// External daemon sessions are suppressed when they are already tracked as
-/// history sources of a local recovered session to avoid duplicate list items.
+private func legacyConversationState(from sessionState: String) -> String {
+    switch sessionState {
+    case "external":
+        return "restorable"
+    case "dead":
+        return "unavailable"
+    case "starting", "prompting", "draining":
+        return "running"
+    case "idle", "completed":
+        return "ready"
+    default:
+        return sessionState
+    }
+}
+
+/// Backward-compatible merge helper for legacy daemon/session.list snapshots.
 func mergeWorkspaceSessions(
     workspacePath: String,
     username: String?,
     daemonSessions: [DaemonSessionInfo],
     localSessions: [Session]
 ) -> [UnifiedSession] {
-    let recoveredHistorySourceIDs: Set<String> = Set(localSessions.compactMap { local in
-        guard let historySessionId = normalizedSessionID(local.historySessionId),
-              historySessionId != local.sessionId else {
-            return nil
-        }
-        return historySessionId
-    })
+    let conversations = daemonSessions.map { session in
+        DaemonConversationInfo(
+            conversationId: session.sessionId,
+            runtimeId: session.state == "external" ? nil : session.sessionId,
+            state: legacyConversationState(from: session.state),
+            cwd: session.cwd,
+            command: session.command,
+            title: session.title,
+            updatedAt: session.updatedAt,
+            ownerId: nil,
+            origin: session.state == "external" ? "discovered" : "managed",
+            lastEventSeq: session.lastEventSeq
+        )
+    }
+    return mergeWorkspaceSessions(
+        workspacePath: workspacePath,
+        username: username,
+        daemonConversations: conversations,
+        localSessions: localSessions
+    )
+}
 
-    var daemonByID: [String: DaemonSessionInfo] = [:]
-    for daemonSession in daemonSessions {
-        guard workspacePathMatchesSessionCwd(
+/// Build merged conversation rows for a workspace by combining daemon + local records.
+func mergeWorkspaceSessions(
+    workspacePath: String,
+    username: String?,
+    daemonConversations: [DaemonConversationInfo],
+    localSessions: [Session]
+) -> [UnifiedSession] {
+    var localByConversationID: [String: Session] = [:]
+    for localSession in localSessions {
+        let conversationId = localSession.stableConversationId
+        if let existing = localByConversationID[conversationId],
+           existing.lastUsedAt >= localSession.lastUsedAt {
+            continue
+        }
+        localByConversationID[conversationId] = localSession
+    }
+
+    var daemonByConversationID: [String: DaemonConversationInfo] = [:]
+    for conversation in daemonConversations {
+        let isKnownLocalConversation = localByConversationID[conversation.conversationId] != nil
+        guard isKnownLocalConversation || workspacePathMatchesSessionCwd(
             workspacePath: workspacePath,
-            sessionCwd: daemonSession.cwd,
+            sessionCwd: conversation.cwd,
             username: username
         ) else {
             continue
         }
-        if daemonSession.state == "external",
-           recoveredHistorySourceIDs.contains(daemonSession.sessionId) {
-            continue
-        }
-        daemonByID[daemonSession.sessionId] = daemonSession
+        daemonByConversationID[conversation.conversationId] = conversation
     }
 
-    var localByID: [String: Session] = [:]
-    for localSession in localSessions {
-        if let existing = localByID[localSession.sessionId],
-           existing.lastUsedAt >= localSession.lastUsedAt {
-            continue
-        }
-        localByID[localSession.sessionId] = localSession
-    }
-
-    let allIds = Set(daemonByID.keys).union(localByID.keys)
-    let unified = allIds.map { sessionId -> UnifiedSession in
-        let daemon = daemonByID[sessionId]
-        let local = localByID[sessionId]
+    let allIds = Set(daemonByConversationID.keys).union(localByConversationID.keys)
+    let unified = allIds.map { conversationId -> UnifiedSession in
+        let daemon = daemonByConversationID[conversationId]
+        let local = localByConversationID[conversationId]
         return UnifiedSession(
-            sessionId: sessionId,
+            sessionId: conversationId,
+            runtimeId: daemon?.runtimeId ?? local?.sessionId,
             daemonState: daemon?.state,
-            cwd: daemon?.cwd ?? workspacePath,
+            cwd: daemon?.cwd ?? local?.sessionCwd ?? workspacePath,
             lastEventSeq: daemon?.lastEventSeq,
             title: local?.title,
             daemonTitle: daemon?.title,
             lastUsedAt: local?.lastUsedAt,
             daemonUpdatedAt: daemon?.updatedAt,
             agentID: local?.agentID,
-            agentCommand: local?.agentCommand ?? daemon?.command
+            agentCommand: local?.agentCommand ?? daemon?.command,
+            hasLocalRecord: local != nil
         )
     }
     .filter { !$0.isEmptyPlaceholder }
 
     return unified.sorted { lhs, rhs in
-        let lhsActive = lhs.daemonState == "prompting" || lhs.daemonState == "draining"
-        let rhsActive = rhs.daemonState == "prompting" || rhs.daemonState == "draining"
-        if lhsActive != rhsActive { return lhsActive }
+        let lhsRunning = lhs.displayState == "running"
+        let rhsRunning = rhs.displayState == "running"
+        if lhsRunning != rhsRunning { return lhsRunning }
+
+        let lhsAttached = lhs.displayState == "attached"
+        let rhsAttached = rhs.displayState == "attached"
+        if lhsAttached != rhsAttached { return lhsAttached }
 
         let lhsDate = lhs.effectiveLastUsedAt ?? .distantPast
         let rhsDate = rhs.effectiveLastUsedAt ?? .distantPast
         return lhsDate > rhsDate
     }
-}
-
-private func normalizedSessionID(_ value: String?) -> String? {
-    guard let value else { return nil }
-    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return nil }
-    return trimmed
 }
 
 struct SessionPickerView: View {
@@ -143,6 +174,7 @@ struct SessionPickerView: View {
     let workspace: Workspace
     @State private var navigateToChat = false
     @State private var loadingSessionId: String?
+    @State private var openErrorMessage: String?
 
     var body: some View {
         sessionListView
@@ -153,6 +185,19 @@ struct SessionPickerView: View {
             .navigationDestination(isPresented: $navigateToChat) {
                 ChatView()
             }
+            .alert(
+                "Cannot Open Session",
+                isPresented: Binding(
+                    get: { openErrorMessage != nil },
+                    set: { showing in
+                        if !showing { openErrorMessage = nil }
+                    }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(openErrorMessage ?? "Unknown error")
+            }
             .onAppear {
                 appState.activeWorkspace = workspace
                 Task {
@@ -161,21 +206,17 @@ struct SessionPickerView: View {
                 }
             }
             .onDisappear {
-                // Clear activeWorkspace when leaving this view so stale state
-                // doesn't leak into a sibling workspace's SessionPickerView
-                // during navigation transitions.
                 if appState.activeWorkspace?.persistentModelID == workspace.persistentModelID {
                     appState.activeWorkspace = nil
                 }
             }
     }
 
-    /// Merge daemon sessions and local SwiftData sessions into a single list.
     private var unifiedSessions: [UnifiedSession] {
         mergeWorkspaceSessions(
             workspacePath: workspace.path,
             username: workspace.node?.username,
-            daemonSessions: appState.daemonSessions,
+            daemonConversations: appState.daemonConversations,
             localSessions: workspace.sessions ?? []
         )
     }
@@ -189,8 +230,7 @@ struct SessionPickerView: View {
             filtered = AgentKind.allCases
         }
         let preferred = AgentKind(rawValue: defaultAgentID)
-        return filtered
-            .sorted { lhs, rhs in
+        return filtered.sorted { lhs, rhs in
             if lhs == preferred { return true }
             if rhs == preferred { return false }
             return lhs.displayName < rhs.displayName
@@ -211,7 +251,7 @@ struct SessionPickerView: View {
                 if OpenCANApp.isUITesting {
                     Button {
                         guard let agent = defaultCreateAgent else { return }
-                        Task { await createNew(agent: agent) }
+                        Task { @MainActor in await createNew(agent: agent) }
                     } label: {
                         HStack {
                             Label("New Session", systemImage: "plus.circle")
@@ -229,7 +269,7 @@ struct SessionPickerView: View {
                         } else {
                             ForEach(availableAgents) { agent in
                                 Button {
-                                    Task { await createNew(agent: agent) }
+                                    Task { @MainActor in await createNew(agent: agent) }
                                 } label: {
                                     let command = AgentCommandStore.command(for: agent)
                                     VStack(alignment: .leading, spacing: 2) {
@@ -258,7 +298,7 @@ struct SessionPickerView: View {
                 Section("Sessions") {
                     ForEach(sessions) { session in
                         Button {
-                            Task { await resume(sessionId: session.sessionId) }
+                            Task { @MainActor in await openConversation(sessionId: session.sessionId) }
                         } label: {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
@@ -271,10 +311,17 @@ struct SessionPickerView: View {
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
-                                    Text(String(session.sessionId.prefix(8)) + "…")
+                                    Text(session.sessionId)
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
                                         .lineLimit(1)
+                                    if let runtimeId = session.effectiveRuntimeId,
+                                       runtimeId != session.sessionId {
+                                        Text("runtime: \(runtimeId)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                            .lineLimit(1)
+                                    }
                                     if let date = session.effectiveLastUsedAt {
                                         Text(date.formatted(.relative(presentation: .named)))
                                             .font(.caption)
@@ -298,6 +345,7 @@ struct SessionPickerView: View {
         }
     }
 
+    @MainActor
     private func createNew(agent: AgentKind) async {
         appState.isCreatingSession = true
         defer { appState.isCreatingSession = false }
@@ -309,7 +357,8 @@ struct SessionPickerView: View {
         }
     }
 
-    private func resume(sessionId: String) async {
+    @MainActor
+    private func openConversation(sessionId: String) async {
         appState.isCreatingSession = true
         loadingSessionId = sessionId
         defer {
@@ -317,15 +366,16 @@ struct SessionPickerView: View {
             loadingSessionId = nil
         }
         do {
-            try await appState.resumeSession(sessionId: sessionId, modelContext: modelContext)
+            try await appState.openSession(sessionId: sessionId, modelContext: modelContext)
             navigateToChat = true
         } catch {
             appState.connectionError = error.localizedDescription
+            openErrorMessage = error.localizedDescription
         }
     }
 }
 
-/// Colored badge showing the daemon session state.
+/// Colored badge showing the daemon conversation state.
 struct SessionStateBadge: View {
     let state: String
 
@@ -342,28 +392,24 @@ struct SessionStateBadge: View {
 
     private var displayText: String {
         switch state {
-        case "idle": "Idle"
-        case "prompting": "Running"
-        case "draining": "Running"
-        case "completed": "Done"
-        case "dead": "Dead"
+        case "running", "prompting", "draining": "Running"
+        case "attached": "Attached"
+        case "ready", "idle", "completed": "Ready"
+        case "restorable", "external": "Restorable"
+        case "unavailable", "dead": "Unavailable"
         case "starting": "Starting"
-        case "history": "History"
-        case "external": "External"
         default: state.capitalized
         }
     }
 
     private var backgroundColor: Color {
         switch state {
-        case "idle": .gray
-        case "prompting": .blue
-        case "draining": .orange
-        case "completed": .green
-        case "dead": .red
+        case "running", "prompting", "draining": .blue
+        case "attached": .green
+        case "ready", "idle", "completed": .gray
+        case "restorable", "external": .purple
+        case "unavailable", "dead": .red
         case "starting": .yellow
-        case "history": .secondary
-        case "external": .purple
         default: .gray
         }
     }

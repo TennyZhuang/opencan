@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -124,6 +125,49 @@ func readResponseWithID(t *testing.T, scanner *bufio.Scanner, id float64) map[st
 	return nil
 }
 
+func createConversation(t *testing.T, conn net.Conn, scanner *bufio.Scanner, requestID float64, cwd, command, ownerID string) (string, string, map[string]interface{}) {
+	t.Helper()
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      requestID,
+		"method":  "daemon/conversation.create",
+		"params": map[string]interface{}{
+			"cwd":     cwd,
+			"command": command,
+			"ownerId": ownerID,
+		},
+	})
+	resp := readResponseWithID(t, scanner, requestID)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.create error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	conversation := result["conversation"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
+	conversationID := conversation["conversationId"].(string)
+	runtimeID := attachment["runtimeId"].(string)
+	if conversationID == "" || runtimeID == "" {
+		t.Fatalf("expected conversation/runtime ids, got %#v", result)
+	}
+	return conversationID, runtimeID, resp
+}
+
+func openConversation(t *testing.T, conn net.Conn, scanner *bufio.Scanner, requestID float64, conversationID, ownerID, lastRuntimeID string, lastEventSeq uint64) map[string]interface{} {
+	t.Helper()
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      requestID,
+		"method":  "daemon/conversation.open",
+		"params": map[string]interface{}{
+			"conversationId": conversationID,
+			"ownerId":        ownerID,
+			"lastRuntimeId":  lastRuntimeID,
+			"lastEventSeq":   lastEventSeq,
+		},
+	})
+	return readResponseWithID(t, scanner, requestID)
+}
+
 func TestDaemon_Hello(t *testing.T) {
 	d, sockPath := testDaemon(t)
 	defer d.Stop()
@@ -170,6 +214,35 @@ func TestDaemon_Hello_StringRequestIDRoundTrip(t *testing.T) {
 	}
 	if id != "hello-1" {
 		t.Fatalf("expected id hello-1, got %q", id)
+	}
+}
+
+func TestDaemon_MalformedRequestReturnsParseErrorOnSameID(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	// Intentionally malformed/truncated JSON so ParseLine fails after the id.
+	raw := `{"jsonrpc":"2.0","id":99,"method":"session/prompt","params":{"sessionId":"abc","prompt":[{"type":"text","text":"hello"}]}`
+	if _, err := conn.Write([]byte(raw + "\n")); err != nil {
+		t.Fatalf("write malformed request: %v", err)
+	}
+
+	resp := readJSON(t, conn)
+	if resp["id"].(float64) != 99 {
+		t.Fatalf("expected id 99 in parse error response, got %v", resp["id"])
+	}
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error object, got %#v", resp)
+	}
+	if code := errObj["code"].(float64); code != -32700 {
+		t.Fatalf("expected parse error code -32700, got %v", code)
+	}
+	if !strings.Contains(fmt.Sprint(errObj["message"]), "Parse error") {
+		t.Fatalf("unexpected parse error message: %v", errObj["message"])
 	}
 }
 
@@ -335,6 +408,33 @@ func TestDaemon_AgentProbe(t *testing.T) {
 	}
 }
 
+func TestDaemon_AgentProbeMalformedParamsReturnsInvalidParams(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/agent.probe",
+		"params":  "malformed",
+	})
+
+	resp := readJSON(t, conn)
+	if resp["error"] == nil {
+		t.Fatalf("expected invalid params error, got response: %#v", resp)
+	}
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected error object, got %#v", resp["error"])
+	}
+	if code := errObj["code"].(float64); code != -32602 {
+		t.Fatalf("expected -32602 invalid params, got %v", code)
+	}
+}
+
 func TestDaemon_DaemonNotificationWithoutIDDoesNotCrash(t *testing.T) {
 	d, sockPath := testDaemon(t)
 	defer d.Stop()
@@ -443,8 +543,155 @@ func TestDaemon_SessionList_DiscoversExternalWithoutManagedSessions(t *testing.T
 	}
 }
 
-func TestDaemon_SessionCreate(t *testing.T) {
-	// This test requires the mock-acp-server binary
+func TestDaemon_SessionList_ManagedProxyAlsoProbesOtherDiscoveryCommands(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found, run 'make mock-acp' first")
+	}
+
+	// Simulate command-specific session/list behavior:
+	// - emptyCmd (managed proxy) returns no loadable sessions.
+	// - richCmd (extra discovery command) returns an external session.
+	tmpDir := t.TempDir()
+	emptyCmd := writeMockWrapperCommand(t, filepath.Join(tmpDir, "mock-empty.sh"), mockBin, "")
+	richCmd := writeMockWrapperCommand(t, filepath.Join(tmpDir, "mock-rich.sh"), mockBin, "external-rich")
+
+	t.Setenv("OPENCAN_DISCOVERY_COMMANDS", emptyCmd+","+richCmd)
+	t.Setenv("MOCK_LIST_OMIT_CREATED", "1")
+	t.Setenv("MOCK_LIST_SESSIONS", "")
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Create a managed runtime using the "empty" command so proxy-based probing
+	// alone would return no loadable sessions.
+	_, _, _ = createConversation(t, conn, scanner, 1, "/tmp", emptyCmd, "ios-owner-1")
+
+	// session.list should still include externally discovered sessions from the
+	// additional command.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/session.list",
+		"params":  map[string]interface{}{},
+	})
+	resp := readResponseWithID(t, scanner, 2)
+	if resp["error"] != nil {
+		t.Fatalf("session.list error: %v", resp["error"])
+	}
+
+	result := resp["result"].(map[string]interface{})
+	sessions := result["sessions"].([]interface{})
+
+	foundExternal := false
+	for _, raw := range sessions {
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		id, _ := item["sessionId"].(string)
+		if id != "external-rich" {
+			continue
+		}
+		state, _ := item["state"].(string)
+		if state != "external" {
+			t.Fatalf("expected external-rich state=external, got %q", state)
+		}
+		foundExternal = true
+		break
+	}
+	if !foundExternal {
+		t.Fatalf("expected external-rich in session.list, got %v", sessions)
+	}
+}
+
+func TestDaemon_SessionList_DeadManagedLoadableSessionShownAsExternal(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found, run 'make mock-acp' first")
+	}
+
+	t.Setenv("OPENCAN_DISCOVERY_COMMANDS", mockBin)
+	t.Setenv("MOCK_CRASH_AFTER", "1")
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// Create a managed conversation; creation already attaches the runtime.
+	_, sessionID, _ := createConversation(t, conn, scanner, 1, "/tmp", mockBin, "test-client")
+
+	// Trigger mock ACP crash so daemon marks managed proxy dead.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": sessionID,
+			"prompt": []map[string]interface{}{{
+				"type": "text",
+				"text": "crash",
+			}},
+		},
+	})
+
+	// Expose the same session ID via external discovery.
+	t.Setenv("MOCK_LIST_SESSIONS", sessionID)
+
+	deadline := time.Now().Add(5 * time.Second)
+	var lastState string
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		reqID := float64(100 + attempt)
+		sendJSON(conn, map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      reqID,
+			"method":  "daemon/session.list",
+			"params":  map[string]interface{}{},
+		})
+
+		resp := readResponseWithID(t, scanner, reqID)
+		if resp["error"] != nil {
+			t.Fatalf("session.list error: %v", resp["error"])
+		}
+
+		result, _ := resp["result"].(map[string]interface{})
+		items, _ := result["sessions"].([]interface{})
+		lastState = ""
+		for _, raw := range items {
+			item, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			id, _ := item["sessionId"].(string)
+			if id != sessionID {
+				continue
+			}
+			lastState, _ = item["state"].(string)
+			break
+		}
+		if lastState == "external" {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("expected %s to be listed as external after managed death; lastState=%q", sessionID, lastState)
+}
+
+func TestDaemon_ConversationCreate_ShowsInSessionList(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {
 		t.Skip("mock-acp-server binary not found, run 'make mock-acp' first")
@@ -460,29 +707,8 @@ func TestDaemon_SessionCreate(t *testing.T) {
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	// Create session using mock ACP
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.create",
-		"params": map[string]interface{}{
-			"cwd":     "/tmp",
-			"command": mockBin,
-		},
-	})
+	_, runtimeID, _ := createConversation(t, conn, scanner, 1, "/tmp", mockBin, "ios-owner-1")
 
-	resp := readJSONWithScanner(t, scanner)
-	if resp["error"] != nil {
-		t.Fatalf("session.create error: %v", resp["error"])
-	}
-	result := resp["result"].(map[string]interface{})
-	sessionID, ok := result["sessionId"].(string)
-	if !ok || sessionID == "" {
-		t.Fatalf("expected sessionId, got %v", result)
-	}
-	t.Logf("created session: %s", sessionID)
-
-	// List sessions — should see our session
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      2,
@@ -490,11 +716,15 @@ func TestDaemon_SessionCreate(t *testing.T) {
 		"params":  map[string]interface{}{},
 	})
 
-	resp = readJSONWithScanner(t, scanner)
-	result = resp["result"].(map[string]interface{})
+	resp := readResponseWithID(t, scanner, 2)
+	result := resp["result"].(map[string]interface{})
 	sessions := result["sessions"].([]interface{})
 	if len(sessions) != 1 {
 		t.Fatalf("expected 1 session, got %d", len(sessions))
+	}
+	listed := sessions[0].(map[string]interface{})
+	if listed["sessionId"] != runtimeID {
+		t.Fatalf("expected runtime %s in session.list, got %#v", runtimeID, listed)
 	}
 }
 
@@ -517,27 +747,26 @@ func TestDaemon_SessionListFiltersNonLoadableIdleSessions(t *testing.T) {
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.create",
-		"params": map[string]interface{}{
-			"cwd":     "/tmp",
-			"command": mockBin,
-		},
-	})
-	resp := readJSONWithScanner(t, scanner)
-	if resp["error"] != nil {
-		t.Fatalf("session.create error: %v", resp["error"])
-	}
+	conversationID, _, _ := createConversation(t, conn, scanner, 1, "/tmp", mockBin, "ios-owner-1")
 
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      2,
+		"method":  "daemon/conversation.detach",
+		"params":  map[string]interface{}{"conversationId": conversationID},
+	})
+	resp := readJSONWithScanner(t, scanner)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.detach error: %v", resp["error"])
+	}
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
 		"method":  "daemon/session.list",
 		"params":  map[string]interface{}{},
 	})
-	resp = readJSONWithScanner(t, scanner)
+	resp = readResponseWithID(t, scanner, 3)
 	if resp["error"] != nil {
 		t.Fatalf("session.list error: %v", resp["error"])
 	}
@@ -548,7 +777,7 @@ func TestDaemon_SessionListFiltersNonLoadableIdleSessions(t *testing.T) {
 	}
 }
 
-func TestDaemon_SessionCreateAndPrompt(t *testing.T) {
+func TestDaemon_ConversationCreateAndPrompt(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {
 		t.Skip("mock-acp-server binary not found")
@@ -564,59 +793,28 @@ func TestDaemon_SessionCreateAndPrompt(t *testing.T) {
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	// Create session
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.create",
-		"params": map[string]interface{}{
-			"cwd":     "/tmp",
-			"command": mockBin,
-		},
-	})
+	conversationID, runtimeID, _ := createConversation(t, conn, scanner, 1, "/tmp", mockBin, "ios-owner-1")
 
-	resp := readJSONWithScanner(t, scanner)
-	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
-
-	// Attach to session
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "daemon/session.attach",
-		"params": map[string]interface{}{
-			"sessionId":    sessionID,
-			"lastEventSeq": 0,
-		},
-	})
-
-	resp = readJSONWithScanner(t, scanner)
-	if resp["error"] != nil {
-		t.Fatalf("session.attach error: %v", resp["error"])
-	}
-
-	// Send prompt
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1001,
 		"method":  "session/prompt",
 		"params": map[string]interface{}{
-			"sessionId": sessionID,
-			"prompt": []map[string]interface{}{
-				{"type": "text", "text": "hello"},
-			},
+			"sessionId": runtimeID,
+			"prompt": []map[string]interface{}{{
+				"type": "text",
+				"text": "hello",
+			}},
 		},
 	})
 
-	// Read streaming events + final response
 	var notifications []map[string]interface{}
 	var promptResponse map[string]interface{}
 	for {
 		msg := readJSONWithScanner(t, scanner)
 		if msg["method"] != nil {
-			// Notification
 			notifications = append(notifications, msg)
 		} else if msg["id"] != nil && msg["id"].(float64) == 1001 {
-			// Response to our prompt
 			promptResponse = msg
 			break
 		}
@@ -628,13 +826,17 @@ func TestDaemon_SessionCreateAndPrompt(t *testing.T) {
 	if promptResponse == nil {
 		t.Fatal("expected prompt response")
 	}
-	t.Logf("received %d notifications", len(notifications))
 
-	// Verify notifications have __seq
 	for _, n := range notifications {
 		params := n["params"].(map[string]interface{})
 		if _, ok := params["__seq"]; !ok {
 			t.Error("notification missing __seq")
+		}
+		if gotRuntimeID, _ := params["runtimeId"].(string); gotRuntimeID != runtimeID {
+			t.Errorf("notification runtimeId = %q, want %q", gotRuntimeID, runtimeID)
+		}
+		if gotConversationID, _ := params["conversationId"].(string); gotConversationID != conversationID {
+			t.Errorf("notification conversationId = %q, want %q", gotConversationID, conversationID)
 		}
 	}
 }
@@ -656,47 +858,18 @@ func TestDaemon_PromptResponseWithoutPromptCompleteStillEndsPrompting(t *testing
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	// Create session.
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.create",
-		"params": map[string]interface{}{
-			"cwd":     "/tmp",
-			"command": mockBin,
-		},
-	})
-	resp := readJSONWithScanner(t, scanner)
-	if resp["error"] != nil {
-		t.Fatalf("session.create error: %v", resp["error"])
-	}
-	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+	_, runtimeID, _ := createConversation(t, conn, scanner, 1, "/tmp", mockBin, "ios-owner-1")
 
-	// Attach session.
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "daemon/session.attach",
-		"params": map[string]interface{}{
-			"sessionId":    sessionID,
-			"lastEventSeq": 0,
-		},
-	})
-	resp = readJSONWithScanner(t, scanner)
-	if resp["error"] != nil {
-		t.Fatalf("session.attach error: %v", resp["error"])
-	}
-
-	// Prompt. Mock omits prompt_complete but still returns stopReason.
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1001,
 		"method":  "session/prompt",
 		"params": map[string]interface{}{
-			"sessionId": sessionID,
-			"prompt": []map[string]interface{}{
-				{"type": "text", "text": "hello"},
-			},
+			"sessionId": runtimeID,
+			"prompt": []map[string]interface{}{{
+				"type": "text",
+				"text": "hello",
+			}},
 		},
 	})
 
@@ -725,14 +898,13 @@ func TestDaemon_PromptResponseWithoutPromptCompleteStillEndsPrompting(t *testing
 		t.Fatal("mock unexpectedly emitted prompt_complete")
 	}
 
-	// Prompt lifecycle should still terminate in daemon state machine.
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      2001,
 		"method":  "daemon/session.list",
 		"params":  map[string]interface{}{},
 	})
-	resp = readJSONWithScanner(t, scanner)
+	resp := readJSONWithScanner(t, scanner)
 	if resp["error"] != nil {
 		t.Fatalf("session.list error: %v", resp["error"])
 	}
@@ -747,20 +919,20 @@ func TestDaemon_PromptResponseWithoutPromptCompleteStillEndsPrompting(t *testing
 		if !ok {
 			continue
 		}
-		if entry["sessionId"] == sessionID {
+		if entry["sessionId"] == runtimeID {
 			state, _ = entry["state"].(string)
 			break
 		}
 	}
 	if state == "" {
-		t.Fatalf("session %s not found in session.list", sessionID)
+		t.Fatalf("session %s not found in session.list", runtimeID)
 	}
 	if state != "idle" {
 		t.Fatalf("session state = %q, want %q", state, "idle")
 	}
 }
 
-func TestDaemon_DisconnectAndReattach(t *testing.T) {
+func TestDaemon_ConversationOpen_ReattachesAfterDisconnect(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {
 		t.Skip("mock-acp-server binary not found")
@@ -769,81 +941,52 @@ func TestDaemon_DisconnectAndReattach(t *testing.T) {
 	d, sockPath := testDaemon(t)
 	defer d.Stop()
 
-	// Client 1: create session and start prompt
 	conn1 := connectToDaemon(t, sockPath)
 	scanner1 := bufio.NewScanner(conn1)
 	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	sendJSON(conn1, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.create",
-		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
-	})
-	resp := readResponseWithID(t, scanner1, 1)
-	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+	conversationID, runtimeID, _ := createConversation(t, conn1, scanner1, 1, "/tmp", mockBin, "ios-owner-1")
 
-	sendJSON(conn1, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "daemon/session.attach",
-		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
-	})
-	readJSONWithScanner(t, scanner1) // attach response
-
-	// Send prompt
 	sendJSON(conn1, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1001,
 		"method":  "session/prompt",
 		"params": map[string]interface{}{
-			"sessionId": sessionID,
+			"sessionId": runtimeID,
 			"prompt":    []map[string]interface{}{{"type": "text", "text": "hello"}},
 		},
 	})
 
-	// Read a couple notifications, then disconnect
 	readJSONWithScanner(t, scanner1)
 	readJSONWithScanner(t, scanner1)
 	conn1.Close()
 
-	// Wait for mock ACP to finish prompt
 	time.Sleep(2 * time.Second)
 
-	// Client 2: reconnect and reattach
 	conn2 := connectToDaemon(t, sockPath)
 	defer conn2.Close()
 	scanner2 := bufio.NewScanner(conn2)
 	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn2.SetReadDeadline(time.Now().Add(10 * time.Second))
 
-	sendJSON(conn2, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.attach",
-		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
-	})
-
-	resp = readJSONWithScanner(t, scanner2)
+	resp := openConversation(t, conn2, scanner2, 1, conversationID, "ios-owner-1", runtimeID, 0)
 	if resp["error"] != nil {
-		t.Fatalf("reattach error: %v", resp["error"])
+		t.Fatalf("conversation.open error: %v", resp["error"])
 	}
 	result := resp["result"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
 
-	// Should have buffered events
-	buffered, ok := result["bufferedEvents"].([]interface{})
+	buffered, ok := attachment["bufferedEvents"].([]interface{})
 	if !ok {
-		t.Fatalf("expected bufferedEvents array, got %T", result["bufferedEvents"])
+		t.Fatalf("expected bufferedEvents array, got %T", attachment["bufferedEvents"])
 	}
-	t.Logf("reattach: state=%v, bufferedEvents=%d", result["state"], len(buffered))
-
 	if len(buffered) == 0 {
 		t.Fatal("expected buffered events after disconnect/reconnect")
 	}
 }
 
-func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
+func TestDaemon_ConversationOpen_RejectsSecondOwner(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {
 		t.Skip("mock-acp-server binary not found")
@@ -858,66 +1001,222 @@ func TestDaemon_SessionAttachRejectsSecondClient(t *testing.T) {
 	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	// Client 1 creates and attaches a session.
-	sendJSON(conn1, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.create",
-		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
-	})
-	resp := readResponseWithID(t, scanner1, 1)
-	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+	conversationID, _, _ := createConversation(t, conn1, scanner1, 1, "/tmp", mockBin, "ios-app-1")
 
-	sendJSON(conn1, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "daemon/session.attach",
-		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
-	})
-	resp = readResponseWithID(t, scanner1, 2)
-	if resp["error"] != nil {
-		t.Fatalf("client1 attach error: %v", resp["error"])
-	}
-
-	// Client 2 cannot attach while client 1 owns the session.
 	conn2 := connectToDaemon(t, sockPath)
 	defer conn2.Close()
 	scanner2 := bufio.NewScanner(conn2)
 	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	sendJSON(conn2, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.attach",
-		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
-	})
-	resp = readResponseWithID(t, scanner2, 1)
+	resp := openConversation(t, conn2, scanner2, 1, conversationID, "ios-app-2", "", 0)
 	if resp["error"] == nil {
-		t.Fatal("expected attach rejection for second client")
+		t.Fatal("expected conversation.open rejection for second client")
 	}
 
-	// Once client 1 detaches, client 2 can attach successfully.
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/conversation.detach",
+		"params":  map[string]interface{}{"conversationId": conversationID},
+	})
+	resp = readResponseWithID(t, scanner1, 2)
+	if resp["error"] != nil {
+		t.Fatalf("client1 detach error: %v", resp["error"])
+	}
+
+	resp = openConversation(t, conn2, scanner2, 2, conversationID, "ios-app-2", "", 0)
+	if resp["error"] != nil {
+		t.Fatalf("client2 conversation.open after detach should succeed: %v", resp["error"])
+	}
+}
+
+func TestDaemon_ConversationOpen_AllowsSameOwnerReclaim(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	defer conn1.Close()
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	conversationID, runtimeID, _ := createConversation(t, conn1, scanner1, 1, "/tmp", mockBin, "ios-app-1")
+
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	resp := openConversation(t, conn2, scanner2, 1, conversationID, "ios-app-1", runtimeID, 0)
+	if resp["error"] != nil {
+		t.Fatalf("client2 conversation.open with same owner should succeed: %v", resp["error"])
+	}
+
 	sendJSON(conn1, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      3,
-		"method":  "daemon/session.detach",
-		"params":  map[string]interface{}{"sessionId": sessionID},
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": runtimeID,
+			"prompt":    []map[string]interface{}{{"type": "text", "text": "old-owner-should-fail"}},
+		},
 	})
 	resp = readResponseWithID(t, scanner1, 3)
+	if resp["error"] == nil {
+		t.Fatal("expected old connection prompt rejection after reclaim")
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: "+runtimeID) {
+		t.Fatalf("unexpected old connection error: %v", resp["error"])
+	}
+
+	conn3 := connectToDaemon(t, sockPath)
+	defer conn3.Close()
+	scanner3 := bufio.NewScanner(conn3)
+	scanner3.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn3.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	resp = openConversation(t, conn3, scanner3, 1, conversationID, "ios-app-2", runtimeID, 0)
+	if resp["error"] == nil {
+		t.Fatal("expected conversation.open rejection for different owner")
+	}
+}
+
+func TestDaemon_ConversationOpen_ReclaimPrunesPreviousHandlerCache(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	defer conn1.Close()
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	conversationID, runtimeID, _ := createConversation(t, conn1, scanner1, 1, "/tmp", mockBin, "ios-app-1")
+
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	resp := openConversation(t, conn2, scanner2, 1, conversationID, "ios-app-1", runtimeID, 0)
 	if resp["error"] != nil {
-		t.Fatalf("client1 detach error: %v", resp["error"])
+		t.Fatalf("client2 reclaim conversation.open error: %v", resp["error"])
+	}
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "session/load",
+		"params": map[string]interface{}{
+			"sessionId":  "external-session-id",
+			"cwd":        "/tmp",
+			"mcpServers": []interface{}{},
+		},
+	})
+	resp = readResponseWithID(t, scanner1, 3)
+	if resp["error"] == nil {
+		t.Fatal("expected stale owner session/load rejection")
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: external-session-id") {
+		t.Fatalf("unexpected stale owner session/load error: %v", resp["error"])
 	}
 
 	sendJSON(conn2, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      2,
-		"method":  "daemon/session.attach",
-		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
+		"method":  "daemon/logs",
+		"params":  map[string]interface{}{"count": 200},
 	})
 	resp = readResponseWithID(t, scanner2, 2)
 	if resp["error"] != nil {
-		t.Fatalf("client2 attach after detach should succeed: %v", resp["error"])
+		t.Fatalf("daemon/logs error: %v", resp["error"])
+	}
+	entries := resp["result"].(map[string]interface{})["entries"].([]interface{})
+	foundPruneLog := false
+	for _, raw := range entries {
+		entry, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if !strings.Contains(fmt.Sprint(entry), "pruned stale attached proxy entry from previous owner") {
+			continue
+		}
+		foundPruneLog = true
+		break
+	}
+	if !foundPruneLog {
+		t.Fatal("expected reclaim path to log stale attached proxy prune")
+	}
+}
+
+func TestDaemon_ACPRequestsRejectUnknownRuntimeID(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	_, _, _ = createConversation(t, conn, scanner, 1, "/tmp", mockBin, "ios-owner-1")
+
+	// session/load with an unknown sessionId is rejected; history restore is daemon-owned.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "session/load",
+		"params": map[string]interface{}{
+			"sessionId":  "external-session-id",
+			"cwd":        "/tmp",
+			"mcpServers": []interface{}{},
+		},
+	})
+	resp := readResponseWithID(t, scanner, 3)
+	if resp["error"] == nil {
+		t.Fatal("expected session/load rejection for unknown sessionId")
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: external-session-id") {
+		t.Fatalf("unexpected session/load error: %v", resp["error"])
+	}
+
+	// Prompt for unknown sessionId is still rejected.
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      4,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": "external-session-id",
+			"prompt": []map[string]interface{}{{
+				"type": "text",
+				"text": "should-fail",
+			}},
+		},
+	})
+	resp = readResponseWithID(t, scanner, 4)
+	if resp["error"] == nil {
+		t.Fatal("expected prompt rejection for unknown sessionId")
+	}
+	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: external-session-id") {
+		t.Fatalf("unexpected prompt error: %v", resp["error"])
 	}
 }
 
@@ -935,23 +1234,7 @@ func TestDaemon_IdleTimeoutRearmsWhileSessionBusy(t *testing.T) {
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	// Create and attach session.
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "daemon/session.create",
-		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
-	})
-	resp := readJSONWithScanner(t, scanner)
-	sessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
-
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  "daemon/session.attach",
-		"params":  map[string]interface{}{"sessionId": sessionID, "lastEventSeq": 0},
-	})
-	readJSONWithScanner(t, scanner) // attach response
+	_, runtimeID, _ := createConversation(t, conn, scanner, 1, "/tmp", mockBin, "ios-owner-1")
 
 	// Start a long-enough prompt (mock streams ~400ms total by default).
 	sendJSON(conn, map[string]interface{}{
@@ -959,7 +1242,7 @@ func TestDaemon_IdleTimeoutRearmsWhileSessionBusy(t *testing.T) {
 		"id":      1001,
 		"method":  "session/prompt",
 		"params": map[string]interface{}{
-			"sessionId": sessionID,
+			"sessionId": runtimeID,
 			"prompt":    []map[string]interface{}{{"type": "text", "text": "hello"}},
 		},
 	})
@@ -984,7 +1267,32 @@ func TestDaemon_IdleTimeoutRearmsWhileSessionBusy(t *testing.T) {
 	t.Fatal("daemon did not stop after idle timeout while no clients were connected")
 }
 
-func TestDaemon_SessionLoadRouteToSession(t *testing.T) {
+func TestDaemon_ConversationList_Empty(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/conversation.list",
+		"params":  map[string]interface{}{},
+	})
+
+	resp := readJSON(t, conn)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.list error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	conversations := result["conversations"].([]interface{})
+	if len(conversations) != 0 {
+		t.Fatalf("expected 0 conversations, got %d", len(conversations))
+	}
+}
+
+func TestDaemon_ConversationCreate_AttachesAndLists(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {
 		t.Skip("mock-acp-server binary not found")
@@ -995,130 +1303,334 @@ func TestDaemon_SessionLoadRouteToSession(t *testing.T) {
 
 	conn := connectToDaemon(t, sockPath)
 	defer conn.Close()
-
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	// Create a session (this will be the "new" session we route to)
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1,
-		"method":  "daemon/session.create",
-		"params":  map[string]interface{}{"cwd": "/tmp", "command": mockBin},
+		"method":  "daemon/conversation.create",
+		"params": map[string]interface{}{
+			"cwd":     "/tmp",
+			"command": mockBin,
+			"ownerId": "ios-owner-1",
+		},
 	})
-	resp := readJSONWithScanner(t, scanner)
-	newSessionID := resp["result"].(map[string]interface{})["sessionId"].(string)
+	resp := readResponseWithID(t, scanner, 1)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.create error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	conversation := result["conversation"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
+	conversationID := conversation["conversationId"].(string)
+	runtimeID := attachment["runtimeId"].(string)
+	if conversationID == "" || runtimeID == "" {
+		t.Fatalf("expected conversation/runtime ids, got %#v", result)
+	}
+	bufferedEvents, _ := attachment["bufferedEvents"].([]interface{})
+	if len(bufferedEvents) > 0 {
+		firstBuffered := bufferedEvents[0].(map[string]interface{})
+		bufferedEvent := firstBuffered["event"].(map[string]interface{})
+		bufferedParams := bufferedEvent["params"].(map[string]interface{})
+		if gotRuntimeID, _ := bufferedParams["runtimeId"].(string); gotRuntimeID != runtimeID {
+			t.Fatalf("buffered event runtimeId = %q, want %q", gotRuntimeID, runtimeID)
+		}
+		if gotConversationID, _ := bufferedParams["conversationId"].(string); gotConversationID != conversationID {
+			t.Fatalf("buffered event conversationId = %q, want %q", gotConversationID, conversationID)
+		}
+	}
+	if conversationID != runtimeID {
+		t.Fatalf("new conversation should start with conversationId == runtimeId, got %q vs %q", conversationID, runtimeID)
+	}
+	if state, _ := conversation["state"].(string); state != "attached" {
+		t.Fatalf("expected attached state, got %q", state)
+	}
 
-	// Attach to the new session
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      2,
-		"method":  "daemon/session.attach",
-		"params":  map[string]interface{}{"sessionId": newSessionID, "lastEventSeq": 0},
+		"method":  "daemon/conversation.list",
+		"params":  map[string]interface{}{},
+	})
+	resp = readResponseWithID(t, scanner, 2)
+	result = resp["result"].(map[string]interface{})
+	conversations := result["conversations"].([]interface{})
+	if len(conversations) != 1 {
+		t.Fatalf("expected 1 conversation, got %d", len(conversations))
+	}
+	listed := conversations[0].(map[string]interface{})
+	if listed["conversationId"].(string) != conversationID {
+		t.Fatalf("listed wrong conversation id: %#v", listed)
+	}
+	if listed["runtimeId"].(string) != runtimeID {
+		t.Fatalf("listed wrong runtime id: %#v", listed)
+	}
+}
+
+func TestDaemon_ConversationOpen_ReusesExistingManagedRuntime(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/conversation.create",
+		"params": map[string]interface{}{
+			"cwd":     "/tmp",
+			"command": mockBin,
+			"ownerId": "ios-owner-1",
+		},
+	})
+	resp := readResponseWithID(t, scanner, 1)
+	result := resp["result"].(map[string]interface{})
+	conversation := result["conversation"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
+	conversationID := conversation["conversationId"].(string)
+	runtimeID := attachment["runtimeId"].(string)
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/conversation.open",
+		"params": map[string]interface{}{
+			"conversationId": conversationID,
+			"ownerId":        "ios-owner-1",
+			"lastRuntimeId":  runtimeID,
+			"lastEventSeq":   0,
+		},
 	})
 	resp = readResponseWithID(t, scanner, 2)
 	if resp["error"] != nil {
-		t.Fatalf("attach error: %v", resp["error"])
+		t.Fatalf("conversation.open error: %v", resp["error"])
+	}
+	result = resp["result"].(map[string]interface{})
+	attachment = result["attachment"].(map[string]interface{})
+	if reused, _ := attachment["reusedRuntime"].(bool); !reused {
+		t.Fatalf("expected reusedRuntime=true, got %#v", attachment)
+	}
+	if gotRuntimeID := attachment["runtimeId"].(string); gotRuntimeID != runtimeID {
+		t.Fatalf("expected runtime reuse %q, got %q", runtimeID, gotRuntimeID)
+	}
+}
+
+func TestDaemon_ConversationOpen_RestoredConversationPromptUsesConversationID(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
 	}
 
-	// Send session/load with a fake "old" sessionId but __routeToSession pointing
-	// to the new session. The daemon should route this to the new session's ACP proxy.
-	oldSessionID := "old-session-that-doesnt-exist"
+	t.Setenv("OPENCAN_DISCOVERY_COMMANDS", mockBin)
+	t.Setenv("MOCK_LIST_SESSIONS", "external-conv-prompt")
+	t.Setenv("MOCK_LIST_OMIT_CREATED", "1")
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
-		"id":      1001,
-		"method":  "session/load",
+		"id":      1,
+		"method":  "daemon/conversation.open",
 		"params": map[string]interface{}{
-			"sessionId":        oldSessionID,
-			"cwd":              "/tmp",
-			"mcpServers":       []interface{}{},
-			"__routeToSession": newSessionID,
+			"conversationId":   "external-conv-prompt",
+			"ownerId":          "ios-owner-1",
+			"preferredCommand": mockBin,
+			"cwdHint":          "/tmp",
 		},
 	})
-
-	resp = readResponseWithID(t, scanner, 1001)
-
-	// Should succeed — the daemon routed to the new session's proxy
+	resp := readResponseWithID(t, scanner, 1)
 	if resp["error"] != nil {
-		t.Fatalf("session/load with __routeToSession should succeed, got error: %v", resp["error"])
+		t.Fatalf("conversation.open restore error: %v", resp["error"])
 	}
-	if resp["id"].(float64) != 1001 {
-		t.Fatalf("expected response id 1001, got %v", resp["id"])
+	result := resp["result"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
+	runtimeID := attachment["runtimeId"].(string)
+	if runtimeID == "" || runtimeID == "external-conv-prompt" {
+		t.Fatalf("expected fresh runtime id, got %q", runtimeID)
 	}
-	t.Logf("session/load with __routeToSession succeeded")
 
-	// session/prompt should support the same routing override so recovered
-	// sessions can continue on their original sessionId.
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
-		"id":      1003,
+		"id":      2,
 		"method":  "session/prompt",
 		"params": map[string]interface{}{
-			"sessionId":        oldSessionID,
-			"prompt":           []map[string]interface{}{{"type": "text", "text": "continue history"}},
-			"__routeToSession": newSessionID,
+			"sessionId": runtimeID,
+			"prompt":    []map[string]interface{}{{"type": "text", "text": "hello"}},
 		},
 	})
 
-	resp = readResponseWithID(t, scanner, 1003)
+	for i := 0; i < 20; i++ {
+		msg := readJSONWithScanner(t, scanner)
+		method, _ := msg["method"].(string)
+		if method != "session/update" {
+			continue
+		}
+		params, _ := msg["params"].(map[string]interface{})
+		gotSessionID, _ := params["sessionId"].(string)
+		if gotSessionID != "external-conv-prompt" {
+			t.Fatalf("upstream prompt used sessionId %q, want %q", gotSessionID, "external-conv-prompt")
+		}
+		gotRuntimeID, _ := params["runtimeId"].(string)
+		if gotRuntimeID != runtimeID {
+			t.Fatalf("decorated runtimeId = %q, want %q", gotRuntimeID, runtimeID)
+		}
+		gotConversationID, _ := params["conversationId"].(string)
+		if gotConversationID != "external-conv-prompt" {
+			t.Fatalf("decorated conversationId = %q, want %q", gotConversationID, "external-conv-prompt")
+		}
+		return
+	}
+	t.Fatal("expected session/update notification after prompt")
+}
+
+func TestDaemon_ConversationOpen_RestoresDiscoveredConversation(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	t.Setenv("OPENCAN_DISCOVERY_COMMANDS", mockBin)
+	t.Setenv("MOCK_LIST_SESSIONS", "external-conv-1")
+	t.Setenv("MOCK_LIST_OMIT_CREATED", "1")
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/conversation.open",
+		"params": map[string]interface{}{
+			"conversationId":   "external-conv-1",
+			"ownerId":          "ios-owner-1",
+			"preferredCommand": mockBin,
+			"cwdHint":          "/tmp",
+		},
+	})
+	resp := readResponseWithID(t, scanner, 1)
 	if resp["error"] != nil {
-		t.Fatalf("session/prompt with __routeToSession should succeed, got error: %v", resp["error"])
+		t.Fatalf("conversation.open restore error: %v", resp["error"])
 	}
-	t.Logf("session/prompt with __routeToSession succeeded")
+	result := resp["result"].(map[string]interface{})
+	conversation := result["conversation"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
+	if gotConversationID := conversation["conversationId"].(string); gotConversationID != "external-conv-1" {
+		t.Fatalf("expected external conversation id, got %q", gotConversationID)
+	}
+	runtimeID := attachment["runtimeId"].(string)
+	if runtimeID == "" || runtimeID == "external-conv-1" {
+		t.Fatalf("expected fresh runtime id, got %q", runtimeID)
+	}
+	if restored, _ := attachment["restoredFromHistory"].(bool); !restored {
+		t.Fatalf("expected restoredFromHistory=true, got %#v", attachment)
+	}
 
-	// Without routing override, prompts for unknown sessions should still fail.
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
-		"id":      1004,
-		"method":  "session/prompt",
-		"params": map[string]interface{}{
-			"sessionId": oldSessionID,
-			"prompt":    []map[string]interface{}{{"type": "text", "text": "should fail"}},
-		},
+		"id":      2,
+		"method":  "daemon/conversation.list",
+		"params":  map[string]interface{}{},
+	})
+	resp = readResponseWithID(t, scanner, 2)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.list error: %v", resp["error"])
+	}
+	result = resp["result"].(map[string]interface{})
+	conversations := result["conversations"].([]interface{})
+	if len(conversations) != 1 {
+		t.Fatalf("expected deduped single conversation row, got %d", len(conversations))
+	}
+	listed := conversations[0].(map[string]interface{})
+	if listed["conversationId"].(string) != "external-conv-1" {
+		t.Fatalf("wrong listed conversation: %#v", listed)
+	}
+	if listed["runtimeId"].(string) != runtimeID {
+		t.Fatalf("expected runtime id %q, got %#v", runtimeID, listed)
+	}
+}
+
+func TestDaemon_ConversationOpen_RetriesAlternateCommandAfterLoadFailure(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	tmpDir := t.TempDir()
+	failingCmd := writeMockWrapperCommandWithEnv(t, filepath.Join(tmpDir, "mock-load-fail.sh"), mockBin, map[string]string{
+		"MOCK_LIST_SESSIONS":      "external-conv-retry",
+		"MOCK_LIST_OMIT_CREATED":  "1",
+		"MOCK_SESSION_LOAD_ERROR": "Query closed before response received",
+	})
+	succeedingCmd := writeMockWrapperCommandWithEnv(t, filepath.Join(tmpDir, "mock-load-ok.sh"), mockBin, map[string]string{
+		"MOCK_LIST_SESSIONS":     "external-conv-retry",
+		"MOCK_LIST_OMIT_CREATED": "1",
 	})
 
-	resp = readResponseWithID(t, scanner, 1004)
-	if resp["error"] == nil {
-		t.Fatal("session/prompt for unknown session without __routeToSession should fail")
-	}
-	t.Logf("session/prompt without __routeToSession correctly failed: %v", resp["error"])
+	t.Setenv("OPENCAN_DISCOVERY_COMMANDS", failingCmd+","+succeedingCmd)
 
-	// __routeToSession should be ignored for unsupported methods.
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn := connectToDaemon(t, sockPath)
+	defer conn.Close()
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
 	sendJSON(conn, map[string]interface{}{
 		"jsonrpc": "2.0",
-		"id":      1005,
-		"method":  "session/list",
+		"id":      1,
+		"method":  "daemon/conversation.open",
 		"params": map[string]interface{}{
-			"sessionId":        oldSessionID,
-			"__routeToSession": newSessionID,
+			"conversationId":   "external-conv-retry",
+			"ownerId":          "ios-owner-1",
+			"preferredCommand": failingCmd,
+			"cwdHint":          "/tmp",
 		},
 	})
-	resp = readResponseWithID(t, scanner, 1005)
-	if resp["error"] == nil {
-		t.Fatal("session/list with __routeToSession should fail (override not allowed)")
+	resp := readResponseWithID(t, scanner, 1)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.open retry error: %v", resp["error"])
 	}
-	if !strings.Contains(fmt.Sprint(resp["error"]), "not attached to session: "+oldSessionID) {
-		t.Fatalf("expected not-attached error for original session id, got: %v", resp["error"])
+	result := resp["result"].(map[string]interface{})
+	conversation := result["conversation"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
+	if gotConversationID := conversation["conversationId"].(string); gotConversationID != "external-conv-retry" {
+		t.Fatalf("expected retried conversation id, got %q", gotConversationID)
 	}
-
-	// Also verify that session/load WITHOUT __routeToSession fails for the old ID
-	sendJSON(conn, map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1002,
-		"method":  "session/load",
-		"params": map[string]interface{}{
-			"sessionId":  oldSessionID,
-			"cwd":        "/tmp",
-			"mcpServers": []interface{}{},
-		},
-	})
-
-	resp = readJSONWithScanner(t, scanner)
-	if resp["error"] == nil {
-		t.Fatal("session/load for unknown session without __routeToSession should fail")
+	if restored, _ := attachment["restoredFromHistory"].(bool); !restored {
+		t.Fatalf("expected restoredFromHistory=true, got %#v", attachment)
 	}
-	t.Logf("session/load without __routeToSession correctly failed: %v", resp["error"])
+	if gotRuntimeID := attachment["runtimeId"].(string); gotRuntimeID == "" || gotRuntimeID == "external-conv-retry" {
+		t.Fatalf("expected fresh runtime after retry, got %q", gotRuntimeID)
+	}
+	if gotCommand := conversation["command"].(string); gotCommand != succeedingCmd {
+		t.Fatalf("expected fallback command %q, got %q", succeedingCmd, gotCommand)
+	}
 }
 
 func findMockBin(t *testing.T) string {
@@ -1158,6 +1670,32 @@ func findMockBin(t *testing.T) string {
 	}
 
 	return ""
+}
+
+func writeMockWrapperCommand(t *testing.T, path, mockBin, configuredListSessions string) string {
+	t.Helper()
+	return writeMockWrapperCommandWithEnv(t, path, mockBin, map[string]string{
+		"MOCK_LIST_SESSIONS": configuredListSessions,
+	})
+}
+
+func writeMockWrapperCommandWithEnv(t *testing.T, path, mockBin string, env map[string]string) string {
+	t.Helper()
+	var builder strings.Builder
+	builder.WriteString("#!/bin/sh\n")
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		builder.WriteString(fmt.Sprintf("export %s=%q\n", key, env[key]))
+	}
+	builder.WriteString(fmt.Sprintf("exec %q \"$@\"\n", mockBin))
+	if err := os.WriteFile(path, []byte(builder.String()), 0o755); err != nil {
+		t.Fatalf("write wrapper command %s: %v", path, err)
+	}
+	return path
 }
 
 func init() {

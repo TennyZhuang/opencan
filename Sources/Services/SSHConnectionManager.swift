@@ -136,13 +136,11 @@ actor SSHConnectionManager {
             throw SSHError.notConnected
         }
 
-        // Load the binary from the app bundle
-        guard let bundleURL = Bundle.main.url(
-            forResource: "opencan-daemon-linux-amd64",
-            withExtension: nil
-        ) else {
-            throw SSHError.daemonBinaryNotFound
-        }
+        // Select the bundled daemon that matches the remote host platform.
+        // Falls back to linux-amd64 only when remote detection is unavailable.
+        let remoteTarget = try await detectRemoteDaemonTarget(client: client)
+        let (bundleName, bundleURL) = try bundledDaemonBinary(remoteTarget: remoteTarget)
+        Log.toFile("[SSH] Using bundled daemon \(bundleName)")
         let binaryData = try Data(contentsOf: bundleURL)
         let localHash = sha256Hex(binaryData)
 
@@ -415,6 +413,90 @@ actor SSHConnectionManager {
             _ = CC_SHA256(ptr.baseAddress, CC_LONG(data.count), &digest)
         }
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func bundledDaemonBinary(remoteTarget: String?) throws -> (name: String, url: URL) {
+        let fallbackName = "opencan-daemon-linux-amd64"
+        if let remoteTarget, remoteTarget != "linux-amd64" {
+            let preferredName = "opencan-daemon-\(remoteTarget)"
+            guard let preferredURL = Bundle.main.url(forResource: preferredName, withExtension: nil) else {
+                Log.toFile("[SSH] Missing bundled daemon for remote target \(remoteTarget)")
+                throw SSHError.daemonBinaryNotFound
+            }
+            return (preferredName, preferredURL)
+        }
+
+        guard let fallbackURL = Bundle.main.url(forResource: fallbackName, withExtension: nil) else {
+            throw SSHError.daemonBinaryNotFound
+        }
+        return (fallbackName, fallbackURL)
+    }
+
+    private func detectRemoteDaemonTarget(client: SSHClient) async throws -> String? {
+        let osMarker = "__opencan_os__"
+        let archMarker = "__opencan_arch__"
+        do {
+            let output = try await client.executeCommand(
+                """
+                os="$(uname -s 2>/dev/null || true)"
+                arch="$(uname -m 2>/dev/null || true)"
+                printf '\(osMarker)%s\\n\(archMarker)%s\\n' "$os" "$arch"
+                """
+            )
+            let lines = String(buffer: output)
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+
+            var rawOS: String?
+            var rawArch: String?
+            for line in lines {
+                if line.hasPrefix(osMarker) {
+                    rawOS = String(line.dropFirst(osMarker.count))
+                } else if line.hasPrefix(archMarker) {
+                    rawArch = String(line.dropFirst(archMarker.count))
+                }
+            }
+
+            guard
+                let rawOS, !rawOS.isEmpty,
+                let rawArch, !rawArch.isEmpty
+            else {
+                return nil
+            }
+
+            guard let os = normalizeRemoteOS(rawOS), let arch = normalizeRemoteArch(rawArch) else {
+                Log.toFile("[SSH] Unsupported remote platform: os='\(rawOS)' arch='\(rawArch)'")
+                return nil
+            }
+            return "\(os)-\(arch)"
+        } catch {
+            Log.toFile("[SSH] Failed to detect remote platform, defaulting to linux-amd64: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func normalizeRemoteOS(_ raw: String) -> String? {
+        let value = raw.lowercased()
+        if value.contains("linux") {
+            return "linux"
+        }
+        if value.contains("darwin") {
+            return "darwin"
+        }
+        return nil
+    }
+
+    private func normalizeRemoteArch(_ raw: String) -> String? {
+        let value = raw.lowercased()
+        switch value {
+        case "x86_64", "amd64":
+            return "amd64"
+        case "arm64", "aarch64", "arm64e":
+            return "arm64"
+        default:
+            return nil
+        }
     }
 
     private func loadPrivateKey(pem data: Data) throws -> Insecure.RSA.PrivateKey {

@@ -3,11 +3,13 @@ package daemon
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"sync"
 
+	"github.com/anthropics/opencan-daemon/internal/ioutils"
 	"github.com/anthropics/opencan-daemon/internal/protocol"
 	"github.com/anthropics/opencan-daemon/internal/proxy"
 )
@@ -23,6 +25,7 @@ type ClientHandler struct {
 	conn            net.Conn
 	scanner         *bufio.Scanner
 	attachedProxies map[string]*proxy.ACPProxy
+	attachedMu      sync.RWMutex
 	daemon          *Daemon
 	logger          *slog.Logger
 
@@ -40,7 +43,9 @@ type ClientHandler struct {
 // NewClientHandler creates a handler for a client connection.
 func NewClientHandler(conn net.Conn, daemon *Daemon, logger *slog.Logger) *ClientHandler {
 	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	// Requests can include large prompt payloads; keep headroom to avoid scanner
+	// token truncation on valid JSON-RPC lines.
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 
 	return &ClientHandler{
 		conn:              conn,
@@ -59,9 +64,24 @@ func (h *ClientHandler) Serve() {
 	defer h.cleanup()
 
 	for h.scanner.Scan() {
-		msg, err := protocol.ParseLine(h.scanner.Bytes())
+		line := append([]byte(nil), h.scanner.Bytes()...)
+		msg, err := protocol.ParseLine(line)
 		if err != nil {
-			h.logger.Warn("parse error", "error", err)
+			h.logger.Warn(
+				"parse error",
+				"error", err,
+				"bytes", len(line),
+				"preview", previewLine(line, 512),
+			)
+			if id, ok := protocol.ExtractIDFromPossiblyMalformedLine(line); ok {
+				if sendErr := h.Send(protocol.NewErrorResponse(
+					id,
+					-32700,
+					"Parse error: invalid JSON-RPC payload",
+				)); sendErr != nil {
+					h.logger.Warn("failed to send parse error response", "error", sendErr)
+				}
+			}
 			continue
 		}
 		if msg == nil {
@@ -79,6 +99,10 @@ func (h *ClientHandler) Serve() {
 	}
 
 	if err := h.scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			h.logger.Warn("client disconnected: JSON-RPC line exceeded scanner limit", "error", err)
+			return
+		}
 		h.logger.Info("client disconnected", "error", err)
 	} else {
 		h.logger.Info("client disconnected (EOF)")
@@ -87,16 +111,77 @@ func (h *ClientHandler) Serve() {
 
 func (h *ClientHandler) cleanup() {
 	// Detach from all sessions but don't kill them
-	for sid, p := range h.attachedProxies {
+	for sid, p := range h.snapshotAttachedProxies() {
 		p.DetachClient(h)
 		h.logger.Info("detached from session", "sessionId", sid)
 	}
+	h.attachedMu.Lock()
 	h.attachedProxies = nil
+	h.attachedMu.Unlock()
 	h.writeMu.Lock()
 	h.closed = true
 	h.writeMu.Unlock()
 	h.conn.Close()
 	h.daemon.clientDisconnected(h)
+}
+
+func (h *ClientHandler) snapshotAttachedProxies() map[string]*proxy.ACPProxy {
+	h.attachedMu.RLock()
+	defer h.attachedMu.RUnlock()
+	if len(h.attachedProxies) == 0 {
+		return map[string]*proxy.ACPProxy{}
+	}
+	out := make(map[string]*proxy.ACPProxy, len(h.attachedProxies))
+	for sid, p := range h.attachedProxies {
+		out[sid] = p
+	}
+	return out
+}
+
+func (h *ClientHandler) getAttachedProxy(sessionID string) (*proxy.ACPProxy, bool) {
+	h.attachedMu.RLock()
+	defer h.attachedMu.RUnlock()
+	p, ok := h.attachedProxies[sessionID]
+	return p, ok
+}
+
+func (h *ClientHandler) setAttachedProxy(sessionID string, p *proxy.ACPProxy) {
+	h.attachedMu.Lock()
+	defer h.attachedMu.Unlock()
+	if h.attachedProxies == nil {
+		return
+	}
+	h.attachedProxies[sessionID] = p
+}
+
+func (h *ClientHandler) removeAttachedProxy(sessionID string) (*proxy.ACPProxy, bool) {
+	h.attachedMu.Lock()
+	defer h.attachedMu.Unlock()
+	if h.attachedProxies == nil {
+		return nil, false
+	}
+	p, ok := h.attachedProxies[sessionID]
+	if ok {
+		delete(h.attachedProxies, sessionID)
+	}
+	return p, ok
+}
+
+func (h *ClientHandler) removeAttachedProxyIfMatches(sessionID string, expected *proxy.ACPProxy) bool {
+	h.attachedMu.Lock()
+	defer h.attachedMu.Unlock()
+	if h.attachedProxies == nil {
+		return false
+	}
+	current, ok := h.attachedProxies[sessionID]
+	if !ok {
+		return false
+	}
+	if expected != nil && current != expected {
+		return false
+	}
+	delete(h.attachedProxies, sessionID)
+	return true
 }
 
 // Send sends a message to the client (implements proxy.ClientConn).
@@ -110,8 +195,7 @@ func (h *ClientHandler) Send(msg *protocol.Message) error {
 	if h.closed {
 		return fmt.Errorf("client connection closed")
 	}
-	_, err = h.conn.Write(data)
-	return err
+	return ioutils.WriteAll(h.conn, data)
 }
 
 func (h *ClientHandler) loggerForMessage(msg *protocol.Message) *slog.Logger {
@@ -120,6 +204,13 @@ func (h *ClientHandler) loggerForMessage(msg *protocol.Message) *slog.Logger {
 		return h.logger
 	}
 	return h.logger.With("traceId", traceID)
+}
+
+func previewLine(line []byte, max int) string {
+	if max <= 0 || len(line) <= max {
+		return string(line)
+	}
+	return string(line[:max]) + "...(truncated)"
 }
 
 // handleDaemonMethod dispatches daemon/ prefixed methods.
@@ -138,12 +229,14 @@ func (h *ClientHandler) handleDaemonMethod(msg *protocol.Message) {
 		h.handleHello(msg)
 	case protocol.MethodDaemonAgentProbe:
 		h.handleAgentProbe(msg)
-	case protocol.MethodDaemonSessionCreate:
-		h.handleSessionCreate(msg)
-	case protocol.MethodDaemonSessionAttach:
-		h.handleSessionAttach(msg)
-	case protocol.MethodDaemonSessionDetach:
-		h.handleSessionDetach(msg)
+	case protocol.MethodDaemonConversationCreate:
+		h.handleConversationCreate(msg)
+	case protocol.MethodDaemonConversationOpen:
+		h.handleConversationOpen(msg)
+	case protocol.MethodDaemonConversationDetach:
+		h.handleConversationDetach(msg)
+	case protocol.MethodDaemonConversationList:
+		h.handleConversationList(msg)
 	case protocol.MethodDaemonSessionList:
 		h.handleSessionList(msg)
 	case protocol.MethodDaemonSessionKill:
@@ -171,97 +264,16 @@ func (h *ClientHandler) handleAgentProbe(msg *protocol.Message) {
 		Agents []AgentProbeRequest `json:"agents"`
 	}
 	if msg.Params != nil {
-		json.Unmarshal(*msg.Params, &params)
+		if err := json.Unmarshal(*msg.Params, &params); err != nil {
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "invalid params: "+err.Error()))
+			return
+		}
 	}
 
 	results := ProbeAgentCommands(params.Agents)
 	result, _ := json.Marshal(map[string]interface{}{
 		"agents": results,
 	})
-	h.Send(protocol.NewResponse(*msg.ID, result))
-}
-
-func (h *ClientHandler) handleSessionCreate(msg *protocol.Message) {
-	var params struct {
-		CWD     string `json:"cwd"`
-		Command string `json:"command"`
-	}
-	if msg.Params != nil {
-		json.Unmarshal(*msg.Params, &params)
-	}
-	if params.CWD == "" {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "cwd is required"))
-		return
-	}
-	if params.Command == "" {
-		params.Command = "claude-agent-acp"
-	}
-
-	p, err := h.daemon.sessions.CreateSession(params.CWD, params.Command)
-	if err != nil {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32000, err.Error()))
-		return
-	}
-
-	result, _ := json.Marshal(map[string]interface{}{
-		"sessionId": p.SessionID,
-	})
-	h.Send(protocol.NewResponse(*msg.ID, result))
-}
-
-func (h *ClientHandler) handleSessionAttach(msg *protocol.Message) {
-	logger := h.loggerForMessage(msg)
-	var params struct {
-		SessionID    string `json:"sessionId"`
-		LastEventSeq uint64 `json:"lastEventSeq"`
-	}
-	if msg.Params != nil {
-		json.Unmarshal(*msg.Params, &params)
-	}
-	if params.SessionID == "" {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "sessionId is required"))
-		return
-	}
-
-	p, ok := h.daemon.sessions.GetSession(params.SessionID)
-	if !ok {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "session not found: "+params.SessionID))
-		return
-	}
-
-	// Attach client (single owner per session)
-	state, attached := p.TryAttachClient(h)
-	if !attached {
-		h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "session already attached by another client: "+params.SessionID))
-		return
-	}
-	h.attachedProxies[params.SessionID] = p
-
-	// Get buffered events since lastEventSeq
-	buffered := p.EventBuf().Since(params.LastEventSeq)
-
-	result, _ := json.Marshal(map[string]interface{}{
-		"state":          state.String(),
-		"bufferedEvents": buffered,
-	})
-	h.Send(protocol.NewResponse(*msg.ID, result))
-	logger.Info("attached to session", "sessionId", params.SessionID, "state", state, "bufferedEvents", len(buffered))
-}
-
-func (h *ClientHandler) handleSessionDetach(msg *protocol.Message) {
-	var params struct {
-		SessionID string `json:"sessionId"`
-	}
-	if msg.Params != nil {
-		json.Unmarshal(*msg.Params, &params)
-	}
-
-	if p, ok := h.attachedProxies[params.SessionID]; ok {
-		p.DetachClient(h)
-		delete(h.attachedProxies, params.SessionID)
-	}
-
-	result, _ := json.Marshal(map[string]interface{}{})
 	h.Send(protocol.NewResponse(*msg.ID, result))
 }
 
@@ -291,9 +303,8 @@ func (h *ClientHandler) handleSessionKill(msg *protocol.Message) {
 	}
 
 	// Detach if attached
-	if p, ok := h.attachedProxies[params.SessionID]; ok {
+	if p, ok := h.removeAttachedProxy(params.SessionID); ok {
 		p.DetachClient(h)
-		delete(h.attachedProxies, params.SessionID)
 	}
 
 	if err := h.daemon.sessions.KillSession(params.SessionID); err != nil {
@@ -339,36 +350,55 @@ func (h *ClientHandler) handleLogs(msg *protocol.Message) {
 // handleACPRequest forwards non-daemon requests to the appropriate ACPProxy.
 func (h *ClientHandler) handleACPRequest(msg *protocol.Message) {
 	logger := h.loggerForMessage(msg)
-	sessionID := protocol.ExtractSessionID(msg)
-	if sessionID == "" {
+	requestedSessionID := protocol.ExtractSessionID(msg)
+	if requestedSessionID == "" {
 		if msg.ID != nil {
 			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "sessionId required in params"))
 		}
 		return
 	}
 
-	// Support __routeToSession only for methods that intentionally decouple
-	// the logical sessionId from the attached proxy session.
-	routeID := sessionID
-	if override := protocol.ExtractRouteToSession(msg); override != "" {
-		if msg.Method == protocol.MethodSessionLoad || msg.Method == protocol.MethodSessionPrompt {
-			routeID = override
-			logger.Info("routing override", "method", msg.Method, "sessionId", sessionID, "routeToSession", routeID)
-		} else {
-			logger.Warn("ignoring routing override for unsupported method", "method", msg.Method, "sessionId", sessionID)
-		}
-	}
+	resolvedSessionID := requestedSessionID
+	p, ok := h.getAttachedProxy(requestedSessionID)
 
-	p, ok := h.attachedProxies[routeID]
 	if !ok {
 		if msg.ID != nil {
-			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+routeID))
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+requestedSessionID))
 		}
 		return
 	}
 
+	if p.State() == proxy.StateDead {
+		h.removeAttachedProxyIfMatches(resolvedSessionID, p)
+		logger.Warn("rejecting request for dead session", "sessionId", resolvedSessionID, "method", msg.Method)
+		if msg.ID != nil {
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "session is dead: "+resolvedSessionID))
+		}
+		return
+	}
+
+	if p.GetClient() != h {
+		h.removeAttachedProxyIfMatches(resolvedSessionID, p)
+		logger.Warn("rejecting request from stale session owner", "sessionId", resolvedSessionID, "method", msg.Method)
+		if msg.ID != nil {
+			h.Send(protocol.NewErrorResponse(*msg.ID, -32602, "not attached to session: "+requestedSessionID))
+		}
+		return
+	}
+
+	if msg.Method == protocol.MethodSessionLoad || msg.Method == protocol.MethodSessionPrompt {
+		logger.Info(
+			"forwarding request to ACP proxy",
+			"method", msg.Method,
+			"requestedSessionId", requestedSessionID,
+			"resolvedSessionId", resolvedSessionID,
+			"proxyState", p.State().String(),
+			"attachedOwnerId", p.CurrentOwnerID(),
+		)
+	}
+
 	if err := p.ForwardFromClient(msg, h); err != nil {
-		logger.Error("forward to ACP", "error", err, "sessionId", sessionID)
+		logger.Error("forward to ACP", "error", err, "sessionId", resolvedSessionID)
 		if msg.ID != nil {
 			h.Send(protocol.NewErrorResponse(*msg.ID, -32000, "failed to forward: "+err.Error()))
 		}

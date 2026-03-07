@@ -27,22 +27,79 @@ actor DaemonClient {
         )
     }
 
-    /// Create a new session via the daemon.
-    /// The daemon internally spawns the ACP process, runs initialize + session/new.
-    func createSession(cwd: String, command: String, traceId: String? = nil) async throws -> String {
+    /// Create and attach a new daemon-owned conversation.
+    func createConversation(
+        cwd: String,
+        command: String,
+        ownerId: String,
+        traceId: String? = nil
+    ) async throws -> DaemonConversationOpenResult {
         let params: JSONValue = .object([
             "cwd": .string(cwd),
-            "command": .string(command)
+            "command": .string(command),
+            "ownerId": .string(ownerId)
         ])
         let result = try await client.sendRequest(
-            method: DaemonMethods.sessionCreate,
+            method: DaemonMethods.conversationCreate,
             params: params,
             traceId: traceId
         )
-        guard let sessionId = result["sessionId"]?.stringValue else {
-            throw ACPError.unexpectedResponse
+        return try parseConversationOpenResult(result)
+    }
+
+    /// Open an existing conversation, reusing a runtime or restoring from history.
+    func openConversation(
+        conversationId: String,
+        ownerId: String,
+        lastRuntimeId: String? = nil,
+        lastEventSeq: UInt64 = 0,
+        preferredCommand: String? = nil,
+        cwdHint: String? = nil,
+        traceId: String? = nil
+    ) async throws -> DaemonConversationOpenResult {
+        var payload: [String: JSONValue] = [
+            "conversationId": .string(conversationId),
+            "ownerId": .string(ownerId),
+            "lastEventSeq": .int(Int(lastEventSeq))
+        ]
+        if let lastRuntimeId, !lastRuntimeId.isEmpty {
+            payload["lastRuntimeId"] = .string(lastRuntimeId)
         }
-        return sessionId
+        if let preferredCommand, !preferredCommand.isEmpty {
+            payload["preferredCommand"] = .string(preferredCommand)
+        }
+        if let cwdHint, !cwdHint.isEmpty {
+            payload["cwdHint"] = .string(cwdHint)
+        }
+        let result = try await client.sendRequest(
+            method: DaemonMethods.conversationOpen,
+            params: .object(payload),
+            traceId: traceId
+        )
+        return try parseConversationOpenResult(result)
+    }
+
+    /// Detach from a daemon-owned conversation without killing its runtime.
+    func detachConversation(conversationId: String, traceId: String? = nil) async throws {
+        let _ = try await client.sendRequest(
+            method: DaemonMethods.conversationDetach,
+            params: .object(["conversationId": .string(conversationId)]),
+            traceId: traceId
+        )
+    }
+
+    /// List daemon-owned conversations and restorable discovered conversations.
+    func listConversations(cwd: String? = nil, traceId: String? = nil) async throws -> [DaemonConversationInfo] {
+        var params: [String: JSONValue] = [:]
+        if let cwd = cwd?.trimmingCharacters(in: .whitespacesAndNewlines), !cwd.isEmpty {
+            params["cwd"] = .string(cwd)
+        }
+        let result = try await client.sendRequest(
+            method: DaemonMethods.conversationList,
+            params: .object(params),
+            traceId: traceId
+        )
+        return parseDaemonConversations(result["conversations"])
     }
 
     /// Probe whether agent launcher commands are available on this node.
@@ -62,31 +119,6 @@ actor DaemonClient {
             traceId: traceId
         )
         return parseAgentAvailability(result["agents"])
-    }
-
-    /// Attach to an existing session, receiving buffered events since lastEventSeq.
-    func attachSession(sessionId: String, lastEventSeq: UInt64, traceId: String? = nil) async throws -> DaemonAttachResult {
-        let params: JSONValue = .object([
-            "sessionId": .string(sessionId),
-            "lastEventSeq": .int(Int(lastEventSeq))
-        ])
-        let result = try await client.sendRequest(
-            method: DaemonMethods.sessionAttach,
-            params: params,
-            traceId: traceId
-        )
-        let state = result["state"]?.stringValue ?? "unknown"
-        let bufferedEvents = parseBufferedEvents(result["bufferedEvents"])
-        return DaemonAttachResult(state: state, bufferedEvents: bufferedEvents)
-    }
-
-    /// Detach from a session without killing it.
-    func detachSession(sessionId: String, traceId: String? = nil) async throws {
-        let _ = try await client.sendRequest(
-            method: DaemonMethods.sessionDetach,
-            params: .object(["sessionId": .string(sessionId)]),
-            traceId: traceId
-        )
     }
 
     /// List all sessions managed by the daemon.
@@ -146,6 +178,49 @@ actor DaemonClient {
                 updatedAt: updatedAt
             )
         }
+    }
+
+    private func parseConversationOpenResult(_ value: JSONValue) throws -> DaemonConversationOpenResult {
+        guard let conversation = parseDaemonConversation(value["conversation"]) else {
+            throw ACPError.unexpectedResponse
+        }
+        guard let attachmentValue = value["attachment"] else {
+            throw ACPError.unexpectedResponse
+        }
+        guard let runtimeId = attachmentValue["runtimeId"]?.stringValue else {
+            throw ACPError.unexpectedResponse
+        }
+        let attachment = DaemonConversationAttachment(
+            runtimeId: runtimeId,
+            state: attachmentValue["state"]?.stringValue ?? "unknown",
+            bufferedEvents: parseBufferedEvents(attachmentValue["bufferedEvents"]),
+            reusedRuntime: attachmentValue["reusedRuntime"]?.boolValue ?? false,
+            restoredFromHistory: attachmentValue["restoredFromHistory"]?.boolValue ?? false
+        )
+        return DaemonConversationOpenResult(conversation: conversation, attachment: attachment)
+    }
+
+    private func parseDaemonConversations(_ value: JSONValue?) -> [DaemonConversationInfo] {
+        guard let arr = value?.arrayValue else { return [] }
+        return arr.compactMap { parseDaemonConversation($0) }
+    }
+
+    private func parseDaemonConversation(_ value: JSONValue?) -> DaemonConversationInfo? {
+        guard let value, let conversationId = value["conversationId"]?.stringValue else {
+            return nil
+        }
+        return DaemonConversationInfo(
+            conversationId: conversationId,
+            runtimeId: value["runtimeId"]?.stringValue,
+            state: value["state"]?.stringValue ?? "unknown",
+            cwd: value["cwd"]?.stringValue ?? "",
+            command: value["command"]?.stringValue,
+            title: value["title"]?.stringValue,
+            updatedAt: parseDaemonDate(value["updatedAt"]?.stringValue),
+            ownerId: value["ownerId"]?.stringValue,
+            origin: value["origin"]?.stringValue,
+            lastEventSeq: UInt64(value["lastEventSeq"]?.intValue ?? 0)
+        )
     }
 
     private func parseDaemonDate(_ raw: String?) -> Date? {

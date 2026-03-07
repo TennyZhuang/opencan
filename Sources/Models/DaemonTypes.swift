@@ -6,6 +6,37 @@ struct DaemonInfo: Sendable {
     let sessions: [DaemonSessionInfo]
 }
 
+/// Conversation-centric daemon snapshot exposed by daemon/conversation.* APIs.
+struct DaemonConversationInfo: Identifiable, Codable, Sendable {
+    let conversationId: String
+    let runtimeId: String?
+    let state: String
+    let cwd: String
+    let command: String?
+    let title: String?
+    let updatedAt: Date?
+    let ownerId: String?
+    let origin: String?
+    let lastEventSeq: UInt64
+
+    var id: String { conversationId }
+}
+
+/// Attachment details returned by daemon/conversation.create and open.
+struct DaemonConversationAttachment: Sendable {
+    let runtimeId: String
+    let state: String
+    let bufferedEvents: [DaemonBufferedEvent]
+    let reusedRuntime: Bool
+    let restoredFromHistory: Bool
+}
+
+/// Result of daemon/conversation.create and open.
+struct DaemonConversationOpenResult: Sendable {
+    let conversation: DaemonConversationInfo
+    let attachment: DaemonConversationAttachment
+}
+
 /// Agent command availability on the connected node.
 struct DaemonAgentAvailability: Equatable, Sendable {
     let id: String
@@ -67,36 +98,36 @@ struct DaemonLogEntry: Identifiable, Codable, Sendable {
     }
 }
 
-/// Result of daemon/session.attach, including buffered events for replay.
-struct DaemonAttachResult {
-    let state: String
-    let bufferedEvents: [DaemonBufferedEvent]
-}
-
 /// A single buffered event with its sequence number.
 struct DaemonBufferedEvent {
     let seq: UInt64
     let event: JSONRPCMessage  // The original notification
 }
 
-/// Merged view of a daemon session and/or a local SwiftData Session.
+/// Merged view of a daemon conversation row and/or a local SwiftData cache.
+/// `sessionId` is the stable row identity currently used by picker/tests; after
+/// the conversation/runtime refactor it corresponds to `conversationId`.
 struct UnifiedSession: Identifiable {
     let sessionId: String
-    let daemonState: String?   // nil = not in daemon
+    let runtimeId: String?
+    let daemonState: String?   // nil = local-only cache row
     let cwd: String?
     let lastEventSeq: UInt64?
     let title: String?
-    let daemonTitle: String?   // title from daemon (e.g., ACP session/list for external sessions)
+    let daemonTitle: String?
     let lastUsedAt: Date?
     let daemonUpdatedAt: Date?
     let agentID: String?
     let agentCommand: String?
+    let hasLocalRecord: Bool
     var id: String { sessionId }
 
     var effectiveLastUsedAt: Date? { lastUsedAt ?? daemonUpdatedAt }
+    var effectiveRuntimeId: String? { runtimeId }
 
     init(
         sessionId: String,
+        runtimeId: String? = nil,
         daemonState: String?,
         cwd: String?,
         lastEventSeq: UInt64?,
@@ -105,9 +136,11 @@ struct UnifiedSession: Identifiable {
         lastUsedAt: Date?,
         daemonUpdatedAt: Date? = nil,
         agentID: String?,
-        agentCommand: String?
+        agentCommand: String?,
+        hasLocalRecord: Bool = false
     ) {
         self.sessionId = sessionId
+        self.runtimeId = runtimeId
         self.daemonState = daemonState
         self.cwd = cwd
         self.lastEventSeq = lastEventSeq
@@ -117,26 +150,35 @@ struct UnifiedSession: Identifiable {
         self.daemonUpdatedAt = daemonUpdatedAt
         self.agentID = agentID
         self.agentCommand = agentCommand
+        self.hasLocalRecord = hasLocalRecord
     }
 
-    var displayState: String { daemonState ?? "history" }
-    /// Even dead daemon sessions are resumable via history recovery.
+    /// Local cache rows stay actionable even when currently unavailable.
+    var displayState: String { daemonState ?? "unavailable" }
     var isResumable: Bool { true }
-    /// Placeholder sessions with no title/events are typically accidental.
+
+    /// Placeholder rows without any visible metadata are usually accidental.
     var isEmptyPlaceholder: Bool {
         let hasLocalTitle = !(title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         let hasDaemonTitle = !(daemonTitle?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         let hasEvents = (lastEventSeq ?? 0) > 0
-        let state = daemonState ?? "history"
-        let isRunning = state == "starting" || state == "prompting" || state == "draining"
-        let isExternal = state == "external"
-        return !hasLocalTitle && !hasDaemonTitle && !hasEvents && !isRunning && !isExternal
+        let state = displayState
+        let isMeaningfulState = [
+            "attached", "running", "restorable", "unavailable",
+            "prompting", "draining", "starting", "external", "dead"
+        ].contains(state)
+        if hasLocalRecord && daemonState == nil {
+            return false
+        }
+        return !hasLocalTitle && !hasDaemonTitle && !hasEvents && !isMeaningfulState
     }
+
     var displayTitle: String {
         if let title, !title.isEmpty { return title }
         if let daemonTitle, !daemonTitle.isEmpty { return daemonTitle }
-        return String(sessionId.prefix(8))
+        return sessionId
     }
+
     var agentDisplayName: String? {
         if let known = AgentCommandStore.agent(forAgentID: agentID)?.displayName {
             return known

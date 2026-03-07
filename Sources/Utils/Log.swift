@@ -15,9 +15,17 @@ enum Log {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("opencan.log")
     }()
+    private static let previousLogFileURL: URL = {
+        logFileURL.deletingPathExtension().appendingPathExtension("log.prev")
+    }()
 
     private static let fileQueue = DispatchQueue(label: "com.tianyizhuang.OpenCAN.log")
+    private static let maxLogFileBytes = 10 * 1024 * 1024
+    private static let syncWriteBatchSize = 20
+    private static let syncInterval: TimeInterval = 2
     private static var fileHandle: FileHandle?
+    private static var pendingSyncWrites = 0
+    private static var lastSyncAt = Date.distantPast
     private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -92,17 +100,60 @@ enum Log {
     private static func writeToFile(_ entry: LogEntry) {
         fileQueue.async {
             guard let data = try? encoder.encode(entry) else { return }
-            if fileHandle == nil {
-                if !FileManager.default.fileExists(atPath: logFileURL.path) {
-                    FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
-                }
-                fileHandle = try? FileHandle(forWritingTo: logFileURL)
-                fileHandle?.seekToEndOfFile()
-            }
+            let lineBreak = Data([0x0A])
+            rotateLogIfNeeded(incomingBytes: data.count + lineBreak.count)
+            ensureFileHandle()
             fileHandle?.write(data)
-            fileHandle?.write(Data([0x0A]))
-            try? fileHandle?.synchronize()
+            fileHandle?.write(lineBreak)
+            pendingSyncWrites += 1
+            syncFileIfNeeded()
         }
+    }
+
+    private static func ensureFileHandle() {
+        if fileHandle != nil { return }
+        if !FileManager.default.fileExists(atPath: logFileURL.path) {
+            FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
+        }
+        fileHandle = try? FileHandle(forWritingTo: logFileURL)
+        fileHandle?.seekToEndOfFile()
+    }
+
+    private static func rotateLogIfNeeded(incomingBytes: Int) {
+        let currentSize = currentLogFileSize()
+        guard currentSize + Int64(incomingBytes) > Int64(maxLogFileBytes) else { return }
+
+        syncFileIfNeeded(force: true)
+        fileHandle?.closeFile()
+        fileHandle = nil
+        pendingSyncWrites = 0
+
+        if FileManager.default.fileExists(atPath: previousLogFileURL.path) {
+            try? FileManager.default.removeItem(at: previousLogFileURL)
+        }
+        if FileManager.default.fileExists(atPath: logFileURL.path) {
+            try? FileManager.default.moveItem(at: logFileURL, to: previousLogFileURL)
+        }
+    }
+
+    private static func currentLogFileSize() -> Int64 {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: logFileURL.path),
+              let size = attrs[.size] as? NSNumber else {
+            return 0
+        }
+        return size.int64Value
+    }
+
+    private static func syncFileIfNeeded(force: Bool = false) {
+        let now = Date()
+        guard force
+                || pendingSyncWrites >= syncWriteBatchSize
+                || now.timeIntervalSince(lastSyncAt) >= syncInterval else {
+            return
+        }
+        try? fileHandle?.synchronize()
+        pendingSyncWrites = 0
+        lastSyncAt = now
     }
 
     private static func parseLegacyMessage(_ message: String) -> (component: String, message: String, extra: [String: String]?) {

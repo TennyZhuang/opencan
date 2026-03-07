@@ -42,73 +42,83 @@ final class SessionPickerPathMatchingTests: XCTestCase {
         )
     }
 
-    func testMergeWorkspaceSessionsSuppressesExternalHistorySourceDuplicate() {
-        let recovered = Session(
+    func testMergeWorkspaceSessionsKeepsManagedAndRestorableConversations() {
+        let managed = Session(
             sessionId: "managed-session",
-            sessionCwd: "/home/tz/repo",
-            historySessionId: "external-source"
+            conversationId: "managed-session",
+            sessionCwd: "/home/tz/repo"
         )
-        recovered.title = "Recovered"
-        recovered.lastUsedAt = Date(timeIntervalSince1970: 200)
+        managed.title = "Managed"
+        managed.lastUsedAt = Date(timeIntervalSince1970: 200)
 
-        let daemonSessions = [
-            DaemonSessionInfo(
-                sessionId: "external-source",
+        let daemonConversations = [
+            DaemonConversationInfo(
+                conversationId: "external-source",
+                runtimeId: nil,
+                state: "restorable",
                 cwd: "/home/tz/repo",
-                state: "external",
-                lastEventSeq: 20,
                 command: nil,
                 title: "Recovered",
-                updatedAt: Date(timeIntervalSince1970: 100)
+                updatedAt: Date(timeIntervalSince1970: 100),
+                ownerId: nil,
+                origin: "discovered",
+                lastEventSeq: 20
             ),
-            DaemonSessionInfo(
-                sessionId: "external-other",
+            DaemonConversationInfo(
+                conversationId: "external-other",
+                runtimeId: nil,
+                state: "restorable",
                 cwd: "/home/tz/repo",
-                state: "external",
-                lastEventSeq: 10,
                 command: nil,
                 title: "Other",
-                updatedAt: Date(timeIntervalSince1970: 150)
+                updatedAt: Date(timeIntervalSince1970: 150),
+                ownerId: nil,
+                origin: "discovered",
+                lastEventSeq: 10
             ),
         ]
 
         let merged = mergeWorkspaceSessions(
             workspacePath: "/home/tz/repo",
             username: "tz",
-            daemonSessions: daemonSessions,
-            localSessions: [recovered]
+            daemonConversations: daemonConversations,
+            localSessions: [managed]
         )
 
         XCTAssertEqual(
             Set(merged.map(\.sessionId)),
-            Set(["managed-session", "external-other"])
+            Set(["managed-session", "external-source", "external-other"])
         )
     }
 
-    func testMergeWorkspaceSessionsKeepsExternalWhenNoRecoveredMappingExists() {
+    func testMergeWorkspaceSessionsKeepsRestorableWhenNoRecoveredMappingExists() {
         let local = Session(
             sessionId: "managed-session",
+            conversationId: "managed-session",
             sessionCwd: "/home/tz/repo"
         )
         local.title = "Managed"
         local.lastUsedAt = Date(timeIntervalSince1970: 200)
 
-        let daemonSessions = [
-            DaemonSessionInfo(
-                sessionId: "external-source",
+        let daemonConversations = [
+            DaemonConversationInfo(
+                conversationId: "external-source",
+                runtimeId: nil,
+                state: "restorable",
                 cwd: "/home/tz/repo",
-                state: "external",
-                lastEventSeq: 20,
                 command: nil,
                 title: "Recovered",
-                updatedAt: Date(timeIntervalSince1970: 100)
+                updatedAt: Date(timeIntervalSince1970: 100),
+                ownerId: nil,
+                origin: "discovered",
+                lastEventSeq: 20
             ),
         ]
 
         let merged = mergeWorkspaceSessions(
             workspacePath: "/home/tz/repo",
             username: "tz",
-            daemonSessions: daemonSessions,
+            daemonConversations: daemonConversations,
             localSessions: [local]
         )
 
@@ -116,5 +126,78 @@ final class SessionPickerPathMatchingTests: XCTestCase {
             Set(merged.map(\.sessionId)),
             Set(["managed-session", "external-source"])
         )
+    }
+
+    func testMergeWorkspaceSessionsCollapsesRecoveredConversationToStableConversationID() {
+        let managed = Session(
+            sessionId: "managed-session",
+            conversationId: "external-source",
+            canonicalSessionId: "external-source",
+            sessionCwd: "/home/tz/repo"
+        )
+        managed.title = "Recovered"
+        managed.lastUsedAt = Date(timeIntervalSince1970: 200)
+
+        let daemonConversations = [
+            DaemonConversationInfo(
+                conversationId: "external-source",
+                runtimeId: "managed-session",
+                state: "attached",
+                cwd: "/home/tz/repo",
+                command: nil,
+                title: "External",
+                updatedAt: Date(timeIntervalSince1970: 210),
+                ownerId: "ios-owner",
+                origin: "managed",
+                lastEventSeq: 25
+            ),
+        ]
+
+        let merged = mergeWorkspaceSessions(
+            workspacePath: "/home/tz/repo",
+            username: "tz",
+            daemonConversations: daemonConversations,
+            localSessions: [managed]
+        )
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged.first?.sessionId, "external-source")
+        XCTAssertEqual(merged.first?.runtimeId, "managed-session")
+    }
+
+    func testMergeWorkspaceSessionsIncludesKnownLocalConversationEvenWhenDaemonCwdDiffers() {
+        let local = Session(
+            sessionId: "legacy-runtime",
+            conversationId: "legacy-conversation",
+            sessionCwd: "/home/tz/repo"
+        )
+        local.title = "Legacy"
+        local.lastUsedAt = Date(timeIntervalSince1970: 200)
+
+        let daemonConversations = [
+            DaemonConversationInfo(
+                conversationId: "legacy-conversation",
+                runtimeId: nil,
+                state: "restorable",
+                cwd: "/tmp/other-project",
+                command: nil,
+                title: "Recovered elsewhere",
+                updatedAt: Date(timeIntervalSince1970: 210),
+                ownerId: nil,
+                origin: "discovered",
+                lastEventSeq: 30
+            ),
+        ]
+
+        let merged = mergeWorkspaceSessions(
+            workspacePath: "/home/tz/repo",
+            username: "tz",
+            daemonConversations: daemonConversations,
+            localSessions: [local]
+        )
+
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged.first?.sessionId, "legacy-conversation")
+        XCTAssertEqual(merged.first?.daemonState, "restorable")
     }
 }

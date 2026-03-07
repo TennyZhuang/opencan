@@ -3,8 +3,8 @@ import SwiftData
 
 @main
 struct OpenCANApp: App {
-    static let isUITesting = CommandLine.arguments.contains("--uitesting")
     static let isUIIntegrationTesting = CommandLine.arguments.contains("--uitesting-integration")
+    static let isUITesting = CommandLine.arguments.contains("--uitesting") || isUIIntegrationTesting
     static let uiTestMockScenario: MockScenario = {
         if CommandLine.arguments.contains("--uitesting-long-stream") {
             return .longStream
@@ -45,14 +45,36 @@ struct OpenCANApp: App {
     /// Seed only placeholder values and only in UI testing mode.
     private func seedUITestDataIfNeeded() {
         guard OpenCANApp.isUITesting else { return }
-        guard !UserDefaults.standard.bool(forKey: "uiTestDataSeeded") else { return }
 
         let context = ModelContext(modelContainer)
+        let expectedWorkspacePath = "/home/demo-user"
+
+        if let existingNode = try? context.fetch(
+            FetchDescriptor<Node>(
+                predicate: #Predicate { node in
+                    node.name == "cp32" && node.host == "example.com" && node.username == "demo-user"
+                }
+            )
+        ).first {
+            let hasWorkspace = (existingNode.workspaces ?? []).contains {
+                $0.name == "home" && $0.path == expectedWorkspacePath
+            }
+            if hasWorkspace {
+                return
+            }
+
+            let workspace = Workspace(name: "home", path: expectedWorkspacePath)
+            workspace.node = existingNode
+            context.insert(workspace)
+            try? context.save()
+            UserDefaults.standard.set(true, forKey: "uiTestDataSeeded")
+            return
+        }
 
         let node = Node(name: "cp32", host: "example.com", port: 22, username: "demo-user")
         context.insert(node)
 
-        let workspace = Workspace(name: "home", path: "/home/demo-user")
+        let workspace = Workspace(name: "home", path: expectedWorkspacePath)
         workspace.node = node
         context.insert(workspace)
 
@@ -80,11 +102,19 @@ struct OpenCANApp: App {
         let workspaceName = envValue("OPENCAN_TEST_WORKSPACE_NAME", in: env) ?? "home"
         let nodePort = Int(envValue("OPENCAN_TEST_NODE_PORT", in: env) ?? "") ?? 22
         let nodeKeyPEM = nodeKeyPEMRaw.replacingOccurrences(of: "\\n", with: "\n")
+        let integrationAgentCommand = envValue("OPENCAN_TEST_AGENT_COMMAND", in: env)
 
         let context = ModelContext(modelContainer)
         var createdKeys: [SSHKeyPair] = []
 
         do {
+            if let integrationAgentCommand {
+                // Force integration runs to use a deterministic local ACP command.
+                let defaults = UserDefaults.standard
+                defaults.set(integrationAgentCommand, forKey: AgentCommandStore.claudeCommandKey)
+                defaults.set(AgentKind.claude.rawValue, forKey: AgentCommandStore.defaultAgentKey)
+            }
+
             // Keep integration runs deterministic by resetting persisted connection data.
             let existingSessions = try context.fetch(FetchDescriptor<Session>())
             for session in existingSessions {

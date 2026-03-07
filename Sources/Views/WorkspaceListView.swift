@@ -95,7 +95,7 @@ struct WorkspaceListView: View {
                 Task { await appState.refreshAvailableAgents() }
             } else if appState.connectionStatus == .connecting, isSameNode {
                 // Already connecting to this node, wait
-            } else if OpenCANApp.isUITesting {
+            } else if OpenCANApp.isUITesting && !OpenCANApp.isUIIntegrationTesting {
                 // UI tests use mock transport — connectMock needs a workspace
                 if let workspace = node.workspaces?.first {
                     appState.connectMock(workspace: workspace, scenario: OpenCANApp.uiTestMockScenario)

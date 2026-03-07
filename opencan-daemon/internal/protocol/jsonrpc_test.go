@@ -189,13 +189,42 @@ func TestParseLine_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestExtractIDFromPossiblyMalformedLine_IntID(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","id":123,"method":"session/prompt","params":{"sessionId":"abc"}`)
+	id, ok := ExtractIDFromPossiblyMalformedLine(line)
+	if !ok {
+		t.Fatal("expected id extraction to succeed")
+	}
+	if !id.IsInt() || id.IntValue() != 123 {
+		t.Fatalf("expected int id 123, got %#v", id)
+	}
+}
+
+func TestExtractIDFromPossiblyMalformedLine_StringID(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","id":"req-42","method":"session/prompt","params":{"sessionId":"abc"}`)
+	id, ok := ExtractIDFromPossiblyMalformedLine(line)
+	if !ok {
+		t.Fatal("expected id extraction to succeed")
+	}
+	if !id.IsString() || id.StringValue() != "req-42" {
+		t.Fatalf("expected string id req-42, got %#v", id)
+	}
+}
+
+func TestExtractIDFromPossiblyMalformedLine_MissingID(t *testing.T) {
+	line := []byte(`{"jsonrpc":"2.0","method":"session/prompt","params":{"sessionId":"abc"}`)
+	if _, ok := ExtractIDFromPossiblyMalformedLine(line); ok {
+		t.Fatal("expected id extraction to fail without id")
+	}
+}
+
 func TestIsDaemonMethod(t *testing.T) {
 	tests := []struct {
 		method string
 		want   bool
 	}{
 		{"daemon/hello", true},
-		{"daemon/session.create", true},
+		{"daemon/conversation.create", true},
 		{"session/prompt", false},
 		{"initialize", false},
 		{"", false},
@@ -221,28 +250,6 @@ func TestExtractSessionID_Missing(t *testing.T) {
 	msg := &Message{Params: &params}
 	if got := ExtractSessionID(msg); got != "" {
 		t.Fatalf("expected empty, got %q", got)
-	}
-}
-
-func TestExtractRouteToSession(t *testing.T) {
-	params := json.RawMessage(`{"sessionId":"old","__routeToSession":"new"}`)
-	msg := &Message{Params: &params}
-	if got := ExtractRouteToSession(msg); got != "new" {
-		t.Fatalf("expected routeToSession 'new', got %q", got)
-	}
-}
-
-func TestExtractRouteToSession_MissingOrInvalid(t *testing.T) {
-	tests := []json.RawMessage{
-		json.RawMessage(`{"sessionId":"old"}`),
-		json.RawMessage(`{"__routeToSession":123}`),
-		json.RawMessage(`[]`),
-	}
-	for _, params := range tests {
-		msg := &Message{Params: &params}
-		if got := ExtractRouteToSession(msg); got != "" {
-			t.Fatalf("expected empty routeToSession for %s, got %q", string(params), got)
-		}
 	}
 }
 

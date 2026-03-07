@@ -3,8 +3,8 @@ import SwiftData
 @testable import OpenCAN
 
 /// Unit tests for AppState session management using MockACPTransport.
-/// These test the core flows: create session, send message, resume session
-/// (draining, completed, history), and verify isPrompting state transitions.
+/// These test the core flows: create session, send message, open conversation
+/// (draining, completed, missing), and verify isPrompting state transitions.
 @MainActor
 final class AppStateTests: XCTestCase {
     private var appState: AppState!
@@ -579,6 +579,199 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testSendMessageWithoutPromptResponseTimesOutAndAllowsRetry() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        appState.configurePromptTimeoutsForTesting(responseTimeoutSeconds: 0.2)
+        await transport.setMockPromptShouldHang(true)
+
+        let firstAccepted = appState.sendMessage("First message will hang")
+        XCTAssertTrue(firstAccepted)
+        XCTAssertTrue(appState.isPrompting)
+
+        try await waitFor(timeout: 2) { !self.appState.isPrompting }
+
+        XCTAssertFalse(
+            appState.messages.contains { $0.role == .assistant && $0.isStreaming },
+            "Streaming should stop after prompt timeout"
+        )
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Timeout guidance should be shown in system message"
+        )
+
+        await transport.setMockPromptShouldHang(false)
+        let secondAccepted = appState.sendMessage("Second message should succeed")
+        XCTAssertTrue(secondAccepted, "Prompt timeout should not permanently block sending")
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        let userMessages = appState.messages.filter { $0.role == .user }
+        XCTAssertEqual(userMessages.count, 2, "Second message should be deliverable after timeout recovery")
+    }
+
+    func testDroppedPromptResponseAfterPromptCompleteDoesNotShowTimeoutError() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        appState.configurePromptTimeoutsForTesting(responseTimeoutSeconds: 1.0)
+        await transport.setMockDropPromptResponse(true)
+
+        appState.sendMessage("Response will be dropped after prompt_complete")
+        try await waitFor(timeout: 2) { !self.appState.isPrompting }
+
+        // Let request timeout fire in background; prompt_complete already ended turn.
+        try await Task.sleep(for: .milliseconds(1400))
+
+        XCTAssertFalse(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Prompt timeout should be ignored after prompt_complete"
+        )
+    }
+
+    func testStreamingUpdatesKeepPromptAlivePastBaseTimeout() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        guard let sessionId = appState.currentSessionId else {
+            XCTFail("Missing current session id")
+            return
+        }
+
+        appState.configurePromptTimeoutsForTesting(responseTimeoutSeconds: 0.2)
+        await transport.setMockPromptShouldHang(true)
+
+        let accepted = appState.sendMessage("keep prompt alive with updates")
+        XCTAssertTrue(accepted)
+        XCTAssertTrue(appState.isPrompting)
+
+        let keepAliveTask = Task.detached {
+            // Keep updates flowing past at least one 1s poll interval so the
+            // inactivity timeout cannot fire while activity is ongoing.
+            for tick in 0..<20 {
+                await transport.emitSessionTextDeltaForTest(
+                    sessionId: sessionId,
+                    text: "heartbeat \(tick)"
+                )
+                try? await Task.sleep(for: .milliseconds(80))
+            }
+        }
+
+        // Prompt should still be active while updates keep arriving.
+        try await Task.sleep(for: .milliseconds(1800))
+        XCTAssertTrue(appState.isPrompting)
+        XCTAssertFalse(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Timeout should not trigger while streaming updates are still flowing"
+        )
+
+        _ = await keepAliveTask.result
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Timeout should trigger after streaming updates stop and prompt remains unfinished"
+        )
+    }
+
+    func testDaemonPromptingStateDefersInactivityTimeout() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        guard let sessionId = appState.currentSessionId else {
+            XCTFail("Missing current session id")
+            return
+        }
+
+        appState.configurePromptTimeoutsForTesting(
+            responseTimeoutSeconds: 0.2,
+            maxWaitSeconds: 2.0
+        )
+        await transport.setMockPromptShouldHang(true)
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string(sessionId),
+                "cwd": .string("/test/path"),
+                "state": .string("prompting"),
+                "lastEventSeq": .int(1),
+            ]
+        ])
+
+        let accepted = appState.sendMessage("long running prompt without intermediate updates")
+        XCTAssertTrue(accepted)
+
+        try await Task.sleep(for: .milliseconds(700))
+        XCTAssertTrue(appState.isPrompting, "Prompt should stay active while daemon reports prompting")
+        XCTAssertFalse(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Timeout guidance should not appear while daemon still reports prompting"
+        )
+
+        await transport.setMockSessionList([
+            [
+                "sessionId": .string(sessionId),
+                "cwd": .string("/test/path"),
+                "state": .string("idle"),
+                "lastEventSeq": .int(1),
+            ]
+        ])
+
+        try await waitFor(timeout: 2) { !self.appState.isPrompting }
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("No terminal response")
+            },
+            "Timeout should eventually surface once daemon no longer reports a busy prompt state"
+        )
+    }
+
+    func testPromptResponseFromPreviousSessionDoesNotSettleCurrentPrompt() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        let originalSessionId = try XCTUnwrap(appState.currentSessionId)
+        appState.sendMessage("message on old session")
+        XCTAssertTrue(appState.isPrompting)
+
+        // Simulate user switching to another session before the old prompt returns.
+        appState.currentSessionId = "new-active-session"
+        appState.isPrompting = true
+
+        try await Task.sleep(for: .milliseconds(500))
+
+        XCTAssertTrue(
+            appState.isPrompting,
+            "Prompt completion from \(originalSessionId) should not settle the new active session"
+        )
+    }
+
     func testSendWhilePromptingIsBlocked() async throws {
         try await connectMock(scenario: .complex) // slower scenario
         try await appState.createNewSession(modelContext: modelContext)
@@ -667,7 +860,7 @@ final class AppStateTests: XCTestCase {
         )
     }
 
-    func testResumeDifferentSessionDetachesPreviousAttachment() async throws {
+    func testOpenDifferentSessionDetachesPreviousAttachment() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)
         let initialSessionId = try XCTUnwrap(appState.currentSessionId)
@@ -678,14 +871,14 @@ final class AppStateTests: XCTestCase {
         }
         await transport.setMockAttachState("idle")
 
-        try await appState.resumeSession(sessionId: "other-session", modelContext: modelContext)
+        try await appState.openSession(sessionId: "other-session", modelContext: modelContext)
 
         let detachedSessionIds = await transport.getDetachedSessionIds()
         XCTAssertEqual(detachedSessionIds.last, initialSessionId, "Should detach previous session before switching")
 
         let receivedMethods = await transport.getReceivedMethods()
-        let detachIndex = try XCTUnwrap(receivedMethods.lastIndex(of: DaemonMethods.sessionDetach))
-        let attachIndex = try XCTUnwrap(receivedMethods.lastIndex(of: DaemonMethods.sessionAttach))
+        let detachIndex = try XCTUnwrap(receivedMethods.lastIndex(of: DaemonMethods.conversationDetach))
+        let attachIndex = try XCTUnwrap(receivedMethods.lastIndex(of: DaemonMethods.conversationOpen))
         XCTAssertLessThan(detachIndex, attachIndex, "Detach should happen before attaching the new session")
     }
 
@@ -718,22 +911,121 @@ final class AppStateTests: XCTestCase {
         }
     }
 
-    // MARK: - Resume Tests: Completed/Idle Session
+    func testAcceptsNotificationForActiveRuntimeWhenLegacySessionIdDiffers() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let currentSessionId = try XCTUnwrap(appState.currentSessionId)
 
-    func testResumeCompletedSession() async throws {
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.emitSessionTextDeltaForTest(
+            sessionId: "legacy-history-id",
+            runtimeId: currentSessionId,
+            conversationId: "legacy-history-id",
+            text: "accept-via-runtime-metadata"
+        )
+        try await waitFor(timeout: 2) {
+            self.appState.messages.contains { $0.content.contains("accept-via-runtime-metadata") }
+        }
+    }
+
+    func testIgnoresNotificationWhenRuntimeIdMismatchesActiveRuntime() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let currentSessionId = try XCTUnwrap(appState.currentSessionId)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.emitSessionTextDeltaForTest(
+            sessionId: currentSessionId,
+            runtimeId: "foreign-runtime",
+            conversationId: currentSessionId,
+            text: "ignore-via-runtime-metadata"
+        )
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(
+            appState.messages.contains { $0.content.contains("ignore-via-runtime-metadata") },
+            "Runtime metadata should win over legacy sessionId when filtering notifications"
+        )
+    }
+
+    func testForeignNotificationDoesNotPolluteLastEventSeqCursor() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let currentSessionId = try XCTUnwrap(appState.currentSessionId)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.emitSessionTextDeltaForTest(
+            sessionId: "foreign-session",
+            text: "ignore-with-seq",
+            seq: 777
+        )
+        try await Task.sleep(for: .milliseconds(50))
+
+        appState.messages = []
+        appState.activeSession = nil
+        appState.currentSessionId = nil
+        try await appState.openSession(sessionId: currentSessionId, modelContext: modelContext)
+
+        let attachedSessionID = await transport.getLastAttachSessionId()
+        let attachedSeq = await transport.getLastAttachLastEventSeq()
+        XCTAssertEqual(attachedSessionID, currentSessionId)
+        XCTAssertEqual(
+            attachedSeq, 0,
+            "Foreign seq should not advance attach replay cursor for the active session"
+        )
+    }
+
+    func testHistoryLoadingWithoutTrackedSessionStillIgnoresForeignNotifications() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        appState.isLoadingHistory = true
+        await transport.emitSessionTextDeltaForTest(
+            sessionId: "foreign-session",
+            text: "history-foreign"
+        )
+        try await Task.sleep(for: .milliseconds(50))
+        appState.isLoadingHistory = false
+
+        XCTAssertFalse(
+            appState.messages.contains { $0.content.contains("history-foreign") },
+            "History-loading fallback should not accept foreign-session notifications"
+        )
+    }
+
+    // MARK: - Open Tests: Completed/Idle Conversation
+
+    func testOpenCompletedSession() async throws {
         try await connectMock()
 
-        // Configure mock for completed session with session/load support
         guard let transport = appState.mockTransport else {
             XCTFail("Mock transport not available")
             return
         }
         await transport.setMockAttachState("idle")
-        await transport.setMockLoadSteps([
-            .userMessageChunk("What is 2+2?"),
-            .textDelta("The answer is 4."),
-            .promptComplete(.endTurn),
-        ])
+        await transport.setMockAttachBufferedEvents(
+            buildBufferedEvents([
+                .userMessageChunk("What is 2+2?"),
+                .textDelta("The answer is 4."),
+                .promptComplete(.endTurn),
+            ])
+        )
 
         let sessionId = "test-session-completed"
         // Create a local session record
@@ -741,17 +1033,17 @@ final class AppStateTests: XCTestCase {
         modelContext.insert(session)
         try modelContext.save()
 
-        try await appState.resumeSession(sessionId: sessionId, modelContext: modelContext)
+        try await appState.openSession(sessionId: sessionId, modelContext: modelContext)
 
-        XCTAssertFalse(appState.isPrompting, "isPrompting should be false after resume")
-        XCTAssertFalse(appState.isLoadingHistory, "isLoadingHistory should be false after resume")
+        XCTAssertFalse(appState.isPrompting, "isPrompting should be false after open")
+        XCTAssertFalse(appState.isLoadingHistory, "isLoadingHistory should be false after open")
 
         // All messages should have isStreaming = false
         for msg in appState.messages where msg.role == .assistant {
             XCTAssertFalse(msg.isStreaming, "No assistant messages should be streaming")
         }
 
-        // Should have loaded assistant content from session/load history
+        // Should have replayed assistant content from daemon buffered history
         let assistantMessages = appState.messages.filter { $0.role == .assistant }
         XCTAssertGreaterThanOrEqual(assistantMessages.count, 1, "Should have assistant message from history")
         let fullText = assistantMessages.map { $0.content }.joined()
@@ -759,54 +1051,22 @@ final class AppStateTests: XCTestCase {
 
         // Should be able to send a new message
         appState.sendMessage("Follow up question")
-        XCTAssertTrue(appState.isPrompting, "Should be able to send after resume")
+        XCTAssertTrue(appState.isPrompting, "Should be able to send after open")
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
     }
 
-    func testSuspendChatListAnimationsDuringHistoryLoadTail() async throws {
-        try await connectMock()
-
-        guard let transport = appState.mockTransport else {
-            XCTFail("Mock transport not available")
-            return
-        }
-        await transport.setMockAttachState("idle")
-        await transport.setMockLoadSteps([
-            .delay(milliseconds: 250),
-            .userMessageChunk("History question"),
-            .textDelta("History answer"),
-            // Intentionally omit prompt_complete so historyLoadSessionIds
-            // stays non-empty until cleanup timeout.
-        ])
-
-        let sessionId = "history-tail-window"
-        let session = Session(sessionId: sessionId, workspace: workspace)
-        modelContext.insert(session)
-        try modelContext.save()
-
-        let resumeTask = Task {
-            try await self.appState.resumeSession(sessionId: sessionId, modelContext: self.modelContext)
-        }
-
-        try await waitFor(timeout: 2) { self.appState.isLoadingHistory }
+    func testSuspendChatListAnimationsDuringHistoryLoad() async throws {
+        XCTAssertFalse(appState.suspendChatListAnimations)
+        appState.isLoadingHistory = true
         XCTAssertTrue(
             appState.suspendChatListAnimations,
             "Animations should be suspended while isLoadingHistory is true"
         )
-
-        try await resumeTask.value
-
-        XCTAssertFalse(appState.isLoadingHistory, "History load should eventually complete")
-        XCTAssertTrue(
-            appState.suspendChatListAnimations,
-            "Animations should remain suspended during the post-load replay tail"
-        )
-
-        try await waitFor(timeout: 3) { !self.appState.suspendChatListAnimations }
+        appState.isLoadingHistory = false
         XCTAssertFalse(appState.suspendChatListAnimations)
     }
 
-    func testResumeLegacySessionUsesDaemonReportedCommand() async throws {
+    func testOpenLegacyConversationUsesDaemonReportedCommand() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -835,15 +1095,15 @@ final class AppStateTests: XCTestCase {
         modelContext.insert(session)
         try modelContext.save()
 
-        try await appState.resumeSession(sessionId: "legacy-claude", modelContext: modelContext)
+        try await appState.openSession(sessionId: "legacy-claude", modelContext: modelContext)
 
         XCTAssertEqual(appState.activeSession?.agentID, AgentKind.claude.rawValue)
         XCTAssertEqual(appState.activeSession?.agentCommand, "claude-agent-acp")
     }
 
-    // MARK: - Resume Tests: Draining Session
+    // MARK: - Open Tests: Draining Conversation
 
-    func testResumeDrainingSession() async throws {
+    func testOpenDrainingConversation() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -858,10 +1118,10 @@ final class AppStateTests: XCTestCase {
         ])
         await transport.setMockAttachBufferedEvents(bufferedEvents)
 
-        try await appState.resumeSession(sessionId: "draining-session", modelContext: modelContext)
+        try await appState.openSession(sessionId: "draining-session", modelContext: modelContext)
 
-        // isPrompting should always be cleared after draining resume
-        XCTAssertFalse(appState.isPrompting, "isPrompting should be false after draining resume")
+        // isPrompting should always be cleared after draining open
+        XCTAssertFalse(appState.isPrompting, "isPrompting should be false after draining open")
 
         // Should be able to send
         appState.sendMessage("Hello")
@@ -869,7 +1129,7 @@ final class AppStateTests: XCTestCase {
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
     }
 
-    func testResumeDrainingStillRunning() async throws {
+    func testOpenDrainingConversationStillRunning() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -884,7 +1144,7 @@ final class AppStateTests: XCTestCase {
         ])
         await transport.setMockAttachBufferedEvents(bufferedEvents)
 
-        try await appState.resumeSession(sessionId: "draining-running", modelContext: modelContext)
+        try await appState.openSession(sessionId: "draining-running", modelContext: modelContext)
 
         // isPrompting should be false — user should not be locked out of draining sessions
         XCTAssertFalse(appState.isPrompting, "isPrompting should be false — user can send even for draining sessions")
@@ -895,7 +1155,7 @@ final class AppStateTests: XCTestCase {
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
     }
 
-    func testResumeDrainingPromptCompleteInBuffer() async throws {
+    func testOpenDrainingConversationPromptCompleteInBuffer() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -911,7 +1171,7 @@ final class AppStateTests: XCTestCase {
         ])
         await transport.setMockAttachBufferedEvents(bufferedEvents)
 
-        try await appState.resumeSession(sessionId: "draining-complete-in-buffer", modelContext: modelContext)
+        try await appState.openSession(sessionId: "draining-complete-in-buffer", modelContext: modelContext)
 
         // prompt_complete in buffer should have cleared isPrompting
         XCTAssertFalse(
@@ -920,9 +1180,7 @@ final class AppStateTests: XCTestCase {
         )
     }
 
-    // MARK: - Resume Tests: History Session (not in daemon)
-
-    func testResumeHistorySession() async throws {
+    func testOpenRunningConversationWithoutReplayDoesNotIssueLegacyLoad() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -930,69 +1188,210 @@ final class AppStateTests: XCTestCase {
             return
         }
 
-        // Configure: first attach fails (session not found), then subsequent attaches succeed
-        await transport.setMockAttachShouldFail(true)
-        await transport.setMockLoadSteps([
-            .userMessageChunk("Old question"),
-            .textDelta("Old answer."),
-            .promptComplete(.endTurn),
-        ])
+        await transport.setMockAttachState("prompting")
+        await transport.setMockAttachBufferedEvents([])
 
-        // Create a local session record
-        let oldSessionId = "old-session-12345"
-        let session = Session(sessionId: oldSessionId, workspace: workspace)
+        try await appState.openSession(sessionId: "running-load", modelContext: modelContext)
+
+        let methods = await transport.getReceivedMethods()
+        XCTAssertFalse(methods.contains(ACPMethods.sessionLoad), "Running conversation open should not issue legacy session/load")
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("Conversation reopened (still running)")
+            },
+            "Running open should rely on daemon-owned reopen state"
+        )
+    }
+
+    func testOpenRunningConversationSkipsBlockingLoadWhenReplayIsAvailable() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAttachState("prompting")
+        await transport.setMockAttachBufferedEvents(
+            buildBufferedEvents([
+                .textDelta("Buffered fallback after load timeout."),
+                .promptComplete(.endTurn)
+            ])
+        )
+        await transport.setMockLoadShouldHang(true)
+
+        let sessionId = "running-load-hang"
+        let session = Session(sessionId: sessionId, workspace: workspace)
         modelContext.insert(session)
         try modelContext.save()
 
-        try await appState.resumeSession(sessionId: oldSessionId, modelContext: modelContext)
+        let startedAt = Date()
+        try await appState.openSession(sessionId: sessionId, modelContext: modelContext)
+        let elapsed = Date().timeIntervalSince(startedAt)
 
-        XCTAssertFalse(appState.isPrompting, "isPrompting should be false after history recovery")
+        XCTAssertLessThan(
+            elapsed,
+            2.0,
+            "Running open should not block on session/load when replay already has visible history"
+        )
         XCTAssertFalse(appState.isLoadingHistory)
-
-        // Session ID should have changed to the new daemon session
-        XCTAssertNotEqual(appState.currentSessionId, oldSessionId, "Should have a new session ID")
+        XCTAssertFalse(appState.isPrompting)
         XCTAssertTrue(
-            appState.currentSessionId?.hasPrefix("mock-sess-") == true,
-            "New session should be a mock session, got: \(appState.currentSessionId ?? "nil")"
+            appState.messages.contains { $0.role == .assistant && $0.content.contains("Buffered fallback after load timeout.") },
+            "Should replay buffered history when session/load times out"
         )
-
-        // Local session should keep the original history source for future recovery.
-        let recoveredSessionId = try XCTUnwrap(appState.currentSessionId)
-        let descriptor = FetchDescriptor<Session>(
-            predicate: #Predicate { $0.sessionId == recoveredSessionId }
+        let methods = await transport.getReceivedMethods()
+        XCTAssertFalse(
+            methods.contains(ACPMethods.sessionLoad),
+            "Running open with visible buffered replay should not issue blocking session/load"
         )
-        let recovered = try XCTUnwrap(modelContext.fetch(descriptor).first)
-        XCTAssertEqual(recovered.historySessionId, oldSessionId)
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content.contains("Conversation reopened (still running)")
+            },
+            "Should surface a non-blocking running open status"
+        )
+    }
 
-        // Should have system message about recovery
-        let recoveryMessages = appState.messages.filter {
-            $0.role == .system && $0.content.contains("recovered")
+    func testOpenRunningConversationWithoutReplayDoesNotBlockForever() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
         }
-        XCTAssertFalse(recoveryMessages.isEmpty, "Should show recovery system message")
 
-        // Should be able to send
-        appState.sendMessage("New question")
-        XCTAssertTrue(appState.isPrompting)
+        await transport.setMockAttachState("prompting")
+        await transport.setMockAttachBufferedEvents([])
+        await transport.setMockLoadShouldHang(true)
+
+        let sessionId = "running-load-timeout"
+        let session = Session(sessionId: sessionId, workspace: workspace)
+        modelContext.insert(session)
+        try modelContext.save()
+
+        let startedAt = Date()
+        try await appState.openSession(sessionId: sessionId, modelContext: modelContext)
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        XCTAssertLessThan(
+            elapsed,
+            2.0,
+            "Running open should stay responsive without app-side history loading"
+        )
+        let methods = await transport.getReceivedMethods()
+        XCTAssertFalse(
+            methods.contains(ACPMethods.sessionLoad),
+            "Should not attempt legacy session/load backfill when replay is empty"
+        )
+        XCTAssertFalse(appState.isLoadingHistory)
+        XCTAssertFalse(appState.isPrompting)
+    }
+
+    func testOpenSameActiveConversationReusesInMemoryTranscript() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        let sessionId = try XCTUnwrap(appState.currentSessionId)
+
+        appState.sendMessage("keep in memory")
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
-        try await waitFor(timeout: 2) {
-            self.appState.messages.contains { $0.role == .assistant && $0.content.contains("mock assistant") }
-        }
+        let messagesBefore = appState.messages.map(\.content)
+        XCTAssertFalse(messagesBefore.isEmpty)
 
-        let lastPromptSessionId = await transport.getLastPromptSessionId()
-        let lastPromptRoute = await transport.getLastPromptRouteToSessionId()
-        XCTAssertEqual(lastPromptSessionId, oldSessionId, "Recovered prompt should target original history session")
-        XCTAssertEqual(lastPromptRoute, recoveredSessionId, "Recovered prompt should route via attached daemon session")
-        let assistantContents = appState.messages
-            .filter { $0.role == .assistant }
-            .map(\.content)
-            .joined(separator: " | ")
-        XCTAssertTrue(
-            appState.messages.contains { $0.role == .assistant && $0.content.contains("mock assistant") },
-            "Prompt updates from history session should still render in the active chat. assistant=\(assistantContents)"
+        let methodsBefore = await transport.getReceivedMethods()
+        try await appState.openSession(sessionId: sessionId, modelContext: modelContext)
+        let methodsAfter = await transport.getReceivedMethods()
+
+        XCTAssertEqual(appState.currentSessionId, sessionId)
+        XCTAssertEqual(appState.messages.map(\.content), messagesBefore)
+        XCTAssertEqual(
+            methodsAfter.count,
+            methodsBefore.count,
+            "Re-entering the same active session should not reattach/reload"
         )
     }
 
-    func testResumeHistorySessionReusesStoredAgentCommand() async throws {
+    // MARK: - Open Tests: Non-Recoverable Conversations
+
+    func testOpenAttachFailureRestoresPreviousAttachment() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let previousSessionId = try XCTUnwrap(appState.currentSessionId)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setNextAttachError(
+            code: -32603,
+            message: "Internal error while attaching",
+            data: nil
+        )
+
+        let busySession = Session(sessionId: "busy-session", workspace: workspace)
+        modelContext.insert(busySession)
+        try modelContext.save()
+
+        do {
+            try await appState.openSession(sessionId: "busy-session", modelContext: modelContext)
+            XCTFail("Expected openSession to fail")
+        } catch {
+            // expected
+        }
+
+        XCTAssertEqual(
+            appState.currentSessionId,
+            previousSessionId,
+            "Failed open should restore previous attached session"
+        )
+        let lastAttachSessionId = await transport.getLastAttachSessionId()
+        XCTAssertEqual(lastAttachSessionId, previousSessionId)
+    }
+
+    func testOpenAttachFailureAndRestoreFailureClearsCurrentSessionId() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+        let previousSessionId = try XCTUnwrap(appState.currentSessionId)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockAttachError(
+            code: -32603,
+            message: "Internal error while attaching",
+            data: nil
+        )
+
+        let busySession = Session(sessionId: "busy-session-restore-fails", workspace: workspace)
+        modelContext.insert(busySession)
+        try modelContext.save()
+
+        do {
+            try await appState.openSession(sessionId: "busy-session-restore-fails", modelContext: modelContext)
+            XCTFail("Expected openSession to fail")
+        } catch {
+            // expected
+        }
+
+        XCTAssertNil(
+            appState.currentSessionId,
+            "When target+restore attach both fail, currentSessionId must be cleared to avoid stale detached pointer"
+        )
+
+        let methods = await transport.getReceivedMethods()
+        let openCalls = methods.filter { $0 == DaemonMethods.conversationOpen }.count
+        XCTAssertEqual(openCalls, 2, "Should attempt target open and rollback open")
+    }
+
+    func testOpenSessionAlreadyAttachedByAnotherClientDoesNotRecover() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -1000,42 +1399,34 @@ final class AppStateTests: XCTestCase {
             return
         }
 
-        await transport.setMockAttachShouldFail(true)
-        await transport.setMockLoadSteps([
-            .userMessageChunk("Old question"),
-            .textDelta("Old answer."),
-            .promptComplete(.endTurn),
-        ])
-
-        let customCommand = "npx @zed-industries/codex-acp"
-        let session = Session(
-            sessionId: "history-session-with-agent",
-            agentID: AgentKind.codex.rawValue,
-            agentCommand: customCommand,
-            workspace: workspace
+        await transport.setMockAttachError(
+            code: -32000,
+            message: "session already attached by another client: busy-session",
+            data: nil
         )
+
+        let session = Session(sessionId: "busy-session", workspace: workspace)
         modelContext.insert(session)
         try modelContext.save()
 
-        try await appState.resumeSession(sessionId: "history-session-with-agent", modelContext: modelContext)
-
-        let createdCommand = await transport.getLastCreateCommand()
-        XCTAssertEqual(createdCommand, customCommand)
-    }
-
-    func testResumeLegacyHistorySessionFallsBackToClaudeCommand() async throws {
-        let defaults = UserDefaults.standard
-        let defaultKey = AgentCommandStore.defaultAgentKey
-        let previousDefault = defaults.string(forKey: defaultKey)
-        defaults.set(AgentKind.codex.rawValue, forKey: defaultKey)
-        defer {
-            if let previousDefault {
-                defaults.set(previousDefault, forKey: defaultKey)
-            } else {
-                defaults.removeObject(forKey: defaultKey)
+        do {
+            try await appState.openSession(sessionId: "busy-session", modelContext: modelContext)
+            XCTFail("Expected openSession to fail for ownership conflict")
+        } catch let error as AppStateError {
+            guard case .sessionAttachedByAnotherClient(let sessionId) = error else {
+                XCTFail("Expected sessionAttachedByAnotherClient, got \(error)")
+                return
             }
+            XCTAssertEqual(sessionId, "busy-session")
+        } catch {
+            XCTFail("Expected AppStateError.sessionAttachedByAnotherClient, got \(error)")
         }
 
+        let methods = await transport.getReceivedMethods()
+        XCTAssertFalse(methods.contains(DaemonMethods.conversationCreate), "Should not create recovery conversation on ownership conflict")
+    }
+
+    func testOpenMissingSessionMarksDeadDirectly() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -1044,59 +1435,71 @@ final class AppStateTests: XCTestCase {
         }
 
         await transport.setMockAttachShouldFail(true)
-        await transport.setMockLoadSteps([
-            .userMessageChunk("legacy"),
-            .textDelta("history"),
-            .promptComplete(.endTurn),
-        ])
 
-        let session = Session(sessionId: "legacy-no-agent-metadata", workspace: workspace)
+        let missingSessionID = "missing-session-123"
+        let session = Session(sessionId: missingSessionID, workspace: workspace)
         modelContext.insert(session)
         try modelContext.save()
 
-        try await appState.resumeSession(sessionId: "legacy-no-agent-metadata", modelContext: modelContext)
+        do {
+            try await appState.openSession(sessionId: missingSessionID, modelContext: modelContext)
+            XCTFail("Expected openSession to fail")
+        } catch let error as AppStateError {
+            guard case .sessionNotRecoverable(let sessionId) = error else {
+                XCTFail("Expected sessionNotRecoverable, got \(error)")
+                return
+            }
+            XCTAssertEqual(sessionId, missingSessionID)
+        }
 
-        let createdCommand = await transport.getLastCreateCommand()
-        XCTAssertEqual(createdCommand, AgentKind.claude.defaultCommand)
+        let methods = await transport.getReceivedMethods()
+        XCTAssertFalse(methods.contains(DaemonMethods.conversationCreate), "Missing managed session should not trigger new conversation creation")
+        XCTAssertFalse(methods.contains(ACPMethods.sessionLoad), "Missing managed session should not attempt history load")
+        XCTAssertEqual(
+            appState.daemonConversations.first { $0.conversationId == missingSessionID }?.state,
+            "unavailable"
+        )
     }
 
-    func testResumeRecoveredSessionUsesOriginalHistorySource() async throws {
+    func testOpenMissingSessionClearsStaleCurrentSessionIdAfterDetach() async throws {
         try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
 
         guard let transport = appState.mockTransport else {
             XCTFail("Mock transport not available")
             return
         }
 
-        let oldSessionId = "old-session-anchor"
-        let session = Session(sessionId: oldSessionId, workspace: workspace)
+        let previousSessionId = try XCTUnwrap(appState.currentSessionId)
+        await transport.setMockAttachShouldFail(true)
+
+        let missingSessionID = "missing-session-after-detach"
+        let session = Session(sessionId: missingSessionID, workspace: workspace)
         modelContext.insert(session)
         try modelContext.save()
 
-        // First recovery.
-        await transport.setMockAttachShouldFail(true)
-        await transport.setMockLoadSteps([
-            .userMessageChunk("Old question"),
-            .textDelta("Old answer."),
-            .promptComplete(.endTurn),
-        ])
-        try await appState.resumeSession(sessionId: oldSessionId, modelContext: modelContext)
-        let recoveredSessionId = try XCTUnwrap(appState.currentSessionId)
+        do {
+            try await appState.openSession(sessionId: missingSessionID, modelContext: modelContext)
+            XCTFail("Expected openSession to fail for missing managed session")
+        } catch let error as AppStateError {
+            guard case .sessionNotRecoverable(let sessionId) = error else {
+                XCTFail("Expected sessionNotRecoverable, got \(error)")
+                return
+            }
+            XCTAssertEqual(sessionId, missingSessionID)
+        }
 
-        // Second recovery should still load from the original anchor.
-        await transport.setMockAttachShouldFail(true)
-        await transport.setMockLoadSteps([
-            .userMessageChunk("Old question"),
-            .textDelta("Recovered from original history."),
-            .promptComplete(.endTurn),
-        ])
-        try await appState.resumeSession(sessionId: recoveredSessionId, modelContext: modelContext)
+        XCTAssertEqual(
+            appState.currentSessionId,
+            previousSessionId,
+            "Missing target should roll back to the previous attached runtime when reclaim succeeds"
+        )
 
-        let lastLoadSessionId = await transport.getLastLoadSessionId()
-        XCTAssertEqual(lastLoadSessionId, oldSessionId, "Should load from original history session")
+        let detachedSessionIds = await transport.getDetachedSessionIds()
+        XCTAssertTrue(detachedSessionIds.contains(previousSessionId))
     }
 
-    func testResumeCompletedSessionFallsBackToHistorySource() async throws {
+    func testOpenCompletedSessionWithoutReplayStillReopensConversation() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -1105,34 +1508,24 @@ final class AppStateTests: XCTestCase {
         }
 
         await transport.setMockAttachState("idle")
-        await transport.setMockLoadFailSessionIDs(["recovered-session"])
-        await transport.setMockLoadSteps([
-            .userMessageChunk("Original question"),
-            .textDelta("Original history answer."),
-            .promptComplete(.endTurn),
-        ])
+        await transport.setMockAttachBufferedEvents([])
 
-        let session = Session(
-            sessionId: "recovered-session",
-            historySessionId: "original-session",
-            workspace: workspace
-        )
+        let session = Session(sessionId: "empty-session", workspace: workspace)
         modelContext.insert(session)
         try modelContext.save()
 
-        try await appState.resumeSession(sessionId: "recovered-session", modelContext: modelContext)
+        try await appState.openSession(sessionId: "empty-session", modelContext: modelContext)
 
-        let lastLoadSessionId = await transport.getLastLoadSessionId()
-        let lastLoadRoute = await transport.getLastLoadRouteToSessionId()
-        XCTAssertEqual(lastLoadSessionId, "original-session")
-        XCTAssertEqual(lastLoadRoute, "recovered-session")
-
-        let assistantMessages = appState.messages.filter { $0.role == .assistant }
-        let fullText = assistantMessages.map { $0.content }.joined()
-        XCTAssertTrue(fullText.contains("Original history answer"))
+        let methods = await transport.getReceivedMethods()
+        XCTAssertFalse(methods.contains(ACPMethods.sessionLoad))
+        XCTAssertTrue(
+            appState.messages.contains {
+                $0.role == .system && $0.content == "Conversation reopened"
+            }
+        )
     }
 
-    func testResumeHistorySessionFallsBackToAlternateCwd() async throws {
+    func testOpenSessionUsesDaemonReportedConversationCwd() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -1140,21 +1533,24 @@ final class AppStateTests: XCTestCase {
             return
         }
 
-        let legacyWorkspace = Workspace(name: "legacy", path: "/legacy/path")
-        legacyWorkspace.node = node
-        modelContext.insert(legacyWorkspace)
-        try modelContext.save()
-
-        await transport.setMockAttachShouldFail(true)
-        await transport.setMockLoadFailSessionCwdPairs([
-            "legacy-history-id|/wrong/path",
-            "legacy-history-id|/test/path",
+        await transport.setMockAttachState("idle")
+        await transport.setMockConversationList([
+            [
+                "conversationId": .string("legacy-history-id"),
+                "runtimeId": .string("managed-runtime-legacy"),
+                "state": .string("ready"),
+                "cwd": .string("/legacy/path"),
+                "lastEventSeq": .int(2),
+                "origin": .string("managed")
+            ]
         ])
-        await transport.setMockLoadSteps([
-            .userMessageChunk("Old question"),
-            .textDelta("Loaded from legacy cwd."),
-            .promptComplete(.endTurn),
-        ])
+        await transport.setMockAttachBufferedEvents(
+            buildBufferedEvents([
+                .userMessageChunk("Question"),
+                .textDelta("Loaded from daemon-owned cwd."),
+                .promptComplete(.endTurn),
+            ])
+        )
 
         let session = Session(
             sessionId: "legacy-history-id",
@@ -1164,19 +1560,19 @@ final class AppStateTests: XCTestCase {
         modelContext.insert(session)
         try modelContext.save()
 
-        try await appState.resumeSession(sessionId: "legacy-history-id", modelContext: modelContext)
+        try await appState.openSession(sessionId: "legacy-history-id", modelContext: modelContext)
 
-        let lastLoadCwd = await transport.getLastLoadCwd()
-        XCTAssertEqual(lastLoadCwd, "/legacy/path")
+        let methods = await transport.getReceivedMethods()
+        XCTAssertFalse(methods.contains(ACPMethods.sessionLoad))
+        XCTAssertEqual(appState.activeSession?.sessionCwd, "/legacy/path")
+        XCTAssertEqual(appState.currentSessionId, "managed-runtime-legacy")
         XCTAssertTrue(
-            appState.messages.contains {
-                $0.role == .system && $0.content == "Session recovered from history"
-            },
-            "Should recover from history via alternate cwd"
+            appState.messages.contains { $0.role == .assistant && $0.content.contains("daemon-owned cwd") },
+            "Should apply daemon replay content without app-side cwd probing"
         )
     }
 
-    func testResumeExternalAgentSessionDemotesBootstrapPromptToSystemMessage() async throws {
+    func testOpenSessionUsesConversationOpenForRestorableConversation() async throws {
         try await connectMock()
 
         guard let transport = appState.mockTransport else {
@@ -1184,74 +1580,227 @@ final class AppStateTests: XCTestCase {
             return
         }
 
-        await transport.setMockSessionList([
+        await transport.setMockConversationList([
             [
-                "sessionId": .string("agent-team-1"),
+                "conversationId": .string("external-session-1"),
+                "state": .string("restorable"),
                 "cwd": .string("/test/path"),
-                "state": .string("external"),
-                "lastEventSeq": .int(11),
-            ]
-        ])
-        await transport.setMockLoadSteps([
-            .userMessageChunk("You are \"build-bot\", an autonomous teammate."),
-            .textDelta("Ready for delegated work."),
-            .promptComplete(.endTurn),
-        ])
-        await appState.refreshDaemonSessions()
-
-        try await appState.resumeSession(sessionId: "agent-team-1", modelContext: modelContext)
-
-        XCTAssertTrue(
-            appState.messages.contains {
-                $0.role == .system && $0.content.contains("You are \"build-bot\"")
-            },
-            "Bootstrap prompt should render as a system message"
-        )
-        XCTAssertFalse(
-            appState.messages.contains {
-                $0.role == .user && $0.content.contains("You are \"build-bot\"")
-            },
-            "Bootstrap prompt should not render as a user message"
-        )
-    }
-
-    func testResumeExternalNonAgentSessionKeepsFirstMessageAsUser() async throws {
-        try await connectMock()
-
-        guard let transport = appState.mockTransport else {
-            XCTFail("Mock transport not available")
-            return
-        }
-
-        await transport.setMockSessionList([
-            [
-                "sessionId": .string("external-session-1"),
-                "cwd": .string("/test/path"),
-                "state": .string("external"),
+                "origin": .string("discovered"),
                 "lastEventSeq": .int(3),
             ]
         ])
         await transport.setMockLoadSteps([
-            .userMessageChunk("Please review this PR."),
-            .textDelta("Sure, let's review it."),
+            .userMessageChunk("External conversation"),
+            .textDelta("Continued on mobile."),
             .promptComplete(.endTurn),
         ])
         await appState.refreshDaemonSessions()
 
-        try await appState.resumeSession(sessionId: "external-session-1", modelContext: modelContext)
+        try await appState.openSession(sessionId: "external-session-1", modelContext: modelContext)
 
+        let openedRuntimeId = try XCTUnwrap(appState.currentSessionId)
+        XCTAssertNotEqual(openedRuntimeId, "external-session-1")
+        XCTAssertTrue(openedRuntimeId.hasPrefix("mock-sess-"))
+        XCTAssertEqual(appState.activeSession?.conversationId, "external-session-1")
+
+        let methods = await transport.getReceivedMethods()
+        XCTAssertTrue(methods.contains(DaemonMethods.conversationOpen))
+        XCTAssertFalse(methods.contains(DaemonMethods.conversationCreate))
+        XCTAssertFalse(methods.contains(ACPMethods.sessionLoad))
         XCTAssertTrue(
-            appState.messages.contains {
-                $0.role == .user && $0.content.contains("Please review this PR.")
-            },
-            "Regular external sessions should keep user role for first replayed message"
+            appState.messages.contains { $0.role == .assistant && $0.content.contains("Continued on mobile.") }
         )
-        XCTAssertFalse(
-            appState.messages.contains {
-                $0.role == .system && $0.content.contains("Please review this PR.")
-            },
-            "Regular external session prompt should not be demoted to system"
+    }
+
+    func testOpenSessionUpdatesExistingLocalRecordToNewRuntime() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        let conversationId = "external-session-mapped"
+        let managedSessionId = "managed-session-local"
+
+        await transport.setMockConversationList([
+            [
+                "conversationId": .string(conversationId),
+                "state": .string("restorable"),
+                "cwd": .string("/test/path"),
+                "origin": .string("discovered"),
+                "lastEventSeq": .int(0),
+            ]
+        ])
+        await transport.setMockLoadSteps([
+            .userMessageChunk("External conversation"),
+            .textDelta("Rebound onto a new runtime."),
+            .promptComplete(.endTurn),
+        ])
+        await appState.refreshDaemonSessions()
+
+        let mapped = Session(
+            sessionId: managedSessionId,
+            conversationId: conversationId,
+            canonicalSessionId: conversationId,
+            sessionCwd: "/test/path",
+            workspace: workspace
         )
+        modelContext.insert(mapped)
+        try modelContext.save()
+
+        try await appState.openSession(sessionId: conversationId, modelContext: modelContext)
+
+        let openedRuntimeId = try XCTUnwrap(appState.currentSessionId)
+        XCTAssertNotEqual(openedRuntimeId, managedSessionId)
+        XCTAssertTrue(openedRuntimeId.hasPrefix("mock-sess-"))
+
+        let sessions = try modelContext.fetch(FetchDescriptor<Session>())
+        let updated = try XCTUnwrap(sessions.first { $0.stableConversationId == conversationId })
+        XCTAssertEqual(updated.conversationId, conversationId)
+        XCTAssertEqual(updated.sessionId, openedRuntimeId)
+
+        let methods = await transport.getReceivedMethods()
+        XCTAssertTrue(methods.contains(DaemonMethods.conversationOpen))
+        XCTAssertFalse(methods.contains(DaemonMethods.conversationCreate))
+        XCTAssertTrue(
+            appState.messages.contains { $0.role == .assistant && $0.content.contains("new runtime") }
+        )
+    }
+
+    func testOpenSessionManagedConversationReusesExistingRuntime() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockConversationList([
+            [
+                "conversationId": .string("managed-conversation"),
+                "runtimeId": .string("managed-runtime-1"),
+                "state": .string("attached"),
+                "cwd": .string("/test/path"),
+                "origin": .string("managed"),
+                "lastEventSeq": .int(4),
+            ]
+        ])
+        await transport.setMockAttachBufferedEvents(
+            buildBufferedEvents([
+                .textDelta("Buffered managed reply."),
+                .promptComplete(.endTurn),
+            ])
+        )
+        await appState.refreshDaemonSessions()
+
+        try await appState.openSession(sessionId: "managed-conversation", modelContext: modelContext)
+
+        XCTAssertEqual(appState.currentSessionId, "managed-runtime-1")
+        let methods = await transport.getReceivedMethods()
+        let openCalls = methods.filter { $0 == DaemonMethods.conversationOpen }.count
+        XCTAssertEqual(openCalls, 1)
+        XCTAssertTrue(
+            appState.messages.contains { $0.role == .assistant && $0.content.contains("Buffered managed reply.") }
+        )
+    }
+
+    func testOpenSessionLoadFailureMarksConversationUnavailable() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockConversationList([
+            [
+                "conversationId": .string("external-session-fail"),
+                "state": .string("restorable"),
+                "cwd": .string("/test/path"),
+                "origin": .string("discovered"),
+                "lastEventSeq": .int(0),
+            ]
+        ])
+        await transport.setMockLoadFailSessionIDs(["external-session-fail"])
+        await appState.refreshDaemonSessions()
+
+        let local = Session(
+            sessionId: "external-session-fail",
+            conversationId: "external-session-fail",
+            workspace: workspace
+        )
+        modelContext.insert(local)
+        try modelContext.save()
+
+        do {
+            try await appState.openSession(sessionId: "external-session-fail", modelContext: modelContext)
+            XCTFail("Expected openSession to fail when daemon restore fails")
+        } catch let error as AppStateError {
+            guard case .sessionNotRecoverable(let sessionId) = error else {
+                XCTFail("Expected sessionNotRecoverable, got \(error)")
+                return
+            }
+            XCTAssertEqual(sessionId, "external-session-fail")
+        }
+
+        let sessions = try modelContext.fetch(FetchDescriptor<Session>())
+        XCTAssertTrue(sessions.contains { $0.sessionId == "external-session-fail" })
+        XCTAssertFalse(sessions.contains { $0.sessionId.hasPrefix("mock-sess-") })
+        XCTAssertTrue(
+            appState.daemonConversations.contains {
+                $0.conversationId == "external-session-fail" && $0.state == "unavailable"
+            }
+        )
+    }
+
+    func testOpenSessionConversationOpenFailureDoesNotMutateLocalRecord() async throws {
+        try await connectMock()
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setMockConversationList([
+            [
+                "conversationId": .string("external-attach-fail"),
+                "state": .string("restorable"),
+                "cwd": .string("/test/path"),
+                "origin": .string("discovered"),
+                "lastEventSeq": .int(0),
+            ]
+        ])
+        await appState.refreshDaemonSessions()
+
+        let local = Session(
+            sessionId: "legacy-runtime",
+            conversationId: "external-attach-fail",
+            workspace: workspace
+        )
+        modelContext.insert(local)
+        try modelContext.save()
+
+        await transport.setNextAttachError(
+            code: -32000,
+            message: "attach failed",
+            data: nil
+        )
+
+        do {
+            try await appState.openSession(sessionId: "external-attach-fail", modelContext: modelContext)
+            XCTFail("Expected openSession to fail when conversation.open attach fails")
+        } catch {
+            // expected
+        }
+
+        let methods = await transport.getReceivedMethods()
+        XCTAssertTrue(methods.contains(DaemonMethods.conversationOpen))
+        XCTAssertFalse(methods.contains(DaemonMethods.conversationCreate))
+
+        let sessions = try modelContext.fetch(FetchDescriptor<Session>())
+        let persisted = try XCTUnwrap(sessions.first { $0.stableConversationId == "external-attach-fail" })
+        XCTAssertEqual(persisted.sessionId, "legacy-runtime")
     }
 
     func testRefreshDaemonSessionsUpdatesSnapshot() async throws {
@@ -1286,7 +1835,7 @@ final class AppStateTests: XCTestCase {
     func testUnifiedSessionMerge() {
         let u1 = UnifiedSession(
             sessionId: "s1",
-            daemonState: "idle",
+            daemonState: "ready",
             cwd: "/test/path",
             lastEventSeq: 10,
             title: nil,
@@ -1295,7 +1844,7 @@ final class AppStateTests: XCTestCase {
             agentID: nil,
             agentCommand: nil
         )
-        XCTAssertEqual(u1.displayState, "idle")
+        XCTAssertEqual(u1.displayState, "ready")
         XCTAssertTrue(u1.isResumable)
         XCTAssertEqual(u1.displayTitle, "s1") // shorter than 8, shown as-is
 
@@ -1310,13 +1859,13 @@ final class AppStateTests: XCTestCase {
             agentID: nil,
             agentCommand: nil
         )
-        XCTAssertEqual(u2.displayState, "history")
+        XCTAssertEqual(u2.displayState, "unavailable")
         XCTAssertTrue(u2.isResumable)
         XCTAssertEqual(u2.displayTitle, "My Session")
 
         let u3 = UnifiedSession(
             sessionId: "s3",
-            daemonState: "prompting",
+            daemonState: "running",
             cwd: "/test/path",
             lastEventSeq: 50,
             title: "Running Session",
@@ -1325,15 +1874,32 @@ final class AppStateTests: XCTestCase {
             agentID: nil,
             agentCommand: nil
         )
-        XCTAssertEqual(u3.displayState, "prompting")
+        XCTAssertEqual(u3.displayState, "running")
         XCTAssertTrue(u3.isResumable)
         XCTAssertEqual(u3.displayTitle, "Running Session")
     }
 
-    func testUnifiedSessionDeadIsResumableForRecovery() {
+    func testUnifiedSessionDisplayTitleUsesFullSessionIDWhenNoTitle() {
+        let sessionID = "019cabed-6f1d-75f1-8a47-44aed3b42e10"
+        let unified = UnifiedSession(
+            sessionId: sessionID,
+            daemonState: "ready",
+            cwd: "/test",
+            lastEventSeq: 0,
+            title: nil,
+            daemonTitle: nil,
+            lastUsedAt: nil,
+            agentID: nil,
+            agentCommand: nil
+        )
+
+        XCTAssertEqual(unified.displayTitle, sessionID)
+    }
+
+    func testUnifiedSessionDeadIsStillActionable() {
         let unified = UnifiedSession(
             sessionId: "dead-sess",
-            daemonState: "dead",
+            daemonState: "unavailable",
             cwd: "/test",
             lastEventSeq: 0,
             title: nil,
@@ -1343,14 +1909,30 @@ final class AppStateTests: XCTestCase {
             agentCommand: nil
         )
         XCTAssertTrue(unified.isResumable)
-        XCTAssertEqual(unified.displayState, "dead")
+        XCTAssertEqual(unified.displayState, "unavailable")
+    }
+
+    func testUnifiedSessionExternalIsResumable() {
+        let unified = UnifiedSession(
+            sessionId: "external-sess",
+            daemonState: "restorable",
+            cwd: "/test",
+            lastEventSeq: 0,
+            title: nil,
+            daemonTitle: "External Session",
+            lastUsedAt: nil,
+            agentID: nil,
+            agentCommand: nil
+        )
+        XCTAssertTrue(unified.isResumable)
+        XCTAssertEqual(unified.displayState, "restorable")
     }
 
     func testUnifiedSessionUsesDaemonUpdatedAtWhenNoLocalTimestamp() {
         let daemonDate = Date(timeIntervalSince1970: 1_700_000_000)
         let unified = UnifiedSession(
             sessionId: "external-no-local-date",
-            daemonState: "external",
+            daemonState: "restorable",
             cwd: "/test",
             lastEventSeq: 0,
             title: nil,
@@ -1366,7 +1948,7 @@ final class AppStateTests: XCTestCase {
     func testUnifiedSessionUnknownAgentIDFallsBackToRawValue() {
         let unified = UnifiedSession(
             sessionId: "s-unknown-agent",
-            daemonState: "idle",
+            daemonState: "ready",
             cwd: "/test",
             lastEventSeq: 1,
             title: nil,
@@ -1381,7 +1963,7 @@ final class AppStateTests: XCTestCase {
     func testUnifiedSessionEmptyPlaceholderDetection() {
         let empty = UnifiedSession(
             sessionId: "s-empty",
-            daemonState: "idle",
+            daemonState: "ready",
             cwd: "/test",
             lastEventSeq: 0,
             title: nil,
@@ -1394,7 +1976,7 @@ final class AppStateTests: XCTestCase {
 
         let withEvents = UnifiedSession(
             sessionId: "s-with-events",
-            daemonState: "idle",
+            daemonState: "ready",
             cwd: "/test",
             lastEventSeq: 1,
             title: nil,
@@ -1562,11 +2144,11 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(
             appState.activeWorkspace?.persistentModelID,
             workspace.persistentModelID,
-            "Workspace should be restored from activeSession for resumeSession()"
+            "Workspace should be restored from activeSession for openSession()"
         )
     }
 
-    func testRecoverInterruptedSessionRoundTripCallsReconnectAndResume() async throws {
+    func testRecoverInterruptedSessionRoundTripCallsReconnectAndOpen() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)
         let sessionId = try XCTUnwrap(appState.currentSessionId)
@@ -1575,27 +2157,27 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.connectionStatus, .disconnected)
 
         var connectCalls = 0
-        var resumedSessionIDs: [String] = []
+        var openedSessionIDs: [String] = []
         appState.autoReconnectConnectHandler = { _ in
             connectCalls += 1
             self.appState.connectionStatus = .connected
         }
-        appState.autoReconnectResumeHandler = { resumedSessionId, _ in
-            resumedSessionIDs.append(resumedSessionId)
-            self.appState.currentSessionId = resumedSessionId
+        appState.autoReconnectOpenHandler = { openedSessionId, _ in
+            openedSessionIDs.append(openedSessionId)
+            self.appState.currentSessionId = openedSessionId
         }
 
         await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
 
         XCTAssertEqual(connectCalls, 1)
-        XCTAssertEqual(resumedSessionIDs, [sessionId])
+        XCTAssertEqual(openedSessionIDs, [sessionId])
         XCTAssertEqual(appState.connectionStatus, .connected)
         XCTAssertNil(appState.connectionError)
 
         // Recovery flag should be cleared after success (no second attempt).
         await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
         XCTAssertEqual(connectCalls, 1)
-        XCTAssertEqual(resumedSessionIDs, [sessionId])
+        XCTAssertEqual(openedSessionIDs, [sessionId])
     }
 
     func testRecoverInterruptedSessionReconnectFailureAllowsRetry() async throws {
@@ -1606,25 +2188,25 @@ final class AppStateTests: XCTestCase {
         XCTAssertNotNil(appState.activeNode, "Failed recovery should preserve active node for retry")
 
         var connectCalls = 0
-        var resumeCalls = 0
+        var openCalls = 0
         appState.autoReconnectConnectHandler = { _ in
             connectCalls += 1
             self.appState.connectionStatus = .failed
             self.appState.connectionError = "mock connect failure"
         }
-        appState.autoReconnectResumeHandler = { _, _ in
-            resumeCalls += 1
+        appState.autoReconnectOpenHandler = { _, _ in
+            openCalls += 1
         }
 
         await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
         XCTAssertEqual(connectCalls, 1)
-        XCTAssertEqual(resumeCalls, 0)
+        XCTAssertEqual(openCalls, 0)
         XCTAssertEqual(appState.connectionStatus, .failed)
 
         // Retry should run again because auto-reconnect intent remains enabled.
         await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
         XCTAssertEqual(connectCalls, 2)
-        XCTAssertEqual(resumeCalls, 0)
+        XCTAssertEqual(openCalls, 0)
     }
 
     // MARK: - Helpers

@@ -3,6 +3,8 @@ package protocol
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -89,6 +91,8 @@ type Message struct {
 	Result  *json.RawMessage `json:"result,omitempty"`
 	Error   *RPCError        `json:"error,omitempty"`
 }
+
+var partialIDPattern = regexp.MustCompile(`"id"\s*:\s*("([^"\\]|\\.)*"|-?[0-9]+)`)
 
 // NewRequest creates a JSON-RPC request message.
 func NewRequest(id JSONRPCID, method string, params json.RawMessage) *Message {
@@ -193,6 +197,37 @@ func ParseLine(line []byte) (*Message, error) {
 	return &msg, nil
 }
 
+// ExtractIDFromPossiblyMalformedLine extracts a JSON-RPC id from raw bytes even
+// when the full line is malformed/truncated.
+//
+// This is best-effort and used to return parse errors against the originating
+// request id instead of letting clients hang until timeout.
+func ExtractIDFromPossiblyMalformedLine(line []byte) (JSONRPCID, bool) {
+	matches := partialIDPattern.FindSubmatch(line)
+	if len(matches) < 2 {
+		return JSONRPCID{}, false
+	}
+
+	rawID := matches[1]
+	if len(rawID) == 0 {
+		return JSONRPCID{}, false
+	}
+
+	if rawID[0] == '"' {
+		var id string
+		if err := json.Unmarshal(rawID, &id); err != nil {
+			return JSONRPCID{}, false
+		}
+		return StringID(id), true
+	}
+
+	intID, err := strconv.ParseInt(string(rawID), 10, 64)
+	if err != nil {
+		return JSONRPCID{}, false
+	}
+	return IntID(intID), true
+}
+
 // Serialize serializes a Message to JSON bytes (without trailing newline).
 func Serialize(msg *Message) ([]byte, error) {
 	return json.Marshal(msg)
@@ -219,21 +254,6 @@ func ExtractSessionID(msg *Message) string {
 		return ""
 	}
 	return params.SessionID
-}
-
-// ExtractRouteToSession extracts the __routeToSession override from params.
-// Used by daemon request routing for methods that support routing overrides.
-func ExtractRouteToSession(msg *Message) string {
-	if msg.Params == nil {
-		return ""
-	}
-	var params struct {
-		RouteToSession string `json:"__routeToSession"`
-	}
-	if err := json.Unmarshal(*msg.Params, &params); err != nil {
-		return ""
-	}
-	return params.RouteToSession
 }
 
 // ExtractTraceID extracts params._meta.traceId from the message.
