@@ -860,6 +860,38 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testPromptServiceUnavailableErrorShowsFriendlyGuidance() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+
+        await transport.setNextPromptError(
+            code: -32603,
+            message: "Internal error",
+            data: .string("{\"message\":\"unexpected status 503 Service Unavailable: 目前服务达到可承受的 QPS / TPM 高峰，请等待自动重试或者等待几秒后手动重试。\",\"codex_error_info\":\"other\"}")
+        )
+
+        appState.sendMessage("trigger overload")
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        let assistantMessages = appState.messages.filter { $0.role == .assistant }
+        let lastAssistant = try XCTUnwrap(assistantMessages.last)
+        XCTAssertTrue(
+            lastAssistant.content.contains("Upstream service is temporarily overloaded."),
+            "Assistant message should summarize service overload instead of raw JSON-RPC code"
+        )
+
+        let systemMessages = appState.messages.filter { $0.role == .system }.map(\.content)
+        XCTAssertTrue(
+            systemMessages.contains { $0.contains("Wait a few seconds and resend") && $0.contains("503 Service Unavailable") },
+            "System guidance should explain retry behavior and preserve backend detail"
+        )
+    }
+
     func testOpenDifferentSessionDetachesPreviousAttachment() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)

@@ -605,7 +605,7 @@ final class AppState {
         daemonUploadProgress = nil
         currentTraceId = nil
         isPrompting = false
-        clearAllPromptActivity()
+        PromptLifecycle.clearAllPromptActivity(appState: self)
         isCreatingSession = false
         isLoadingHistory = false
         isUploadingImage = false
@@ -781,7 +781,7 @@ final class AppState {
         let assistantMsg = ChatMessage(role: .assistant, isStreaming: true)
         messages.append(assistantMsg)
         isPrompting = true
-        markPromptActivity(for: sessionId)
+        PromptLifecycle.markPromptActivity(appState: self, for: sessionId)
         forceScrollToBottom = true
 
         let traceId = newTraceId()
@@ -800,69 +800,13 @@ final class AppState {
         )
 
         Task {
-            let timeoutSeconds = self.promptResponseTimeoutSeconds
-            do {
-                let _ = try await Log.timed(
-                    "session/prompt",
-                    component: "AppState",
-                    traceId: traceId,
-                    sessionId: sessionId
-                ) {
-                    try await self.sendPromptAwaitingTerminalResponse(
-                        service: service,
-                        sessionId: sessionId,
-                        prompt: promptBlocks,
-                        monitorSessionId: sessionId,
-                        traceId: traceId,
-                        inactivityTimeoutSeconds: timeoutSeconds
-                    )
-                }
-                let promptStillActive = self.isPrompting && self.currentSessionId == sessionId
-                guard promptStillActive else {
-                    Log.log(
-                        level: "warning",
-                        component: "AppState",
-                        "sendPrompt returned after prompt already settled",
-                        traceId: traceId,
-                        sessionId: sessionId
-                    )
-                    return
-                }
-                Log.log(component: "AppState", "sendPrompt returned", traceId: traceId, sessionId: sessionId)
-                for msg in self.messages where msg.role == .assistant && msg.isStreaming {
-                    msg.isStreaming = false
-                }
-                self.isPrompting = false
-                self.clearPromptActivity(for: sessionId)
-            } catch {
-                let normalizedError = self.normalizePromptSendError(error, timeoutSeconds: timeoutSeconds)
-                let promptStillActive = self.isPrompting && self.currentSessionId == sessionId
-                guard promptStillActive else {
-                    Log.log(
-                        level: "warning",
-                        component: "AppState",
-                        "sendPrompt finished after prompt already settled: \(normalizedError.localizedDescription)",
-                        traceId: traceId,
-                        sessionId: sessionId
-                    )
-                    return
-                }
-                Log.log(
-                    level: "error",
-                    component: "AppState",
-                    "sendPrompt error: \(normalizedError.localizedDescription)",
-                    traceId: traceId,
-                    sessionId: sessionId
-                )
-                self.presentPromptError(normalizedError)
-                for msg in self.messages where msg.role == .assistant && msg.isStreaming {
-                    msg.isStreaming = false
-                }
-                self.isPrompting = false
-                self.clearPromptActivity(for: sessionId)
-                self.forceScrollToBottom = true
-                Task { await self.refreshDaemonSessions() }
-            }
+            await PromptLifecycle.executePrompt(
+                appState: self,
+                service: service,
+                sessionId: sessionId,
+                prompt: promptBlocks,
+                traceId: traceId
+            )
         }
         return true
     }
@@ -1067,9 +1011,11 @@ final class AppState {
     }
 
     private func handleSessionEvent(_ event: SessionEvent, sessionId: String? = nil) {
-        if let sessionId, isPrompting {
-            markPromptActivity(for: sessionId)
-        }
+        PromptLifecycle.didReceiveSessionEvent(
+            appState: self,
+            event: event,
+            sessionId: sessionId
+        )
 
         // Reset thought-streaming flag when a different event type arrives
         if case .thoughtDelta = event {} else {
@@ -1137,20 +1083,7 @@ final class AppState {
             break
 
         case .promptComplete(_):
-            // Stop streaming on ALL assistant messages from this turn.
-            for msg in messages where msg.role == .assistant && msg.isStreaming {
-                msg.isStreaming = false
-            }
-            isPrompting = false
-            if let sessionId {
-                clearPromptActivity(for: sessionId)
-            } else if let currentSessionId {
-                clearPromptActivity(for: currentSessionId)
-            }
-            Task { await self.refreshDaemonSessions() }
-            // Force scroll regardless of isNearBottom — the final content
-            // must be visible even if the anchor drifted off-screen.
-            forceScrollToBottom = true
+            break
         }
         contentDidChange()
     }
@@ -1252,7 +1185,7 @@ final class AppState {
 
     private func settlePromptingStateForSessionSwitch(clearMessages: Bool) {
         isPrompting = false
-        clearAllPromptActivity()
+        PromptLifecycle.clearAllPromptActivity(appState: self)
         for msg in messages where msg.isStreaming {
             msg.isStreaming = false
         }
@@ -1315,236 +1248,8 @@ final class AppState {
         return !hasDaemonTitle
     }
 
-    /// Wait for terminal `session/prompt` response with an inactivity timeout.
-    /// As long as streaming updates keep arriving, we keep waiting past the base timeout.
-    private func sendPromptAwaitingTerminalResponse(
-        service: ACPService,
-        sessionId: String,
-        prompt: [PromptBlock],
-        monitorSessionId: String,
-        traceId: String?,
-        inactivityTimeoutSeconds: TimeInterval
-    ) async throws -> StopReason {
-        let startedAt = Date()
-        markPromptActivity(for: monitorSessionId)
-        let pollIntervalSeconds = min(
-            promptResponsePollIntervalSeconds,
-            max(0.05, inactivityTimeoutSeconds / 2)
-        )
-        let maxWaitSeconds = max(inactivityTimeoutSeconds, promptResponseMaxWaitSeconds)
-        let client = service.client
 
-        return try await withThrowingTaskGroup(of: StopReason.self) { group in
-            group.addTask {
-                try await ACPService(client: client).sendPrompt(
-                    sessionId: sessionId,
-                    prompt: prompt,
-                    traceId: traceId
-                )
-            }
 
-            group.addTask { @MainActor in
-                while true {
-                    try await Task.sleep(for: .seconds(pollIntervalSeconds))
-                    let inactivity = self.promptInactivitySeconds(for: monitorSessionId, fallback: startedAt)
-                    if inactivity < inactivityTimeoutSeconds {
-                        continue
-                    }
-
-                    let promptStillActive = self.isPrompting && self.currentSessionId == monitorSessionId
-                    if !promptStillActive {
-                        throw CancellationError()
-                    }
-
-                    let elapsedSeconds = max(0, Date().timeIntervalSince(startedAt))
-                    if elapsedSeconds >= maxWaitSeconds {
-                        throw PromptResponseTimeoutError(seconds: maxWaitSeconds)
-                    }
-
-                    let shouldKeepWaiting = await self.shouldKeepWaitingForPromptAfterInactivity(
-                        sessionId: monitorSessionId,
-                        traceId: traceId
-                    )
-                    if shouldKeepWaiting {
-                        self.markPromptActivity(for: monitorSessionId)
-                        continue
-                    }
-
-                    throw PromptResponseTimeoutError(seconds: inactivityTimeoutSeconds)
-                }
-            }
-
-            defer { group.cancelAll() }
-            guard let first = try await group.next() else {
-                throw CancellationError()
-            }
-            return first
-        }
-    }
-
-    /// When the watchdog reaches inactivity timeout, confirm whether daemon still
-    /// considers this session actively running before surfacing a timeout to UI.
-    private func shouldKeepWaitingForPromptAfterInactivity(
-        sessionId: String,
-        traceId: String?
-    ) async -> Bool {
-        let cachedState = daemonSessions.first(where: { $0.sessionId == sessionId })?.state
-        guard let daemon = daemonClient else {
-            return isBusyDaemonSessionState(cachedState)
-        }
-
-        do {
-            let sessions = try await fetchDaemonSessionsForPromptWatchdog(
-                daemon: daemon,
-                traceId: traceId
-            )
-            if let refreshed = sessions.first(where: { $0.sessionId == sessionId }) {
-                if let index = daemonSessions.firstIndex(where: { $0.sessionId == sessionId }) {
-                    daemonSessions[index] = refreshed
-                } else {
-                    daemonSessions.append(refreshed)
-                }
-                let busy = isBusyDaemonSessionState(refreshed.state)
-                if busy {
-                    Log.log(
-                        level: "warning",
-                        component: "AppState",
-                        "prompt watchdog deferred timeout; daemon state=\(refreshed.state)",
-                        traceId: traceId,
-                        sessionId: sessionId
-                    )
-                }
-                return busy
-            }
-            return false
-        } catch {
-            let cachedBusy = isBusyDaemonSessionState(cachedState)
-            Log.log(
-                level: "warning",
-                component: "AppState",
-                "prompt watchdog daemon state check failed (cachedBusy=\(cachedBusy)): \(error.localizedDescription)",
-                traceId: traceId,
-                sessionId: sessionId
-            )
-            return cachedBusy
-        }
-    }
-
-    /// Nonisolated helper for prompt watchdog polling.
-    /// `DaemonClient` is its own actor; this just avoids implicitly binding the
-    /// polling helper itself to MainActor.
-    nonisolated private func fetchDaemonSessionsForPromptWatchdog(
-        daemon: DaemonClient,
-        traceId: String?
-    ) async throws -> [DaemonSessionInfo] {
-        try await daemon.listSessions(traceId: traceId)
-    }
-
-    private func isBusyDaemonSessionState(_ state: String?) -> Bool {
-        guard let normalized = state?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
-            return false
-        }
-        return normalized == "starting"
-            || normalized == "prompting"
-            || normalized == "draining"
-    }
-
-    private func markPromptActivity(for sessionId: String) {
-        promptLastActivityAt[sessionId] = Date()
-    }
-
-    private func clearPromptActivity(for sessionId: String) {
-        promptLastActivityAt.removeValue(forKey: sessionId)
-    }
-
-    private func clearAllPromptActivity() {
-        promptLastActivityAt.removeAll()
-    }
-
-    private func promptInactivitySeconds(for sessionId: String, fallback: Date) -> TimeInterval {
-        let lastActivity = promptLastActivityAt[sessionId] ?? fallback
-        return max(0, Date().timeIntervalSince(lastActivity))
-    }
-
-    /// Present a concise prompt failure in chat and add actionable guidance.
-    private func presentPromptError(_ error: Error) {
-        let presentation = userFacingPromptError(error)
-        let assistant = lastAssistantMessage()
-        let errorLine = "[Error: \(presentation.inline)]"
-        if assistant.content.isEmpty {
-            assistant.content = errorLine
-        } else {
-            assistant.content += "\n\(errorLine)"
-        }
-        if let guidance = presentation.guidance {
-            addSystemMessage(guidance)
-        }
-    }
-
-    private func userFacingPromptError(_ error: Error) -> (inline: String, guidance: String?) {
-        if let promptTimeout = error as? PromptResponseTimeoutError {
-            let seconds = max(1, Int(promptTimeout.seconds.rounded()))
-            return (
-                "Timed out waiting for model response.",
-                "No terminal response or streaming updates were received within \(seconds)s. You can resend the message."
-            )
-        }
-
-        if error is CancellationError {
-            return (
-                "Connection interrupted while waiting for a response.",
-                "Connection dropped during the request. Please resend after reconnecting."
-            )
-        }
-
-        guard let acpError = error as? ACPError else {
-            return (error.localizedDescription, nil)
-        }
-
-        if acpError.isModelUnavailable {
-            if let requestID = acpError.backendRequestID {
-                return (
-                    "Model unavailable on current provider group.",
-                    "Model routing failed (`model_not_found`, request id: \(requestID)). Try switching model/group, then resend."
-                )
-            }
-            return (
-                "Model unavailable on current provider group.",
-                "Model routing failed (`model_not_found`). Try switching model/group, then resend."
-            )
-        }
-
-        if acpError.isNotAttached {
-            return (
-                "Session is no longer attached.",
-                "Server session detached. Re-open the session and retry."
-            )
-        }
-
-        if acpError.isSessionNotFound {
-            return (
-                "Session not found on server.",
-                "Session no longer exists remotely. Create a new session to continue."
-            )
-        }
-
-        if acpError.rpcCode == -32603 {
-            return (
-                "Server internal error while processing this prompt.",
-                "Server returned JSON-RPC -32603. Please retry in a moment."
-            )
-        }
-
-        return (acpError.errorDescription ?? error.localizedDescription, nil)
-    }
-
-    private func normalizePromptSendError(_ error: Error, timeoutSeconds: TimeInterval) -> Error {
-        if let appStateError = error as? AppStateError,
-           case .timeout = appStateError {
-            return PromptResponseTimeoutError(seconds: timeoutSeconds)
-        }
-        return error
-    }
 
     private func addSystemMessage(_ text: String) {
         messages.append(ChatMessage(role: .system, content: text))
@@ -1662,7 +1367,39 @@ extension AppState: ConversationLifecycleAppState {
     }
 }
 
-private struct PromptResponseTimeoutError: LocalizedError {
+extension AppState: PromptLifecycleAppState {
+    var daemonClientForPromptLifecycle: DaemonClient? { daemonClient }
+    var promptResponseTimeoutSecondsForLifecycle: TimeInterval { promptResponseTimeoutSeconds }
+    var promptResponseMaxWaitSecondsForLifecycle: TimeInterval { promptResponseMaxWaitSeconds }
+    var promptResponsePollIntervalSecondsForLifecycle: TimeInterval { promptResponsePollIntervalSeconds }
+
+    var promptLastActivityAtForLifecycle: [String: Date] {
+        get { promptLastActivityAt }
+        set { promptLastActivityAt = newValue }
+    }
+
+    func newTraceIDForPromptLifecycle() -> String {
+        newTraceId()
+    }
+
+    func promptLifecycleRefreshDaemonSessions() async {
+        await refreshDaemonSessions()
+    }
+
+    func promptLifecycleAddSystemMessage(_ text: String) {
+        addSystemMessage(text)
+    }
+
+    func promptLifecycleContentDidChange() {
+        contentDidChange()
+    }
+
+    func promptLifecycleLastAssistantMessage() -> ChatMessage {
+        lastAssistantMessage()
+    }
+}
+
+struct PromptResponseTimeoutError: LocalizedError {
     let seconds: TimeInterval
 
     var errorDescription: String? {

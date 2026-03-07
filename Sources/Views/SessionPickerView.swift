@@ -173,7 +173,7 @@ struct SessionPickerView: View {
     @AppStorage(AgentCommandStore.defaultAgentKey) private var defaultAgentID = AgentKind.claude.rawValue
     let workspace: Workspace
     @State private var navigateToChat = false
-    @State private var loadingSessionId: String?
+    @State private var loadingConversationId: String?
     @State private var openErrorMessage: String?
 
     var body: some View {
@@ -255,7 +255,7 @@ struct SessionPickerView: View {
                     } label: {
                         HStack {
                             Label("New Session", systemImage: "plus.circle")
-                            if appState.isCreatingSession, loadingSessionId == nil {
+                            if appState.isCreatingSession, loadingConversationId == nil {
                                 Spacer()
                                 ProgressView()
                             }
@@ -283,7 +283,7 @@ struct SessionPickerView: View {
                     } label: {
                         HStack {
                             Label("New Session", systemImage: "plus.circle")
-                            if appState.isCreatingSession, loadingSessionId == nil {
+                            if appState.isCreatingSession, loadingConversationId == nil {
                                 Spacer()
                                 ProgressView()
                             }
@@ -298,7 +298,7 @@ struct SessionPickerView: View {
                 Section("Sessions") {
                     ForEach(sessions) { session in
                         Button {
-                            Task { @MainActor in await openConversation(sessionId: session.sessionId) }
+                            Task { @MainActor in await openConversation(conversationId: session.conversationId) }
                         } label: {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
@@ -311,12 +311,12 @@ struct SessionPickerView: View {
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
-                                    Text(session.sessionId)
+                                    Text(session.conversationId)
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
                                         .lineLimit(1)
                                     if let runtimeId = session.effectiveRuntimeId,
-                                       runtimeId != session.sessionId {
+                                       runtimeId != session.conversationId {
                                         Text("runtime: \(runtimeId)")
                                             .font(.caption2)
                                             .foregroundStyle(.tertiary)
@@ -330,7 +330,7 @@ struct SessionPickerView: View {
                                 }
                                 Spacer()
                                 SessionStateBadge(state: session.displayState)
-                                if loadingSessionId == session.sessionId {
+                                if loadingConversationId == session.conversationId {
                                     ProgressView()
                                 }
                             }
@@ -358,15 +358,15 @@ struct SessionPickerView: View {
     }
 
     @MainActor
-    private func openConversation(sessionId: String) async {
+    private func openConversation(conversationId: String) async {
         appState.isCreatingSession = true
-        loadingSessionId = sessionId
+        loadingConversationId = conversationId
         defer {
             appState.isCreatingSession = false
-            loadingSessionId = nil
+            loadingConversationId = nil
         }
         do {
-            try await appState.openSession(sessionId: sessionId, modelContext: modelContext)
+            try await appState.openSession(sessionId: conversationId, modelContext: modelContext)
             navigateToChat = true
         } catch {
             appState.connectionError = error.localizedDescription

@@ -198,4 +198,29 @@ final class ACPClientTests: XCTestCase {
         XCTAssertTrue(nonLoadResourceError.isResourceNotFound)
         XCTAssertFalse(nonLoadResourceError.isSessionLoadResourceNotFound)
     }
+
+    func testACPErrorExtractsSummaryFromStringifiedJSONData() {
+        let overloaded = ACPError.rpcError(
+            code: -32603,
+            message: "Internal error",
+            data: .string("{\"message\":\"unexpected status 503 Service Unavailable: provider overloaded\",\"codex_error_info\":\"other\"}")
+        )
+
+        XCTAssertEqual(overloaded.summary, "unexpected status 503 Service Unavailable: provider overloaded")
+        XCTAssertEqual(
+            overloaded.errorDescription,
+            "ACP error: Internal error (unexpected status 503 Service Unavailable: provider overloaded)"
+        )
+        XCTAssertTrue(overloaded.isServiceOverloaded)
+    }
+
+    func testACPErrorQueryClosedDetectionUsesStringData() {
+        let queryClosed = ACPError.rpcError(
+            code: -32603,
+            message: "Internal error",
+            data: .string("Query closed before response received")
+        )
+
+        XCTAssertTrue(queryClosed.isQueryClosedBeforeResponse)
+    }
 }
