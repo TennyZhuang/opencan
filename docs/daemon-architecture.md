@@ -139,6 +139,17 @@ When iOS opens a conversation:
 
 iOS no longer orchestrates `session/load` fallback itself.
 
+## Request Routing Invariant
+
+Managed attachment and buffered replay are runtime-oriented, but upstream ACP requests must preserve conversation identity.
+
+- iOS opens and reopens conversations through daemon-owned `runtimeId` attachments.
+- The daemon may recreate a fresh runtime for an existing `conversationId`.
+- When forwarding ACP calls like `session/prompt` and `session/load`, the daemon must rewrite the upstream ACP `sessionId` to the stable `conversationId` whenever it differs from the live `runtimeId`.
+- Failing to do this breaks restored conversations: the UI can replay history correctly while the underlying agent sees an empty context.
+
+This is a regression boundary, not an implementation detail.
+
 ## Replay Contract
 
 Forwarded `session/update` notifications include:

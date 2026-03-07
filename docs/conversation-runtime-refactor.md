@@ -4,7 +4,80 @@
 
 Implemented in the current codebase.
 
-This document captures the rationale behind the conversation/runtime split and remains useful as design background. Historical stopgap plans have been removed to avoid confusion.
+This document captures the rationale behind the conversation/runtime split and remains useful as design background. Historical stopgap plans have been removed to avoid confusion. Unless a section is explicitly labeled as post-merge follow-up, read the remainder as the design document that drove the refactor rather than the canonical source for the current wire contract. For the latest implemented behavior, use `docs/daemon-architecture.md` and `CLAUDE.md`.
+
+## Post-merge follow-up plan
+
+The conversation/runtime model is now in place. The next phase is not another protocol rewrite; it is a focused simplification pass that removes leftover orchestration, narrows app-facing abstractions, and makes tests cheaper to maintain.
+
+### 1. Shrink `AppState` back to a UI coordinator
+
+**Goal:** move conversation open/recover/prompt lifecycle orchestration out of `AppState` so the top-level state container stops being the place where policy accumulates.
+
+**Why this matters:** the architecture is cleaner now, but `AppState` is still the easiest place for retry logic, replay settlement, and persistence syncing to grow back into a large bug-prone control tree.
+
+**Scope:**
+
+- extract conversation open/recover coordination from `Sources/AppState.swift`
+- extract prompt terminal-state settlement and watchdog behavior into a smaller boundary
+- separate persistence sync from live transport/runtime handling
+- keep the new logging, but move it to coordinator boundaries instead of branch-by-branch tracing
+
+**Done when:**
+
+- `AppState` mostly binds UI state, navigation state, and rendered transcript state
+- open/recover/send flows are readable without scrolling through multi-branch recovery code
+- the main lifecycle logic is covered by focused tests around small collaborators instead of one giant state object
+
+### 2. Keep runtime details out of conversation-facing layers
+
+**Goal:** preserve the architectural rule that `conversationId` is the durable product identity and `runtimeId` is an operational detail used only for attachment, replay, and diagnostics.
+
+**Why this matters:** the refactor only pays off if runtime-oriented APIs stop leaking upward into SwiftData, picker models, and user-facing orchestration. Otherwise the same dual-identity confusion will reappear under new names.
+
+**Scope:**
+
+- audit `Sources/Views/SessionPickerView.swift`, `Sources/Models/DaemonTypes.swift`, and related tests for raw runtime-centric assumptions
+- keep `daemon/session.list` and `daemon/session.kill` strictly diagnostic/operational; avoid building new UX flows on top of them
+- continue trimming persistence so local rows are cache/reference records keyed by `conversationId`, not daemon runtime facts
+- make conversation descriptors the default app-facing DTOs everywhere outside transport/replay plumbing
+
+**Done when:**
+
+- picker, open, reconnect, and history-loading flows can be explained entirely in conversation terms
+- `runtimeId` no longer acts as an authority key in SwiftData or feature logic
+- only transport, replay, and diagnostic paths need to reason directly about runtime identity
+
+### 3. Reset tests and mocks around the new contract
+
+**Goal:** make the test suite protect the conversation/runtime contract instead of preserving every historical branch that existed during the migration.
+
+**Why this matters:** the previous bug pattern was “tests keep growing while the system stays fragile.” The only durable fix is to reduce branch-shaped tests and delete mock behavior that models interfaces we no longer want.
+
+**Scope:**
+
+- simplify the mock ACP server so it only models currently supported daemon/ACP behaviors
+- add reusable conversation/runtime fixtures for daemon tests and iOS tests
+- convert broad scenario tests into focused helpers around create, open, replay, prompt, and restore
+- delete tests that only protect removed compatibility paths or app-side takeover logic
+
+**Done when:**
+
+- new tests read as protocol or product-contract checks rather than branch snapshots
+- mock ACP behavior matches the current daemon contract and does not emulate deleted compatibility APIs
+- adding a new lifecycle case usually means extending a fixture/helper, not copying another end-to-end branch test
+
+## Execution order
+
+1. Shrink `AppState` orchestration first, because it is the biggest remaining concentration of lifecycle complexity.
+2. Audit and trim runtime leakage next, so the extracted boundaries stabilize around conversation-level DTOs.
+3. Simplify mocks and tests last, once the production seams are in their intended shape.
+
+## Success criteria for the next phase
+
+- The app can be described as: SSH transport -> daemon conversation API -> thin UI coordinator.
+- Reconnect and restore bugs are debugged through stable logs and a small number of lifecycle boundaries.
+- The codebase gets smaller in conceptual surface area even if some cleanup patches temporarily move lines across files.
 
 ## Why a bigger refactor
 
@@ -553,7 +626,9 @@ Delete tests whose only purpose is protecting app-side orchestration that should
 - temporary notification scope tests
 - routing hacks around history source session IDs
 
-## Rollout phases
+## Historical rollout phases
+
+These phases describe the migration plan that drove the refactor. They are kept for context, not as a statement of the current codebase state.
 
 ## Phase 0 — Lock current behavior at the edges
 
@@ -575,8 +650,8 @@ Do not add more branch tests.
 
 ## Phase 3 — Cleanup
 
-- delete old `session.*` compatibility methods
-- delete old SwiftData fields and dead migration scaffolding
+- delete obsolete compatibility methods that are no longer justified by the current architecture (while keeping intentionally retained diagnostic APIs such as `daemon/session.list|kill` unless/until they are replaced)
+- delete SwiftData fields and migration scaffolding once the app no longer depends on them
 - remove obsolete tests and docs
 
 ## Explicit decisions
@@ -588,7 +663,6 @@ Do not add more branch tests.
 4. **Do not keep external-session adoption in AppState.**
 5. **Prefer a clean API break over preserving ambiguous `sessionId` semantics.**
 
-## Recommended immediate next step
+## Historical immediate next step
 
-Implement a daemon-side RFC prototype for `conversation.list` and `conversation.open` first.
-Once those wire contracts are stable, the iOS rewrite becomes dramatically simpler and can be done with far fewer moving parts.
+The original immediate next step in this document was to prototype the daemon-side `conversation.list` / `conversation.open` contract first. That work has been completed on this branch. Use the post-merge follow-up plan above as the active roadmap from here.
