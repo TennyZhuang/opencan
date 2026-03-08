@@ -1,12 +1,12 @@
 import SwiftUI
 import SwiftData
 
-func workspacePathMatchesSessionCwd(workspacePath: String, sessionCwd: String, username: String?) -> Bool {
+func workspacePathMatchesConversationCwd(workspacePath: String, conversationCwd: String, username: String?) -> Bool {
     let workspaceKeys = remotePathMatchKeys(workspacePath, username: username)
     guard !workspaceKeys.isEmpty else { return false }
-    let sessionKeys = remotePathMatchKeys(sessionCwd, username: username)
-    guard !sessionKeys.isEmpty else { return false }
-    return !workspaceKeys.isDisjoint(with: sessionKeys)
+    let conversationKeys = remotePathMatchKeys(conversationCwd, username: username)
+    guard !conversationKeys.isEmpty else { return false }
+    return !workspaceKeys.isDisjoint(with: conversationKeys)
 }
 
 /// Build path match keys for remote UNIX-like paths.
@@ -57,50 +57,6 @@ private func normalizedRemotePathKey(_ rawPath: String) -> String? {
     return parts.joined(separator: "/")
 }
 
-private func legacyConversationState(from sessionState: String) -> String {
-    switch sessionState {
-    case "external":
-        return "restorable"
-    case "dead":
-        return "unavailable"
-    case "starting", "prompting", "draining":
-        return "running"
-    case "idle", "completed":
-        return "ready"
-    default:
-        return sessionState
-    }
-}
-
-/// Backward-compatible merge helper for legacy daemon/session.list snapshots.
-func mergeWorkspaceSessions(
-    workspacePath: String,
-    username: String?,
-    daemonSessions: [DaemonSessionInfo],
-    localSessions: [Session]
-) -> [UnifiedSession] {
-    let conversations = daemonSessions.map { session in
-        DaemonConversationInfo(
-            conversationId: session.sessionId,
-            runtimeId: session.state == "external" ? nil : session.sessionId,
-            state: legacyConversationState(from: session.state),
-            cwd: session.cwd,
-            command: session.command,
-            title: session.title,
-            updatedAt: session.updatedAt,
-            ownerId: nil,
-            origin: session.state == "external" ? "discovered" : "managed",
-            lastEventSeq: session.lastEventSeq
-        )
-    }
-    return mergeWorkspaceSessions(
-        workspacePath: workspacePath,
-        username: username,
-        daemonConversations: conversations,
-        localSessions: localSessions
-    )
-}
-
 /// Build merged conversation rows for a workspace by combining daemon + local records.
 func mergeWorkspaceSessions(
     workspacePath: String,
@@ -110,7 +66,7 @@ func mergeWorkspaceSessions(
 ) -> [UnifiedSession] {
     var localByConversationID: [String: Session] = [:]
     for localSession in localSessions {
-        let conversationId = localSession.stableConversationId
+        let conversationId = localSession.conversationId
         if let existing = localByConversationID[conversationId],
            existing.lastUsedAt >= localSession.lastUsedAt {
             continue
@@ -121,9 +77,9 @@ func mergeWorkspaceSessions(
     var daemonByConversationID: [String: DaemonConversationInfo] = [:]
     for conversation in daemonConversations {
         let isKnownLocalConversation = localByConversationID[conversation.conversationId] != nil
-        guard isKnownLocalConversation || workspacePathMatchesSessionCwd(
+        guard isKnownLocalConversation || workspacePathMatchesConversationCwd(
             workspacePath: workspacePath,
-            sessionCwd: conversation.cwd,
+            conversationCwd: conversation.cwd,
             username: username
         ) else {
             continue
@@ -136,10 +92,10 @@ func mergeWorkspaceSessions(
         let daemon = daemonByConversationID[conversationId]
         let local = localByConversationID[conversationId]
         return UnifiedSession(
-            sessionId: conversationId,
-            runtimeId: daemon?.runtimeId ?? local?.sessionId,
+            conversationId: conversationId,
+            runtimeId: daemon?.runtimeId ?? local?.runtimeId,
             daemonState: daemon?.state,
-            cwd: daemon?.cwd ?? local?.sessionCwd ?? workspacePath,
+            cwd: daemon?.cwd ?? local?.conversationCwd ?? workspacePath,
             lastEventSeq: daemon?.lastEventSeq,
             title: local?.title,
             daemonTitle: daemon?.title,
@@ -173,7 +129,7 @@ struct SessionPickerView: View {
     @AppStorage(AgentCommandStore.defaultAgentKey) private var defaultAgentID = AgentKind.claude.rawValue
     let workspace: Workspace
     @State private var navigateToChat = false
-    @State private var loadingSessionId: String?
+    @State private var loadingConversationId: String?
     @State private var openErrorMessage: String?
 
     var body: some View {
@@ -255,7 +211,7 @@ struct SessionPickerView: View {
                     } label: {
                         HStack {
                             Label("New Session", systemImage: "plus.circle")
-                            if appState.isCreatingSession, loadingSessionId == nil {
+                            if appState.isCreatingSession, loadingConversationId == nil {
                                 Spacer()
                                 ProgressView()
                             }
@@ -283,7 +239,7 @@ struct SessionPickerView: View {
                     } label: {
                         HStack {
                             Label("New Session", systemImage: "plus.circle")
-                            if appState.isCreatingSession, loadingSessionId == nil {
+                            if appState.isCreatingSession, loadingConversationId == nil {
                                 Spacer()
                                 ProgressView()
                             }
@@ -298,7 +254,7 @@ struct SessionPickerView: View {
                 Section("Sessions") {
                     ForEach(sessions) { session in
                         Button {
-                            Task { @MainActor in await openConversation(sessionId: session.sessionId) }
+                            Task { @MainActor in await openConversation(conversationId: session.conversationId) }
                         } label: {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
@@ -311,12 +267,12 @@ struct SessionPickerView: View {
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
-                                    Text(session.sessionId)
+                                    Text(session.conversationId)
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
                                         .lineLimit(1)
                                     if let runtimeId = session.effectiveRuntimeId,
-                                       runtimeId != session.sessionId {
+                                       runtimeId != session.conversationId {
                                         Text("runtime: \(runtimeId)")
                                             .font(.caption2)
                                             .foregroundStyle(.tertiary)
@@ -330,7 +286,7 @@ struct SessionPickerView: View {
                                 }
                                 Spacer()
                                 SessionStateBadge(state: session.displayState)
-                                if loadingSessionId == session.sessionId {
+                                if loadingConversationId == session.conversationId {
                                     ProgressView()
                                 }
                             }
@@ -358,15 +314,15 @@ struct SessionPickerView: View {
     }
 
     @MainActor
-    private func openConversation(sessionId: String) async {
+    private func openConversation(conversationId: String) async {
         appState.isCreatingSession = true
-        loadingSessionId = sessionId
+        loadingConversationId = conversationId
         defer {
             appState.isCreatingSession = false
-            loadingSessionId = nil
+            loadingConversationId = nil
         }
         do {
-            try await appState.openSession(sessionId: sessionId, modelContext: modelContext)
+            try await appState.openSession(conversationId: conversationId, modelContext: modelContext)
             navigateToChat = true
         } catch {
             appState.connectionError = error.localizedDescription

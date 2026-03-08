@@ -8,5 +8,4 @@ enum ACPMethods {
     static let sessionPrompt = "session/prompt"
     static let sessionUpdate = "session/update"
     static let sessionList = "session/list"
-    static let sessionLoad = "session/load"
 }

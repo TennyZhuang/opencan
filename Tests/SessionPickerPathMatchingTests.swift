@@ -4,9 +4,9 @@ import XCTest
 final class SessionPickerPathMatchingTests: XCTestCase {
     func testMatchesSamePathWithTrailingSlashDifference() {
         XCTAssertTrue(
-            workspacePathMatchesSessionCwd(
+            workspacePathMatchesConversationCwd(
                 workspacePath: "/home/tz/articles/",
-                sessionCwd: "/home/tz/articles",
+                conversationCwd: "/home/tz/articles",
                 username: "tz"
             )
         )
@@ -14,9 +14,9 @@ final class SessionPickerPathMatchingTests: XCTestCase {
 
     func testMatchesTildeToHomeExpansion() {
         XCTAssertTrue(
-            workspacePathMatchesSessionCwd(
+            workspacePathMatchesConversationCwd(
                 workspacePath: "~/articles",
-                sessionCwd: "/home/tz/articles",
+                conversationCwd: "/home/tz/articles",
                 username: "tz"
             )
         )
@@ -24,9 +24,9 @@ final class SessionPickerPathMatchingTests: XCTestCase {
 
     func testMatchesHomeToTildeExpansion() {
         XCTAssertTrue(
-            workspacePathMatchesSessionCwd(
+            workspacePathMatchesConversationCwd(
                 workspacePath: "/home/tz/articles",
-                sessionCwd: "~/articles",
+                conversationCwd: "~/articles",
                 username: "tz"
             )
         )
@@ -34,9 +34,9 @@ final class SessionPickerPathMatchingTests: XCTestCase {
 
     func testDoesNotMatchDifferentDirectories() {
         XCTAssertFalse(
-            workspacePathMatchesSessionCwd(
+            workspacePathMatchesConversationCwd(
                 workspacePath: "/home/tz/articles",
-                sessionCwd: "/home/tz/other",
+                conversationCwd: "/home/tz/other",
                 username: "tz"
             )
         )
@@ -44,9 +44,9 @@ final class SessionPickerPathMatchingTests: XCTestCase {
 
     func testMergeWorkspaceSessionsKeepsManagedAndRestorableConversations() {
         let managed = Session(
-            sessionId: "managed-session",
+            runtimeId: "managed-session",
             conversationId: "managed-session",
-            sessionCwd: "/home/tz/repo"
+            conversationCwd: "/home/tz/repo"
         )
         managed.title = "Managed"
         managed.lastUsedAt = Date(timeIntervalSince1970: 200)
@@ -86,16 +86,16 @@ final class SessionPickerPathMatchingTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            Set(merged.map(\.sessionId)),
+            Set(merged.map(\.conversationId)),
             Set(["managed-session", "external-source", "external-other"])
         )
     }
 
     func testMergeWorkspaceSessionsKeepsRestorableWhenNoRecoveredMappingExists() {
         let local = Session(
-            sessionId: "managed-session",
+            runtimeId: "managed-session",
             conversationId: "managed-session",
-            sessionCwd: "/home/tz/repo"
+            conversationCwd: "/home/tz/repo"
         )
         local.title = "Managed"
         local.lastUsedAt = Date(timeIntervalSince1970: 200)
@@ -123,17 +123,16 @@ final class SessionPickerPathMatchingTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            Set(merged.map(\.sessionId)),
+            Set(merged.map(\.conversationId)),
             Set(["managed-session", "external-source"])
         )
     }
 
     func testMergeWorkspaceSessionsCollapsesRecoveredConversationToStableConversationID() {
         let managed = Session(
-            sessionId: "managed-session",
+            runtimeId: "managed-session",
             conversationId: "external-source",
-            canonicalSessionId: "external-source",
-            sessionCwd: "/home/tz/repo"
+            conversationCwd: "/home/tz/repo"
         )
         managed.title = "Recovered"
         managed.lastUsedAt = Date(timeIntervalSince1970: 200)
@@ -161,15 +160,15 @@ final class SessionPickerPathMatchingTests: XCTestCase {
         )
 
         XCTAssertEqual(merged.count, 1)
-        XCTAssertEqual(merged.first?.sessionId, "external-source")
+        XCTAssertEqual(merged.first?.conversationId, "external-source")
         XCTAssertEqual(merged.first?.runtimeId, "managed-session")
     }
 
     func testMergeWorkspaceSessionsIncludesKnownLocalConversationEvenWhenDaemonCwdDiffers() {
         let local = Session(
-            sessionId: "legacy-runtime",
+            runtimeId: "legacy-runtime",
             conversationId: "legacy-conversation",
-            sessionCwd: "/home/tz/repo"
+            conversationCwd: "/home/tz/repo"
         )
         local.title = "Legacy"
         local.lastUsedAt = Date(timeIntervalSince1970: 200)
@@ -197,7 +196,7 @@ final class SessionPickerPathMatchingTests: XCTestCase {
         )
 
         XCTAssertEqual(merged.count, 1)
-        XCTAssertEqual(merged.first?.sessionId, "legacy-conversation")
+        XCTAssertEqual(merged.first?.conversationId, "legacy-conversation")
         XCTAssertEqual(merged.first?.daemonState, "restorable")
     }
 }

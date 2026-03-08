@@ -986,6 +986,171 @@ func TestDaemon_ConversationOpen_ReattachesAfterDisconnect(t *testing.T) {
 	}
 }
 
+func TestDaemon_ConversationOpen_ReplaysOnlyTailAfterDisconnect(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	tmpDir := t.TempDir()
+	slowCmd := writeMockWrapperCommandWithEnv(t, filepath.Join(tmpDir, "mock-slow-replay-tail.sh"), mockBin, map[string]string{
+		"MOCK_PROMPT_DELAY": "120",
+	})
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	conversationID, runtimeID, _ := createConversation(t, conn1, scanner1, 1, "/tmp", slowCmd, "ios-owner-1")
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1001,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": runtimeID,
+			"prompt":    []map[string]interface{}{{"type": "text", "text": "hello"}},
+		},
+	})
+
+	var lastSeenSeq uint64
+	seenNotifications := 0
+	for seenNotifications < 2 {
+		msg := readJSONWithScanner(t, scanner1)
+		if msg["method"] != "session/update" {
+			continue
+		}
+		params, _ := msg["params"].(map[string]interface{})
+		seq, _ := params["__seq"].(float64)
+		lastSeenSeq = uint64(seq)
+		seenNotifications++
+	}
+	conn1.Close()
+
+	time.Sleep(350 * time.Millisecond)
+
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	resp := openConversation(t, conn2, scanner2, 1, conversationID, "ios-owner-1", runtimeID, lastSeenSeq)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.open error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
+	buffered, ok := attachment["bufferedEvents"].([]interface{})
+	if !ok {
+		t.Fatalf("expected bufferedEvents array, got %T", attachment["bufferedEvents"])
+	}
+	if len(buffered) == 0 {
+		t.Fatal("expected replay tail after reconnect")
+	}
+	for _, raw := range buffered {
+		entry, _ := raw.(map[string]interface{})
+		seq, _ := entry["seq"].(float64)
+		if uint64(seq) <= lastSeenSeq {
+			t.Fatalf("replayed seq %d, want > %d", uint64(seq), lastSeenSeq)
+		}
+	}
+}
+
+func TestDaemon_ConversationOpen_ReplaysBufferedToolUpdatesAfterDisconnect(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	tmpDir := t.TempDir()
+	toolCmd := writeMockWrapperCommandWithEnv(t, filepath.Join(tmpDir, "mock-tool-disconnect.sh"), mockBin, map[string]string{
+		"MOCK_PROMPT_DELAY": "120",
+		"MOCK_TOOL_CALL":    "1",
+	})
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	conversationID, runtimeID, _ := createConversation(t, conn1, scanner1, 1, "/tmp", toolCmd, "ios-owner-1")
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1001,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": runtimeID,
+			"prompt":    []map[string]interface{}{{"type": "text", "text": "tool please"}},
+		},
+	})
+
+	var toolCallSeq uint64
+	for {
+		msg := readJSONWithScanner(t, scanner1)
+		if msg["method"] != "session/update" {
+			continue
+		}
+		params, _ := msg["params"].(map[string]interface{})
+		update, _ := params["update"].(map[string]interface{})
+		if update["sessionUpdate"] == "tool_call" {
+			seq, _ := params["__seq"].(float64)
+			toolCallSeq = uint64(seq)
+			break
+		}
+	}
+	conn1.Close()
+
+	time.Sleep(350 * time.Millisecond)
+
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	resp := openConversation(t, conn2, scanner2, 1, conversationID, "ios-owner-1", runtimeID, toolCallSeq)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.open error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
+	buffered, ok := attachment["bufferedEvents"].([]interface{})
+	if !ok {
+		t.Fatalf("expected bufferedEvents array, got %T", attachment["bufferedEvents"])
+	}
+	if len(buffered) == 0 {
+		t.Fatal("expected buffered tool updates after reconnect")
+	}
+
+	foundToolUpdate := false
+	for _, raw := range buffered {
+		entry, _ := raw.(map[string]interface{})
+		seq, _ := entry["seq"].(float64)
+		if uint64(seq) <= toolCallSeq {
+			continue
+		}
+		event, _ := entry["event"].(map[string]interface{})
+		params, _ := event["params"].(map[string]interface{})
+		update, _ := params["update"].(map[string]interface{})
+		if update["sessionUpdate"] == "tool_call_update" {
+			foundToolUpdate = true
+			break
+		}
+	}
+	if !foundToolUpdate {
+		t.Fatalf("expected buffered tool_call_update after seq %d, got %#v", toolCallSeq, buffered)
+	}
+}
+
 func TestDaemon_ConversationOpen_RejectsSecondOwner(t *testing.T) {
 	mockBin := findMockBin(t)
 	if mockBin == "" {
@@ -1085,6 +1250,269 @@ func TestDaemon_ConversationOpen_AllowsSameOwnerReclaim(t *testing.T) {
 	resp = openConversation(t, conn3, scanner3, 1, conversationID, "ios-app-2", runtimeID, 0)
 	if resp["error"] == nil {
 		t.Fatal("expected conversation.open rejection for different owner")
+	}
+}
+
+func TestDaemon_ConversationOpen_SameOwnerReclaimTransfersLiveStream(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	tmpDir := t.TempDir()
+	slowCmd := writeMockWrapperCommandWithEnv(t, filepath.Join(tmpDir, "mock-reclaim-live-stream.sh"), mockBin, map[string]string{
+		"MOCK_PROMPT_DELAY": "150",
+	})
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	defer conn1.Close()
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	conversationID, runtimeID, _ := createConversation(t, conn1, scanner1, 1, "/tmp", slowCmd, "ios-app-1")
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1001,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": runtimeID,
+			"prompt":    []map[string]interface{}{{"type": "text", "text": "handoff while running"}},
+		},
+	})
+
+	var firstSeq uint64
+	for {
+		msg := readJSONWithScanner(t, scanner1)
+		if msg["method"] != "session/update" {
+			continue
+		}
+		params, _ := msg["params"].(map[string]interface{})
+		seq, _ := params["__seq"].(float64)
+		firstSeq = uint64(seq)
+		break
+	}
+
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	resp := openConversation(t, conn2, scanner2, 1, conversationID, "ios-app-1", runtimeID, firstSeq)
+	if resp["error"] != nil {
+		t.Fatalf("client2 conversation.open with same owner should succeed: %v", resp["error"])
+	}
+
+	gotLiveNotification := false
+	for i := 0; i < 20; i++ {
+		msg := readJSONWithScanner(t, scanner2)
+		if msg["method"] != "session/update" {
+			continue
+		}
+		params, _ := msg["params"].(map[string]interface{})
+		seq, _ := params["__seq"].(float64)
+		if uint64(seq) <= firstSeq {
+			continue
+		}
+		gotRuntimeID, _ := params["runtimeId"].(string)
+		if gotRuntimeID != runtimeID {
+			t.Fatalf("live notification runtimeId = %q, want %q", gotRuntimeID, runtimeID)
+		}
+		gotConversationID, _ := params["conversationId"].(string)
+		if gotConversationID != conversationID {
+			t.Fatalf("live notification conversationId = %q, want %q", gotConversationID, conversationID)
+		}
+		gotLiveNotification = true
+		break
+	}
+	if !gotLiveNotification {
+		t.Fatal("expected reclaimed connection to receive live session/update notifications")
+	}
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "session/prompt",
+		"params": map[string]interface{}{
+			"sessionId": runtimeID,
+			"prompt":    []map[string]interface{}{{"type": "text", "text": "old-owner-should-fail"}},
+		},
+	})
+	resp = readResponseWithID(t, scanner1, 3)
+	if resp["error"] == nil {
+		t.Fatal("expected old connection prompt rejection after live reclaim")
+	}
+}
+
+func TestDaemon_ConversationCreate_DisconnectBeforeResponseLeavesManagedConversation(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/conversation.create",
+		"params": map[string]interface{}{
+			"cwd":     "/tmp",
+			"command": mockBin,
+			"ownerId": "ios-owner-1",
+		},
+	})
+	conn1.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn2, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "daemon/conversation.list",
+		"params":  map[string]interface{}{},
+	})
+	resp := readResponseWithID(t, scanner2, 2)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.list error: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	conversations := result["conversations"].([]interface{})
+	if len(conversations) != 1 {
+		t.Fatalf("expected exactly one managed conversation after lost create response, got %d", len(conversations))
+	}
+	conversation := conversations[0].(map[string]interface{})
+	conversationID := conversation["conversationId"].(string)
+	runtimeID := conversation["runtimeId"].(string)
+	if conversationID == "" || runtimeID == "" {
+		t.Fatalf("expected conversation/runtime ids, got %#v", conversation)
+	}
+	if conversationID != runtimeID {
+		t.Fatalf("newly created managed conversation should still have matching ids, got %#v", conversation)
+	}
+	if state := conversation["state"].(string); state != "ready" {
+		t.Fatalf("conversation state = %q, want %q", state, "ready")
+	}
+
+	resp = openConversation(t, conn2, scanner2, 3, conversationID, "ios-owner-1", runtimeID, 0)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.open after lost create response should succeed: %v", resp["error"])
+	}
+}
+
+func TestDaemon_ConversationOpen_DisconnectBeforeRestoreResponseReusesCreatedRuntime(t *testing.T) {
+	mockBin := findMockBin(t)
+	if mockBin == "" {
+		t.Skip("mock-acp-server binary not found")
+	}
+
+	tmpDir := t.TempDir()
+	slowCmd := writeMockWrapperCommandWithEnv(t, filepath.Join(tmpDir, "mock-open-response-lost.sh"), mockBin, map[string]string{
+		"MOCK_LIST_SESSIONS":     "external-open-lost",
+		"MOCK_LIST_OMIT_CREATED": "1",
+		"MOCK_PROMPT_DELAY":      "120",
+	})
+
+	t.Setenv("OPENCAN_DISCOVERY_COMMANDS", slowCmd)
+
+	d, sockPath := testDaemon(t)
+	defer d.Stop()
+
+	conn1 := connectToDaemon(t, sockPath)
+	scanner1 := bufio.NewScanner(conn1)
+	scanner1.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn1.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	sendJSON(conn1, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "daemon/conversation.open",
+		"params": map[string]interface{}{
+			"conversationId":   "external-open-lost",
+			"ownerId":          "ios-owner-1",
+			"preferredCommand": slowCmd,
+			"cwdHint":          "/tmp",
+		},
+	})
+	conn1.Close()
+
+	conn2 := connectToDaemon(t, sockPath)
+	defer conn2.Close()
+	scanner2 := bufio.NewScanner(conn2)
+	scanner2.Buffer(make([]byte, 1024*1024), 1024*1024)
+	conn2.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	var restoredRuntimeID string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		sendJSON(conn2, map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      2,
+			"method":  "daemon/logs",
+			"params":  map[string]interface{}{"count": 200},
+		})
+		resp := readResponseWithID(t, scanner2, 2)
+		if resp["error"] != nil {
+			t.Fatalf("daemon/logs error: %v", resp["error"])
+		}
+		entries := resp["result"].(map[string]interface{})["entries"].([]interface{})
+		for _, raw := range entries {
+			entry, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			message, _ := entry["message"].(string)
+			if !strings.Contains(message, "conversation restored from history") {
+				continue
+			}
+			attrs, _ := entry["attrs"].(map[string]interface{})
+			if attrs["conversationId"] != "external-open-lost" {
+				continue
+			}
+			if runtimeID, ok := attrs["runtimeId"].(string); ok && runtimeID != "" && runtimeID != "external-open-lost" {
+				restoredRuntimeID = runtimeID
+				break
+			}
+		}
+		if restoredRuntimeID != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if restoredRuntimeID == "" {
+		t.Fatal("expected lost open response to still complete restore and log a managed runtime id")
+	}
+
+	resp := openConversation(t, conn2, scanner2, 3, "external-open-lost", "ios-owner-1", restoredRuntimeID, 0)
+	if resp["error"] != nil {
+		t.Fatalf("conversation.open retry after lost response should succeed: %v", resp["error"])
+	}
+	result := resp["result"].(map[string]interface{})
+	attachment := result["attachment"].(map[string]interface{})
+	if gotRuntimeID := attachment["runtimeId"].(string); gotRuntimeID != restoredRuntimeID {
+		t.Fatalf("reopen runtimeId = %q, want %q", gotRuntimeID, restoredRuntimeID)
+	}
+	if reused, _ := attachment["reusedRuntime"].(bool); !reused {
+		t.Fatalf("expected reusedRuntime=true after retrying lost open response, got %#v", attachment)
+	}
+	if restored, _ := attachment["restoredFromHistory"].(bool); restored {
+		t.Fatalf("expected restoredFromHistory=false on retry reuse, got %#v", attachment)
 	}
 }
 

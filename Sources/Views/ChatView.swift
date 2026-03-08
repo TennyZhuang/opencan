@@ -12,7 +12,6 @@ struct ChatView: View {
             ChatMessageListView(
                 messages: appState.messages,
                 isPrompting: appState.isPrompting,
-                suspendAnimations: appState.suspendChatListAnimations,
                 contentVersion: appState.contentVersion,
                 forceScrollToken: forceScrollToken
             )

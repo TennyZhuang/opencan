@@ -121,7 +121,7 @@ actor ACPClient {
     }
 
     private func shouldLogRequestLifecycle(_ method: String) -> Bool {
-        method == ACPMethods.sessionLoad || method == ACPMethods.sessionPrompt
+        method == ACPMethods.sessionPrompt
     }
 
     private func injectTraceId(_ traceId: String?, into params: JSONValue?) -> JSONValue? {
@@ -189,20 +189,25 @@ actor ACPClient {
             if let id {
                 sentRequestIds.remove(id)
                 let method = pendingRequestMethods.removeValue(forKey: id)
+                let acpError = ACPError.rpcError(code: code, message: msg, data: data)
                 if let c = pendingRequests.removeValue(forKey: id) {
-                    c.resume(throwing: ACPError.rpcError(code: code, message: msg, data: data))
+                    c.resume(throwing: acpError)
                 }
                 if let method, shouldLogRequestLifecycle(method) {
+                    var extra: [String: String] = [
+                        "method": method,
+                        "requestId": "\(id)",
+                        "rpcCode": "\(code)",
+                        "rpcMessage": msg
+                    ]
+                    if let detail = acpError.details, !detail.isEmpty {
+                        extra["rpcDetail"] = detail
+                    }
                     Log.log(
                         level: "warning",
                         component: "ACPClient",
                         "received terminal error",
-                        extra: [
-                            "method": method,
-                            "requestId": "\(id)",
-                            "rpcCode": "\(code)",
-                            "rpcMessage": msg
-                        ]
+                        extra: extra
                     )
                 }
             }
@@ -284,7 +289,7 @@ enum ACPError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .rpcError(_, let message, let data):
-            if let details = data?["details"]?.stringValue, !details.isEmpty {
+            if let details = ACPError.bestDetail(from: data), !details.isEmpty {
                 return "ACP error: \(message) (\(details))"
             }
             return "ACP error: \(message)"
@@ -293,10 +298,11 @@ enum ACPError: Error, LocalizedError {
         }
     }
 
-    /// Server-provided detail field carried in JSON-RPC error.data.details.
+    /// Best-effort detail extracted from JSON-RPC error data.
+    /// Supports both structured `{"details": ...}` payloads and stringified JSON.
     var details: String? {
         guard case .rpcError(_, _, let data) = self else { return nil }
-        return data?["details"]?.stringValue
+        return ACPError.bestDetail(from: data)
     }
 
     /// JSON-RPC error code when this is an rpcError.
@@ -320,15 +326,6 @@ enum ACPError: Error, LocalizedError {
         matchesMessageOrDetails(phrase: "resource not found")
     }
 
-    /// `session/load` specific resource-missing signal.
-    /// Keep this narrower than generic `isResourceNotFound` to avoid unrelated
-    /// resource errors triggering takeover retries.
-    var isSessionLoadResourceNotFound: Bool {
-        guard case .rpcError(let code, _, _) = self else { return false }
-        guard code == -32002 || code == -32603 else { return false }
-        return isResourceNotFound
-    }
-
     /// True when the request was routed to a proxy we're not attached to.
     var isNotAttached: Bool {
         matchesMessageOrDetails(phrase: "not attached to session")
@@ -346,11 +343,22 @@ enum ACPError: Error, LocalizedError {
         matchesMessageOrDetails(phrase: "query closed before response received")
     }
 
+    /// True when upstream rejected the request due to temporary overload or rate limiting.
+    var isServiceOverloaded: Bool {
+        let combined = searchableText.lowercased()
+        return combined.contains("503 service unavailable")
+            || combined.contains("service unavailable")
+            || combined.contains("too many requests")
+            || combined.contains("rate limit")
+            || combined.contains("maximum sustainable qps")
+            || combined.contains("qps / tpm")
+            || combined.contains("qps/tpm")
+            || combined.contains("高峰")
+    }
+
     /// True when upstream model routing has no available backend provider.
     var isModelUnavailable: Bool {
-        guard case .rpcError(_, let message, let data) = self else { return false }
-        let details = data?["details"]?.stringValue ?? ""
-        let combined = "\(message) \(details)".lowercased()
+        let combined = searchableText.lowercased()
         return combined.contains("model_not_found")
             || combined.contains("no available distributor")
             || combined.contains("无可用渠道")
@@ -358,10 +366,22 @@ enum ACPError: Error, LocalizedError {
 
     /// Best-effort extraction of backend request id from nested provider errors.
     var backendRequestID: String? {
-        guard case .rpcError(_, let message, let data) = self else { return nil }
-        let details = data?["details"]?.stringValue ?? ""
-        let combined = "\(message) \(details)"
-        return ACPError.extractRequestID(from: combined)
+        ACPError.extractRequestID(from: searchableText)
+    }
+
+    /// Human-readable upstream explanation when available.
+    var summary: String? {
+        guard case .rpcError(_, _, let data) = self else { return nil }
+        return ACPError.bestDetail(from: data)
+    }
+
+    private var searchableText: String {
+        guard case .rpcError(_, let message, let data) = self else { return "" }
+        let detail = ACPError.bestDetail(from: data) ?? ""
+        if detail.isEmpty {
+            return message
+        }
+        return "\(message) \(detail)"
     }
 
     private static func extractRequestID(from text: String) -> String? {
@@ -385,10 +405,67 @@ enum ACPError: Error, LocalizedError {
     }
 
     private func matchesMessageOrDetails(phrase: String) -> Bool {
-        guard case .rpcError(_, let message, let data) = self else { return false }
-        let details = data?["details"]?.stringValue ?? ""
-        return ACPError.containsStandalonePhrase(phrase, in: message)
-            || ACPError.containsStandalonePhrase(phrase, in: details)
+        ACPError.containsStandalonePhrase(phrase, in: searchableText)
+    }
+
+    private static func bestDetail(from value: JSONValue?) -> String? {
+        guard let value else { return nil }
+        let candidates = detailCandidates(from: value)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        for candidate in candidates {
+            let normalized = candidate.lowercased()
+            if normalized != "internal error" && normalized != "null" {
+                return candidate
+            }
+        }
+        return candidates.first
+    }
+
+    private static func detailCandidates(from value: JSONValue) -> [String] {
+        switch value {
+        case .null:
+            return []
+        case .bool(let bool):
+            return [String(bool)]
+        case .int(let int):
+            return [String(int)]
+        case .double(let double):
+            return [String(double)]
+        case .array(let array):
+            return array.flatMap(detailCandidates)
+        case .object(let object):
+            var results: [String] = []
+            for key in ["details", "message", "error_description", "description"] {
+                if let nested = object[key] {
+                    results.append(contentsOf: detailCandidates(from: nested))
+                }
+            }
+            if let nestedError = object["error"] {
+                results.append(contentsOf: detailCandidates(from: nestedError))
+            }
+            if results.isEmpty {
+                results.append(contentsOf: object.values.flatMap(detailCandidates))
+            }
+            return results
+        case .string(let string):
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return [] }
+            if let nested = parseEmbeddedJSON(trimmed) {
+                let nestedResults = detailCandidates(from: nested)
+                if !nestedResults.isEmpty {
+                    return nestedResults + [trimmed]
+                }
+            }
+            return [trimmed]
+        }
+    }
+
+    private static func parseEmbeddedJSON(_ text: String) -> JSONValue? {
+        guard text.first == "{" || text.first == "[" else { return nil }
+        guard let data = text.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(JSONValue.self, from: data)
     }
 
     private static func containsStandalonePhrase(_ phrase: String, in text: String) -> Bool {

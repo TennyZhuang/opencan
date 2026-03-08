@@ -3,16 +3,22 @@ import SwiftData
 
 @Model
 final class Session {
-    var sessionId: String
-    /// Stable logical conversation identity. For newly created conversations it
-    /// typically matches `sessionId`; after daemon restore it keeps the original
-    /// history ID while `sessionId` tracks the current runtime.
-    var conversationId: String?
-    /// Original history session ID when this local record represents a managed
-    /// takeover of an external ACP session.
-    var canonicalSessionId: String?
-    /// CWD used to load `sessionId` from disk.
-    var sessionCwd: String?
+    @Attribute(originalName: "sessionId")
+    var runtimeId: String
+
+    /// Durable conversation identity. Backed by the historical `conversationId` column,
+    /// with a one-time fallback from `canonicalSessionId` for migrated installs.
+    @Attribute(originalName: "conversationId")
+    var persistedConversationId: String?
+
+    /// Migration-only fallback for older installs that persisted the stable identity
+    /// under `canonicalSessionId`. New writes clear this field.
+    @Attribute(originalName: "canonicalSessionId")
+    var legacyCanonicalConversationId: String?
+
+    @Attribute(originalName: "sessionCwd")
+    var conversationCwd: String?
+
     var createdAt: Date
     var lastUsedAt: Date
     var title: String?
@@ -24,18 +30,17 @@ final class Session {
     var workspace: Workspace?
 
     init(
-        sessionId: String,
+        runtimeId: String,
         conversationId: String? = nil,
-        canonicalSessionId: String? = nil,
-        sessionCwd: String? = nil,
+        conversationCwd: String? = nil,
         agentID: String? = nil,
         agentCommand: String? = nil,
         workspace: Workspace? = nil
     ) {
-        self.sessionId = sessionId
-        self.conversationId = conversationId
-        self.canonicalSessionId = canonicalSessionId
-        self.sessionCwd = sessionCwd
+        self.runtimeId = runtimeId
+        self.persistedConversationId = Self.normalizedIdentity(conversationId)
+        self.legacyCanonicalConversationId = nil
+        self.conversationCwd = conversationCwd
         self.createdAt = Date()
         self.lastUsedAt = Date()
         self.agentID = agentID
@@ -43,13 +48,22 @@ final class Session {
         self.workspace = workspace
     }
 
-    var stableConversationId: String {
-        if let conversationId = conversationId?.trimmingCharacters(in: .whitespacesAndNewlines), !conversationId.isEmpty {
-            return conversationId
+    var conversationId: String {
+        get {
+            Self.normalizedIdentity(persistedConversationId)
+                ?? Self.normalizedIdentity(legacyCanonicalConversationId)
+                ?? runtimeId
         }
-        if let canonicalSessionId = canonicalSessionId?.trimmingCharacters(in: .whitespacesAndNewlines), !canonicalSessionId.isEmpty {
-            return canonicalSessionId
+        set {
+            persistedConversationId = Self.normalizedIdentity(newValue) ?? runtimeId
+            legacyCanonicalConversationId = nil
         }
-        return sessionId
+    }
+
+    private static func normalizedIdentity(_ rawValue: String?) -> String? {
+        guard let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 }

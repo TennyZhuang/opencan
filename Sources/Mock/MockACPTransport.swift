@@ -28,23 +28,19 @@ actor MockACPTransport: ACPTransport {
     /// Optional one-shot attach error injected for the next `daemon/conversation.open`.
     var nextAttachError: (code: Int, message: String, data: JSONValue?)?
 
-    /// Steps to stream during session/load (simulates history replay).
-    var mockLoadSteps: [MockStep] = []
-    /// Session IDs that should fail on session/load (simulates load errors).
-    var mockLoadFailSessionIDs: Set<String> = []
-    /// Specific (sessionId, cwd) pairs that should fail on session/load.
-    /// Format: "\(sessionId)|\(cwd)".
-    var mockLoadFailSessionCwdPairs: Set<String> = []
-    /// If true, session/load receives no response (simulates upstream hang).
-    var mockLoadShouldHang = false
-    /// Optional one-shot error injected for the next session/load request.
-    var nextLoadError: (code: Int, message: String, data: JSONValue?)?
-    /// Tracks the most recent session/load params for assertions.
-    var lastLoadSessionId: String?
-    var lastLoadCwd: String?
+    /// Steps to stream during daemon restore replay (simulates history replay).
+    var mockRestoreSteps: [MockStep] = []
+    /// Conversation IDs that should fail during daemon-managed restore replay.
+    var mockRestoreFailConversationIDs: Set<String> = []
+    /// Specific (conversationId, cwd) pairs that should fail during daemon restore replay.
+    /// Format: "\(conversationId)|\(cwd)".
+    var mockRestoreFailConversationCwdPairs: Set<String> = []
+    /// Optional one-shot error injected for the next daemon-managed restore.
+    var nextRestoreError: (code: Int, message: String, data: JSONValue?)?
     /// Tracks the most recent `daemon/conversation.create` parameters.
     var lastCreateCwd: String?
     var lastCreateCommand: String?
+    var lastCreateOwnerId: String?
     /// Tracks all `daemon/conversation.create` commands in order.
     var createCommands: [String] = []
     /// Tracks the most recent `daemon/conversation.open` params.
@@ -53,6 +49,7 @@ actor MockACPTransport: ACPTransport {
     /// Tracks the most recent daemon/conversation.open params.
     var lastOpenConversationId: String?
     var lastOpenLastRuntimeId: String?
+    var lastOpenOwnerId: String?
     /// Tracks the most recent session/prompt content blocks.
     var lastPromptSessionId: String?
     var lastPromptBlocks: [JSONValue]?
@@ -145,6 +142,7 @@ actor MockACPTransport: ACPTransport {
         case DaemonMethods.conversationCreate:
             lastCreateCwd = params?["cwd"]?.stringValue
             lastCreateCommand = params?["command"]?.stringValue
+            lastCreateOwnerId = params?["ownerId"]?.stringValue
             if let cmd = lastCreateCommand {
                 createCommands.append(cmd)
             }
@@ -187,6 +185,7 @@ actor MockACPTransport: ACPTransport {
             let cwdHint = params?["cwdHint"]?.stringValue ?? ""
             lastOpenConversationId = conversationId
             lastOpenLastRuntimeId = params?["lastRuntimeId"]?.stringValue
+            lastOpenOwnerId = params?["ownerId"]?.stringValue
 
             var conversation = conversationValue(for: conversationId)
             if conversation == nil {
@@ -262,20 +261,20 @@ actor MockACPTransport: ACPTransport {
 
             let runtimeId = "mock-sess-\(UUID().uuidString.prefix(8))"
             let command = preferredCommand ?? conversation["command"]?.stringValue
-            if let nextLoadError {
-                self.nextLoadError = nil
+            if let nextRestoreError {
+                self.nextRestoreError = nil
                 messageContinuation.yield(
                     .error(
                         id: id,
-                        code: nextLoadError.code,
-                        message: nextLoadError.message,
-                        data: nextLoadError.data
+                        code: nextRestoreError.code,
+                        message: nextRestoreError.message,
+                        data: nextRestoreError.data
                     )
                 )
                 return
             }
-            let failSessionIDs = mockLoadFailSessionIDs
-            let failSessionCwdPairs = mockLoadFailSessionCwdPairs
+            let failSessionIDs = mockRestoreFailConversationIDs
+            let failSessionCwdPairs = mockRestoreFailConversationCwdPairs
             let requestedCwd = conversation["cwd"]?.stringValue ?? cwdHint
             let failKey = "\(conversationId)|\(requestedCwd)"
             if failSessionIDs.contains(conversationId) || failSessionCwdPairs.contains(failKey) {
@@ -286,7 +285,7 @@ actor MockACPTransport: ACPTransport {
                 )
                 return
             }
-            let bufferedArr = bufferedEventsFromLoadSteps(sessionId: conversationId, runtimeId: runtimeId, conversationId: conversationId)
+            let bufferedArr = bufferedEventsFromRestoreSteps(sessionId: conversationId, runtimeId: runtimeId, conversationId: conversationId)
             let restoredConversation = makeConversationValue(
                 conversationId: conversationId,
                 runtimeId: runtimeId,
@@ -377,40 +376,6 @@ actor MockACPTransport: ACPTransport {
                 sendResponse: !mockDropPromptResponse
             )
 
-        case ACPMethods.sessionLoad:
-            let sessionId = params?["sessionId"]?.stringValue ?? mockSessionId ?? "unknown"
-            let cwd = params?["cwd"]?.stringValue ?? ""
-            lastLoadSessionId = sessionId
-            lastLoadCwd = cwd
-            if mockLoadShouldHang {
-                return
-            }
-            if let nextLoadError {
-                self.nextLoadError = nil
-                messageContinuation.yield(
-                    .error(
-                        id: id,
-                        code: nextLoadError.code,
-                        message: nextLoadError.message,
-                        data: nextLoadError.data
-                    )
-                )
-                return
-            }
-            let failSessionIDs = mockLoadFailSessionIDs
-            let failSessionCwdPairs = mockLoadFailSessionCwdPairs
-            let steps = mockLoadSteps
-            let failKey = "\(sessionId)|\(cwd)"
-            if failSessionIDs.contains(sessionId) || failSessionCwdPairs.contains(failKey) {
-                messageContinuation.yield(
-                    .error(id: id, code: -32603, message: "Internal error", data: .object([
-                        "details": .string("Session not found")
-                    ]))
-                )
-                return
-            }
-            await streamLoadHistory(requestId: id, sessionId: sessionId, steps: steps)
-
         default:
             messageContinuation.yield(
                 .error(id: id, code: -32601, message: "Method not found: \(method)", data: nil)
@@ -434,23 +399,6 @@ actor MockACPTransport: ACPTransport {
         guard sendResponse else { return }
         let result: JSONValue = .object([
             "stopReason": .string("end_turn")
-        ])
-        messageContinuation.yield(.response(id: requestId, result: result))
-    }
-
-    /// Stream history events during session/load, then return response.
-    private func streamLoadHistory(
-        requestId: JSONRPCMessage.JSONRPCID,
-        sessionId: String,
-        steps: [MockStep]
-    ) async {
-        for step in steps {
-            guard !isClosed else { return }
-            await executeStep(step, sessionId: sessionId)
-        }
-
-        let result: JSONValue = .object([
-            "sessionId": .string(sessionId)
         ])
         messageContinuation.yield(.response(id: requestId, result: result))
     }
@@ -671,14 +619,14 @@ actor MockACPTransport: ACPTransport {
         }
     }
 
-    private func bufferedEventsFromLoadSteps(
+    private func bufferedEventsFromRestoreSteps(
         sessionId: String,
         runtimeId: String,
         conversationId: String
     ) -> [JSONValue] {
         var events: [JSONValue] = []
         var seq = 0
-        for step in mockLoadSteps {
+        for step in mockRestoreSteps {
             let update: JSONValue?
             switch step {
             case .delay:
@@ -826,24 +774,20 @@ actor MockACPTransport: ACPTransport {
         self.mockConversationList = list
     }
 
-    func setMockLoadSteps(_ steps: [MockStep]) {
-        self.mockLoadSteps = steps
+    func setMockRestoreSteps(_ steps: [MockStep]) {
+        self.mockRestoreSteps = steps
     }
 
-    func setMockLoadFailSessionIDs(_ ids: Set<String>) {
-        self.mockLoadFailSessionIDs = ids
+    func setMockRestoreFailConversationIDs(_ ids: Set<String>) {
+        self.mockRestoreFailConversationIDs = ids
     }
 
-    func setMockLoadFailSessionCwdPairs(_ pairs: Set<String>) {
-        self.mockLoadFailSessionCwdPairs = pairs
+    func setMockRestoreFailConversationCwdPairs(_ pairs: Set<String>) {
+        self.mockRestoreFailConversationCwdPairs = pairs
     }
 
-    func setNextLoadError(code: Int, message: String, data: JSONValue?) {
-        nextLoadError = (code: code, message: message, data: data)
-    }
-
-    func setMockLoadShouldHang(_ shouldHang: Bool) {
-        mockLoadShouldHang = shouldHang
+    func setNextRestoreError(code: Int, message: String, data: JSONValue?) {
+        nextRestoreError = (code: code, message: message, data: data)
     }
 
     func setMockAgentAvailabilityByID(_ availability: [String: Bool]) {
@@ -854,16 +798,12 @@ actor MockACPTransport: ACPTransport {
         self.mockAgentProbeUnsupported = unsupported
     }
 
-    func getLastLoadSessionId() -> String? {
-        lastLoadSessionId
-    }
-
-    func getLastLoadCwd() -> String? {
-        lastLoadCwd
-    }
-
     func getLastCreateCommand() -> String? {
         lastCreateCommand
+    }
+
+    func getLastCreateOwnerId() -> String? {
+        lastCreateOwnerId
     }
 
     func getLastCreateCwd() -> String? {
@@ -880,6 +820,18 @@ actor MockACPTransport: ACPTransport {
 
     func getLastAttachLastEventSeq() -> UInt64? {
         lastAttachLastEventSeq
+    }
+
+    func getLastOpenConversationId() -> String? {
+        lastOpenConversationId
+    }
+
+    func getLastOpenLastRuntimeId() -> String? {
+        lastOpenLastRuntimeId
+    }
+
+    func getLastOpenOwnerId() -> String? {
+        lastOpenOwnerId
     }
 
     func getLastPromptBlocks() -> [JSONValue]? {
