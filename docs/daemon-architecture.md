@@ -133,11 +133,11 @@ When iOS opens a conversation:
 2. if yes, daemon reattaches and replays buffered events after `lastEventSeq`
 3. if not, daemon discovers loadable ACP history entries
 4. daemon creates a fresh runtime
-5. daemon issues `session/load` itself
+5. daemon performs daemon-owned history restore inside the new runtime
 6. daemon binds `conversationId -> runtimeId`
 7. daemon returns the new runtime attachment to iOS
 
-iOS no longer orchestrates `session/load` fallback itself.
+iOS no longer orchestrates restore fallback itself.
 
 ## Request Routing Invariant
 
@@ -145,7 +145,7 @@ Managed attachment and buffered replay are runtime-oriented, but upstream ACP re
 
 - iOS opens and reopens conversations through daemon-owned `runtimeId` attachments.
 - The daemon may recreate a fresh runtime for an existing `conversationId`.
-- When forwarding ACP calls like `session/prompt` and `session/load`, the daemon must rewrite the upstream ACP `sessionId` to the stable `conversationId` whenever it differs from the live `runtimeId`.
+- When forwarding ACP calls like `session/prompt`, the daemon must preserve the stable `conversationId` even when the live runtime uses a different `runtimeId`; daemon-owned restore requests must follow the same rule internally.
 - Failing to do this breaks restored conversations: the UI can replay history correctly while the underlying agent sees an empty context.
 
 This is a regression boundary, not an implementation detail.

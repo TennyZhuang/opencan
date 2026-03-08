@@ -121,7 +121,6 @@ struct DiagnosticView: View {
                 keyValueRow("activeWorkspace", appState.activeWorkspace?.name ?? "nil")
                 keyValueRow("currentSessionId", appState.currentSessionId ?? "nil")
                 keyValueRow("isPrompting", appState.isPrompting ? "true" : "false")
-                keyValueRow("isLoadingHistory", appState.isLoadingHistory ? "true" : "false")
                 keyValueRow("messages.count", "\(appState.messages.count)")
 
                 Section("daemonSessions") {
@@ -177,7 +176,6 @@ struct DiagnosticView: View {
             let activeWorkspace: String?
             let currentSessionId: String?
             let isPrompting: Bool
-            let isLoadingHistory: Bool
             let messageCount: Int
             let daemonSessions: [DaemonSessionInfo]
         }
@@ -199,7 +197,6 @@ struct DiagnosticView: View {
                 activeWorkspace: appState.activeWorkspace?.name,
                 currentSessionId: appState.currentSessionId,
                 isPrompting: appState.isPrompting,
-                isLoadingHistory: appState.isLoadingHistory,
                 messageCount: appState.messages.count,
                 daemonSessions: appState.daemonSessions
             )

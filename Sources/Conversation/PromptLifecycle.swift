@@ -3,7 +3,6 @@ import Foundation
 @MainActor
 protocol PromptLifecycleAppState: AnyObject {
     var isPrompting: Bool { get set }
-    var isLoadingHistory: Bool { get }
     var currentSessionId: String? { get set }
     var forceScrollToBottom: Bool { get set }
     var messages: [ChatMessage] { get set }

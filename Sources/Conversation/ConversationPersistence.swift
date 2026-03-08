@@ -43,12 +43,12 @@ enum ConversationPersistence {
     }
 
     static func resolveConversationID(
-        forLegacySessionID sessionId: String,
+        forSessionOrRuntimeID sessionOrRuntimeId: String,
         daemonConversations: [DaemonConversationInfo],
         modelContext: ModelContext
     ) -> String {
-        let trimmedSessionID = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedSessionID.isEmpty else { return sessionId }
+        let trimmedSessionID = sessionOrRuntimeId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSessionID.isEmpty else { return sessionOrRuntimeId }
 
         if let conversation = daemonConversations.first(where: { $0.conversationId == trimmedSessionID }) {
             return conversation.conversationId
@@ -60,10 +60,10 @@ enum ConversationPersistence {
         let descriptor = FetchDescriptor<Session>()
         let sessions = (try? modelContext.fetch(descriptor)) ?? []
         if let local = sessions
-            .filter({ $0.sessionId == trimmedSessionID || $0.stableConversationId == trimmedSessionID })
+            .filter({ $0.runtimeId == trimmedSessionID || $0.conversationId == trimmedSessionID })
             .sorted(by: { $0.lastUsedAt > $1.lastUsedAt })
             .first {
-            return local.stableConversationId
+            return local.conversationId
         }
 
         return trimmedSessionID
@@ -78,21 +78,17 @@ enum ConversationPersistence {
         let descriptor = FetchDescriptor<Session>()
         let sessions = (try? modelContext.fetch(descriptor)) ?? []
         return sessions
-            .filter { $0.stableConversationId == trimmedConversationID }
+            .filter { $0.conversationId == trimmedConversationID }
             .sorted { $0.lastUsedAt > $1.lastUsedAt }
             .first
     }
 
     static func backfillConversationIdentity(_ session: Session, conversationId: String? = nil) {
-        let resolvedConversationID = (conversationId ?? session.stableConversationId)
+        let resolvedConversationID = (conversationId ?? session.conversationId)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !resolvedConversationID.isEmpty else { return }
-        if session.conversationId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+        if session.conversationId != resolvedConversationID {
             session.conversationId = resolvedConversationID
-        }
-        if resolvedConversationID != session.sessionId,
-           session.canonicalSessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
-            session.canonicalSessionId = resolvedConversationID
         }
     }
 
@@ -106,10 +102,9 @@ enum ConversationPersistence {
         let conversationId = result.conversation.conversationId
         let runtimeId = result.attachment.runtimeId
         let session = Session(
-            sessionId: runtimeId,
+            runtimeId: runtimeId,
             conversationId: conversationId,
-            canonicalSessionId: conversationId == runtimeId ? nil : conversationId,
-            sessionCwd: workspace.path,
+            conversationCwd: workspace.path,
             agentID: agentID,
             agentCommand: command,
             workspace: workspace
@@ -129,7 +124,7 @@ enum ConversationPersistence {
     ) -> Session {
         let runtimeId = result.attachment.runtimeId
         let resolvedCwd = (!result.conversation.cwd.isEmpty ? result.conversation.cwd : nil)
-            ?? existingSession?.sessionCwd
+            ?? existingSession?.conversationCwd
             ?? workspace.path
         let resolvedCommand = normalizeAgentCommand(
             existingSession?.agentCommand,
@@ -138,12 +133,9 @@ enum ConversationPersistence {
 
         let persistedSession: Session
         if let existingSession {
-            existingSession.sessionId = runtimeId
+            existingSession.runtimeId = runtimeId
             existingSession.conversationId = conversationId
-            if conversationId != runtimeId, existingSession.canonicalSessionId == nil {
-                existingSession.canonicalSessionId = conversationId
-            }
-            existingSession.sessionCwd = resolvedCwd
+            existingSession.conversationCwd = resolvedCwd
             existingSession.agentID = existingSession.agentID ?? sessionAgent.id
             existingSession.agentCommand = resolvedCommand
             existingSession.lastUsedAt = Date()
@@ -151,10 +143,9 @@ enum ConversationPersistence {
             persistedSession = existingSession
         } else {
             let session = Session(
-                sessionId: runtimeId,
+                runtimeId: runtimeId,
                 conversationId: conversationId,
-                canonicalSessionId: conversationId == runtimeId ? nil : conversationId,
-                sessionCwd: resolvedCwd,
+                conversationCwd: resolvedCwd,
                 agentID: sessionAgent.id,
                 agentCommand: resolvedCommand,
                 workspace: workspace
@@ -174,7 +165,7 @@ enum ConversationPersistence {
         command: String?,
         daemonConversations: inout [DaemonConversationInfo]
     ) {
-        let resolvedCwd = session?.sessionCwd ?? session?.workspace?.path ?? fallbackCwd
+        let resolvedCwd = session?.conversationCwd ?? session?.workspace?.path ?? fallbackCwd
         let resolvedCommand = normalizeOptionalAgentCommand(command) ?? session?.agentCommand
         let conversation = DaemonConversationInfo(
             conversationId: conversationId,

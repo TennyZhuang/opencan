@@ -56,7 +56,7 @@ enum ConversationLifecycle {
     @MainActor
     static func openSession(
         appState: ConversationLifecycleAppState,
-        sessionId conversationId: String,
+        conversationId: String,
         modelContext: ModelContext
     ) async throws {
         guard let daemon = appState.daemonClientForLifecycle,
@@ -70,7 +70,7 @@ enum ConversationLifecycle {
             modelContext: modelContext
         )
         let daemonConversation = appState.daemonConversations.first { $0.conversationId == conversationId }
-        let currentConversationId = appState.activeSession?.stableConversationId
+        let currentConversationId = appState.activeSession?.conversationId
         let sessionAgent = appState.lifecycleResolveSessionAgent(
             storedAgentID: existingSession?.agentID,
             storedAgentCommand: existingSession?.agentCommand,
@@ -78,13 +78,13 @@ enum ConversationLifecycle {
         )
 
         if currentConversationId == conversationId,
-           let activeRuntimeId = appState.activeSession?.sessionId,
+           let activeRuntimeId = appState.activeSession?.runtimeId,
            appState.currentSessionId == activeRuntimeId,
            !appState.messages.isEmpty {
             if let existingSession {
                 appState.lifecycleBackfillConversationIdentity(existingSession, conversationId: conversationId)
                 existingSession.lastUsedAt = Date()
-                existingSession.sessionCwd = daemonConversation?.cwd ?? existingSession.sessionCwd ?? workspace.path
+                existingSession.conversationCwd = daemonConversation?.cwd ?? existingSession.conversationCwd ?? workspace.path
                 existingSession.agentID = existingSession.agentID ?? sessionAgent.id
                 existingSession.agentCommand = appState.lifecycleNormalizeAgentCommand(
                     existingSession.agentCommand,
@@ -108,9 +108,9 @@ enum ConversationLifecycle {
             guard let previousSessionId else { return 0 }
             return appState.lastEventSeqByRuntimeIDForLifecycle[previousSessionId] ?? 0
         }()
-        let lastRuntimeId = daemonConversation?.runtimeId ?? existingSession?.sessionId
+        let lastRuntimeId = daemonConversation?.runtimeId ?? existingSession?.runtimeId
         let desiredAttachSeq = lastRuntimeId.flatMap { appState.lastEventSeqByRuntimeIDForLifecycle[$0] } ?? 0
-        let cwdHint = daemonConversation?.cwd ?? existingSession?.sessionCwd ?? workspace.path
+        let cwdHint = daemonConversation?.cwd ?? existingSession?.conversationCwd ?? workspace.path
 
         Log.log(
             component: "ConversationLifecycle",
@@ -125,7 +125,7 @@ enum ConversationLifecycle {
                 "desiredAttachSeq": String(desiredAttachSeq),
                 "daemonConversationRuntimeId": daemonConversation?.runtimeId ?? "",
                 "daemonConversationState": daemonConversation?.state ?? "",
-                "localRuntimeId": existingSession?.sessionId ?? "",
+                "localRuntimeId": existingSession?.runtimeId ?? "",
                 "cwdHint": cwdHint,
                 "preferredCommand": sessionAgent.command,
                 "ownerId": appState.daemonAttachClientIDForLifecycle
@@ -166,7 +166,7 @@ enum ConversationLifecycle {
                 previousSessionId: previousSessionId,
                 previousSessionAttachSeq: previousSessionAttachSeq,
                 previousCommand: appState.activeSession?.agentCommand,
-                previousCwd: appState.activeSession?.sessionCwd,
+                previousCwd: appState.activeSession?.conversationCwd,
                 failedTargetConversationId: conversationId,
                 daemon: daemon,
                 traceId: traceId
@@ -214,7 +214,7 @@ enum ConversationLifecycle {
             sessionAgent: sessionAgent,
             modelContext: modelContext
         )
-        let resolvedCwd = persistedSession.sessionCwd ?? workspace.path
+        let resolvedCwd = persistedSession.conversationCwd ?? workspace.path
         let resolvedCommand = persistedSession.agentCommand
         appState.activeSession = persistedSession
 
@@ -243,8 +243,8 @@ enum ConversationLifecycle {
                 "bufferedEventCount": String(result.attachment.bufferedEvents.count),
                 "resolvedCwd": resolvedCwd,
                 "resolvedCommand": resolvedCommand ?? "",
-                "activeSessionConversationId": appState.activeSession?.stableConversationId ?? "",
-                "activeSessionRuntimeId": appState.activeSession?.sessionId ?? "",
+                "activeSessionConversationId": appState.activeSession?.conversationId ?? "",
+                "activeSessionRuntimeId": appState.activeSession?.runtimeId ?? "",
                 "currentSessionId": appState.currentSessionId ?? ""
             ]
         )
@@ -262,9 +262,9 @@ enum ConversationLifecycle {
         guard !appState.isAutoReconnectInProgressForLifecycle else { return }
         guard appState.connectionStatus == .disconnected || appState.connectionStatus == .failed else { return }
         guard let node = appState.activeNode else { return }
-        let recoveryTargetId = appState.activeSession?.stableConversationId
+        let recoveryTargetId = appState.activeSession?.conversationId
             ?? appState.currentSessionId
-            ?? appState.activeSession?.sessionId
+            ?? appState.activeSession?.runtimeId
         guard let sessionId = recoveryTargetId else { return }
         guard let workspace = appState.activeWorkspace ?? appState.activeSession?.workspace else { return }
 
@@ -305,7 +305,7 @@ enum ConversationLifecycle {
             if let openHandler = appState.autoReconnectOpenHandler {
                 try await openHandler(sessionId, modelContext)
             } else {
-                try await openSession(appState: appState, sessionId: sessionId, modelContext: modelContext)
+                try await openSession(appState: appState, conversationId: sessionId, modelContext: modelContext)
             }
             appState.connectionError = nil
             appState.shouldAutoReconnectInterruptedSessionForLifecycle = false
@@ -395,10 +395,10 @@ enum ConversationLifecycle {
             appState.currentSessionId = restoredRuntimeId
             appState.lastEventSeqByRuntimeIDForLifecycle[restoredRuntimeId] = restored.attachment.bufferedEvents.last?.seq ?? previousSessionAttachSeq
             if let activeSession = appState.activeSession,
-               activeSession.stableConversationId == previousConversationId {
-                activeSession.sessionId = restoredRuntimeId
-                activeSession.sessionCwd = restored.conversation.cwd.isEmpty
-                    ? (activeSession.sessionCwd ?? previousCwd)
+               activeSession.conversationId == previousConversationId {
+                activeSession.runtimeId = restoredRuntimeId
+                activeSession.conversationCwd = restored.conversation.cwd.isEmpty
+                    ? (activeSession.conversationCwd ?? previousCwd)
                     : restored.conversation.cwd
             }
             appState.lifecycleUpsertDaemonConversationSnapshot(restored.conversation)

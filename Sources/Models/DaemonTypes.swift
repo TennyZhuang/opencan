@@ -105,10 +105,8 @@ struct DaemonBufferedEvent {
 }
 
 /// Merged view of a daemon conversation row and/or a local SwiftData cache.
-/// App-facing code should prefer `conversationId`; `sessionId` remains as a
-/// compatibility alias for older tests and call sites.
 struct UnifiedSession: Identifiable {
-    let sessionId: String
+    let conversationId: String
     let runtimeId: String?
     let daemonState: String?   // nil = local-only cache row
     let cwd: String?
@@ -120,14 +118,13 @@ struct UnifiedSession: Identifiable {
     let agentID: String?
     let agentCommand: String?
     let hasLocalRecord: Bool
-    var id: String { sessionId }
+    var id: String { conversationId }
 
-    var conversationId: String { sessionId }
     var effectiveLastUsedAt: Date? { lastUsedAt ?? daemonUpdatedAt }
     var effectiveRuntimeId: String? { runtimeId }
 
     init(
-        sessionId: String,
+        conversationId: String,
         runtimeId: String? = nil,
         daemonState: String?,
         cwd: String?,
@@ -140,7 +137,7 @@ struct UnifiedSession: Identifiable {
         agentCommand: String?,
         hasLocalRecord: Bool = false
     ) {
-        self.sessionId = sessionId
+        self.conversationId = conversationId
         self.runtimeId = runtimeId
         self.daemonState = daemonState
         self.cwd = cwd
