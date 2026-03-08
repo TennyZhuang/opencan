@@ -179,7 +179,6 @@ final class ACPClientTests: XCTestCase {
             data: nil
         )
         XCTAssertTrue(resourceNotFound.isResourceNotFound)
-        XCTAssertTrue(resourceNotFound.isSessionLoadResourceNotFound)
 
         let falsePositive = ACPError.rpcError(
             code: -32002,
@@ -187,16 +186,6 @@ final class ACPClientTests: XCTestCase {
             data: .object(["details": .string("resource not foundry artifact")])
         )
         XCTAssertFalse(falsePositive.isResourceNotFound)
-    }
-
-    func testACPErrorSessionLoadResourceNotFoundIsCodeScoped() {
-        let nonLoadResourceError = ACPError.rpcError(
-            code: -32000,
-            message: "Resource not found",
-            data: nil
-        )
-        XCTAssertTrue(nonLoadResourceError.isResourceNotFound)
-        XCTAssertFalse(nonLoadResourceError.isSessionLoadResourceNotFound)
     }
 
     func testACPErrorExtractsSummaryFromStringifiedJSONData() {

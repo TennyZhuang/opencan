@@ -121,7 +121,7 @@ actor ACPClient {
     }
 
     private func shouldLogRequestLifecycle(_ method: String) -> Bool {
-        method == ACPMethods.sessionLoad || method == ACPMethods.sessionPrompt
+        method == ACPMethods.sessionPrompt
     }
 
     private func injectTraceId(_ traceId: String?, into params: JSONValue?) -> JSONValue? {
@@ -324,15 +324,6 @@ enum ACPError: Error, LocalizedError {
     /// True when upstream reports the requested history/session resource is missing.
     var isResourceNotFound: Bool {
         matchesMessageOrDetails(phrase: "resource not found")
-    }
-
-    /// `session/load` specific resource-missing signal.
-    /// Keep this narrower than generic `isResourceNotFound` to avoid unrelated
-    /// resource errors triggering takeover retries.
-    var isSessionLoadResourceNotFound: Bool {
-        guard case .rpcError(let code, _, _) = self else { return false }
-        guard code == -32002 || code == -32603 else { return false }
-        return isResourceNotFound
     }
 
     /// True when the request was routed to a proxy we're not attached to.

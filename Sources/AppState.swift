@@ -66,10 +66,6 @@ final class AppState {
     var currentSessionId: String?
     var isPrompting = false
     var isCreatingSession = false
-    /// True while replaying history via session/load — suppresses streaming UI.
-    var isLoadingHistory = false
-    /// Suspend chat list row animations while replaying history.
-    var suspendChatListAnimations: Bool { isLoadingHistory }
     /// Incremented (debounced) when chat content changes. The view
     /// auto-scrolls only if the user is already near the bottom.
     var contentVersion = 0
@@ -151,7 +147,7 @@ final class AppState {
     // MARK: - Connection
 
     /// Connect to a node via SSH and the daemon.
-    /// After this, set activeWorkspace and call createNewSession() or openSession() to start chatting.
+    /// After this, set activeWorkspace and call createNewSession() or openSession(conversationId:) to start chatting.
     /// If already connected, tears down the old connection first.
     func connect(node: Node, isAutoReconnect: Bool = false) {
         if connectionStatus == .connected || connectionStatus == .connecting {
@@ -548,10 +544,10 @@ final class AppState {
 
     /// Open a stable conversation from SessionPicker, reusing an existing
     /// runtime when available or restoring it into a fresh daemon runtime.
-    func openSession(sessionId conversationId: String, modelContext: ModelContext) async throws {
+    func openSession(conversationId: String, modelContext: ModelContext) async throws {
         try await ConversationLifecycle.openSession(
             appState: self,
-            sessionId: conversationId,
+            conversationId: conversationId,
             modelContext: modelContext
         )
     }
@@ -577,7 +573,7 @@ final class AppState {
             activeWorkspace = activeSession?.workspace
         }
         if currentSessionId == nil {
-            currentSessionId = activeSession?.sessionId
+            currentSessionId = activeSession?.runtimeId
         }
 
         connectionError = errorMessage
@@ -607,7 +603,6 @@ final class AppState {
         isPrompting = false
         PromptLifecycle.clearAllPromptActivity(appState: self)
         isCreatingSession = false
-        isLoadingHistory = false
         isUploadingImage = false
         isRefreshingDaemonSessions = false
         availableNodeAgents = []
@@ -792,8 +787,8 @@ final class AppState {
             sessionId: sessionId,
             extra: [
                 "promptSessionId": sessionId,
-                "activeConversationId": activeSession?.stableConversationId ?? "",
-                "activeRuntimeId": activeSession?.sessionId ?? "",
+                "activeConversationId": activeSession?.conversationId ?? "",
+                "activeRuntimeId": activeSession?.runtimeId ?? "",
                 "currentSessionId": currentSessionId ?? "",
                 "resourceLinkCount": String(referencedMentions.count)
             ]
@@ -875,13 +870,13 @@ final class AppState {
         guard let session = activeSession else { return }
         guard shouldDiscardEmptySession(session) else { return }
 
-        let sessionId = session.sessionId
+        let sessionId = session.runtimeId
         Log.toFile("[AppState] Discarding empty session \(sessionId)")
 
         if let daemon = daemonClient {
             if currentSessionId == sessionId {
                 do {
-                    try await daemon.detachConversation(conversationId: session.stableConversationId)
+                    try await daemon.detachConversation(conversationId: session.conversationId)
                 } catch {
                     Log.toFile("[AppState] Failed to detach empty session \(sessionId): \(error)")
                 }
@@ -984,7 +979,7 @@ final class AppState {
             return runtimeId == currentSessionId
         }
 
-        let activeConversationId = normalizedNotificationID(activeSession?.stableConversationId)
+        let activeConversationId = normalizedNotificationID(activeSession?.conversationId)
         if let conversationId = context.conversationId,
            let activeConversationId {
             return conversationId == activeConversationId
@@ -1032,7 +1027,7 @@ final class AppState {
             let msg = lastAssistantMessage()
             if !msg.toolCalls.isEmpty {
                 msg.isStreaming = false
-                let newMsg = ChatMessage(role: .assistant, isStreaming: isPrompting && !isLoadingHistory)
+                let newMsg = ChatMessage(role: .assistant, isStreaming: isPrompting)
                 newMsg.content = text
                 messages.append(newMsg)
             } else {
@@ -1115,7 +1110,7 @@ final class AppState {
         if let last = messages.last, last.role == .assistant {
             return last
         }
-        let msg = ChatMessage(role: .assistant, isStreaming: isPrompting && !isLoadingHistory)
+        let msg = ChatMessage(role: .assistant, isStreaming: isPrompting)
         messages.append(msg)
         return msg
     }
@@ -1142,9 +1137,9 @@ final class AppState {
     }
 
     /// Resolve a legacy runtime/session identifier back to a stable conversation ID.
-    private func resolveConversationID(forLegacySessionID sessionId: String, modelContext: ModelContext) -> String {
+    private func resolveConversationID(forSessionOrRuntimeID sessionId: String, modelContext: ModelContext) -> String {
         ConversationPersistence.resolveConversationID(
-            forLegacySessionID: sessionId,
+            forSessionOrRuntimeID: sessionId,
             daemonConversations: daemonConversations,
             modelContext: modelContext
         )
@@ -1227,13 +1222,12 @@ final class AppState {
 
     private func shouldDiscardEmptySession(_ session: Session) -> Bool {
         guard !isPrompting else { return false }
-        guard !isLoadingHistory else { return false }
         guard hasRenderableConversation() == false else { return false }
 
         let hasLocalTitle = !(session.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         guard !hasLocalTitle else { return false }
 
-        guard let daemonSession = daemonSessions.first(where: { $0.sessionId == session.sessionId }) else {
+        guard let daemonSession = daemonSessions.first(where: { $0.sessionId == session.runtimeId }) else {
             return true
         }
 
