@@ -166,6 +166,17 @@ These are the next tests worth adding before broadening the suite further.
 - key open/recover/prompt boundaries emit enough structured context for log correlation
 - `traceId` is easy to follow across app and daemon logs for a single lifecycle
 
+## TODO: ACP protocol realism follow-ups (2026-03-09)
+
+This round of comparison against upstream `codex-acp` and `claude-agent-acp` found one confirmed protocol bug and a few high-value follow-ups. Keep these tracked as TODO items until the relevant coverage exists.
+
+- TODO: add an end-to-end permission-interrupt flow where `session/request_permission` arrives mid-prompt, the client replies, and streaming continues with subsequent `tool_call` / `tool_call_update` / text updates.
+- TODO: add a daemon or `AppState` regression that proves newer ACP tool statuses (`pending`, `in_progress`, `completed`, `failed`) are tolerated everywhere we consume tool events, not just in the parser and mocks.
+- TODO: decide whether product surfaces should consume `current_mode_update`, `config_options_update`, `usage_update`, and `available_commands_update`; today we safely ignore them, but the UI has no visibility into these upstream state changes.
+- TODO: keep local mocks aligned with upstream structured tool outputs (`rawOutput` as content blocks/JSON), because this mismatch previously hid a real bug where tool output text could be dropped from the visible transcript.
+
+Note: the confirmed bug from this review was the structured `rawOutput` parsing gap. That parser issue is now fixed; the TODOs above are the remaining realism and coverage follow-ups.
+
 ## What to test at each layer
 
 When adding a new regression test, prefer the cheapest layer that can prove the contract.

@@ -49,10 +49,13 @@ enum SessionUpdateParser {
                 // Extract rawInput if present (often arrives here, not on tool_call)
                 let rawInput = update?["rawInput"]
 
-                // Extract output from rawOutput or content array
+                // Extract output from rawOutput or content array.
+                // Upstream ACP adapters commonly send structured `rawOutput`
+                // blocks (e.g. Claude content arrays) rather than a plain
+                // string, so we need to decode both shapes.
                 var outputText: String?
-                if let raw = update?["rawOutput"]?.stringValue {
-                    outputText = raw
+                if let rawOutput = update?["rawOutput"] {
+                    outputText = extractToolOutputText(from: rawOutput)
                 } else if let contentText = extractText(from: update?["content"]) {
                     outputText = contentText
                 }
@@ -76,7 +79,7 @@ enum SessionUpdateParser {
             let reason = StopReason(rawValue: rawReason) ?? .unknown
             return .promptComplete(stopReason: reason)
 
-        case "plan", "available_commands_update", "mode_update":
+        case "plan", "available_commands_update", "current_mode_update", "config_options_update", "usage_update", "mode_update":
             return nil
 
         case "user_message", "user_message_chunk":
@@ -119,5 +122,21 @@ enum SessionUpdateParser {
         default:
             return nil
         }
+    }
+
+    /// Best-effort extraction for tool outputs.
+    /// Falls back to a compact JSON string when upstream returns structured
+    /// payloads that do not contain plain text blocks.
+    private static func extractToolOutputText(from value: JSONValue) -> String? {
+        if case .null = value { return nil }
+        if let text = extractText(from: value) {
+            return text
+        }
+        guard let data = try? JSONEncoder().encode(value),
+              let json = String(data: data, encoding: .utf8),
+              !json.isEmpty else {
+            return nil
+        }
+        return json
     }
 }
