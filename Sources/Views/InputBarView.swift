@@ -72,7 +72,8 @@ struct InputBarView: View {
     }
 
     private var canSend: Bool {
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !appState.isPrompting
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !appState.shouldShowChatReconnectOverlay
     }
 
     private func send() {

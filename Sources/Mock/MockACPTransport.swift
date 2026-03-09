@@ -765,6 +765,34 @@ actor MockACPTransport: ACPTransport {
         )
     }
 
+    func emitPromptCompleteForTest(
+        sessionId: String,
+        runtimeId: String? = nil,
+        conversationId: String? = nil,
+        reason: StopReason = .endTurn,
+        seq: Int? = nil
+    ) {
+        var params: [String: JSONValue] = [
+            "sessionId": .string(sessionId),
+            "update": .object([
+                "sessionUpdate": .string("prompt_complete"),
+                "stopReason": .string(reason.rawValue)
+            ])
+        ]
+        if let runtimeId {
+            params["runtimeId"] = .string(runtimeId)
+        }
+        if let conversationId {
+            params["conversationId"] = .string(conversationId)
+        }
+        if let seq {
+            params["__seq"] = .int(seq)
+        }
+        messageContinuation.yield(
+            .notification(method: ACPMethods.sessionUpdate, params: .object(params))
+        )
+    }
+
     // MARK: - Test Helpers
 
     func setMockAttachState(_ state: String) {

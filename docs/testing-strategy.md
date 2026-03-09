@@ -45,6 +45,7 @@ Because of that, the highest-value tests are the ones that protect **contracts a
 - image mention prompt block generation
 - prompt termination when `prompt_complete` is missing
 - timeout/watchdog behavior and retry safety
+- busy-session reopen and queued follow-up sends
 - cross-session notification filtering
 - conversation open/reopen for ready, running, draining, completed, missing, and restorable conversations
 - detached-session recovery after unexpected transport interruption

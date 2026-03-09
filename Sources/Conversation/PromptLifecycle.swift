@@ -18,6 +18,8 @@ protocol PromptLifecycleAppState: AnyObject {
     func promptLifecycleAddSystemMessage(_ text: String)
     func promptLifecycleContentDidChange()
     func promptLifecycleLastAssistantMessage() -> ChatMessage
+    func promptLifecycleRecoverBusyState(sessionId: String)
+    func promptLifecycleDidSettlePrompt(sessionId: String?)
 }
 
 enum PromptLifecycle {
@@ -133,6 +135,7 @@ enum PromptLifecycle {
         if refreshDaemonSessions {
             Task { await appState.promptLifecycleRefreshDaemonSessions() }
         }
+        appState.promptLifecycleDidSettlePrompt(sessionId: sessionId)
     }
 
     @MainActor

@@ -787,29 +787,30 @@ final class AppStateTests: XCTestCase {
         )
     }
 
-    func testSendWhilePromptingIsBlocked() async throws {
+    func testSendWhilePromptingQueuesFollowUpMessage() async throws {
         try await connectMock(scenario: .complex) // slower scenario
         try await appState.createNewSession(modelContext: modelContext)
 
-        // Send first message
-        appState.sendMessage("First")
+        XCTAssertTrue(appState.sendMessage("First"))
         XCTAssertTrue(appState.isPrompting)
 
-        // Immediately try to send second — should be blocked
-        appState.sendMessage("Second")
+        XCTAssertTrue(appState.sendMessage("Second"))
 
-        // Should see "Still waiting" system message
-        let waitingMessages = appState.messages.filter {
-            $0.role == .system && $0.content.contains("Still waiting")
+        let queuedMessages = appState.messages.filter {
+            $0.role == .system && $0.content.contains("Queued message")
         }
-        XCTAssertEqual(waitingMessages.count, 1, "Should show 'still waiting' message")
+        XCTAssertEqual(queuedMessages.count, 1, "Should show queue guidance")
 
-        // Only one user message should exist (the first one)
         let userMessages = appState.messages.filter { $0.role == .user }
-        XCTAssertEqual(userMessages.count, 1, "Only first message should go through")
+        XCTAssertEqual(userMessages.count, 1, "Queued message should not duplicate into transcript before dispatch")
+
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+
+        let finalUserMessages = appState.messages.filter { $0.role == .user }
+        XCTAssertEqual(finalUserMessages.count, 2, "Queued message should dispatch after the first turn settles")
     }
 
-    func testSendMessageReturnsFalseWhenPrompting() async throws {
+    func testSendMessageReturnsTrueWhenPromptingAndQueues() async throws {
         try await connectMock(scenario: .complex)
         try await appState.createNewSession(modelContext: modelContext)
 
@@ -818,7 +819,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(appState.isPrompting)
 
         let secondAccepted = appState.sendMessage("Second")
-        XCTAssertFalse(secondAccepted, "Second send should be rejected while prompting")
+        XCTAssertTrue(secondAccepted, "Second send should be queued while prompting")
     }
 
     func testSendMessageReturnsFalseWhenDisconnected() async {
@@ -1132,13 +1133,24 @@ final class AppStateTests: XCTestCase {
 
         try await appState.openSession(conversationId: "draining-session", modelContext: modelContext)
 
-        // isPrompting should always be cleared after draining open
-        XCTAssertFalse(appState.isPrompting, "isPrompting should be false after draining open")
+        XCTAssertTrue(appState.isPrompting, "draining open should preserve busy prompt state")
 
-        // Should be able to send
-        appState.sendMessage("Hello")
-        XCTAssertTrue(appState.isPrompting)
+        XCTAssertTrue(appState.sendMessage("Hello"))
+        XCTAssertTrue(
+            appState.messages.contains { $0.role == .system && $0.content.contains("Queued message") },
+            "Follow-up should queue instead of overlapping the recovered turn"
+        )
+
+        let runtimeId = try XCTUnwrap(appState.currentSessionId)
+        await transport.emitPromptCompleteForTest(
+            sessionId: runtimeId,
+            runtimeId: runtimeId,
+            conversationId: "draining-session",
+            seq: 2
+        )
+
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
+        XCTAssertEqual(appState.messages.filter { $0.role == .user }.count, 2)
     }
 
     func testOpenDrainingConversationStillRunning() async throws {
@@ -1158,13 +1170,13 @@ final class AppStateTests: XCTestCase {
 
         try await appState.openSession(conversationId: "draining-running", modelContext: modelContext)
 
-        // isPrompting should be false — user should not be locked out of draining sessions
-        XCTAssertFalse(appState.isPrompting, "isPrompting should be false — user can send even for draining sessions")
+        XCTAssertTrue(appState.isPrompting, "draining session that is still running should stay busy after reopen")
 
-        // User should be able to send a message
-        appState.sendMessage("New message")
-        XCTAssertTrue(appState.isPrompting, "Should be able to send to draining session")
-        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+        XCTAssertTrue(appState.sendMessage("New message"))
+        XCTAssertTrue(
+            appState.messages.contains { $0.role == .system && $0.content.contains("Queued message") },
+            "New send should queue while reopened turn is still running"
+        )
     }
 
     func testOpenDrainingConversationPromptCompleteInBuffer() async throws {
@@ -1205,6 +1217,7 @@ final class AppStateTests: XCTestCase {
 
         try await appState.openSession(conversationId: "running-load", modelContext: modelContext)
 
+        XCTAssertTrue(appState.isPrompting, "running open should preserve busy state until prompt completion arrives")
         XCTAssertTrue(
             appState.messages.contains {
                 $0.role == .system && $0.content.contains("Conversation reopened (still running)")
@@ -1282,7 +1295,7 @@ final class AppStateTests: XCTestCase {
             2.0,
             "Running open should stay responsive without app-side history loading"
         )
-        XCTAssertFalse(appState.isPrompting)
+        XCTAssertTrue(appState.isPrompting, "Running open without terminal replay should stay busy")
     }
 
     func testOpenSameActiveConversationReusesInMemoryTranscript() async throws {
@@ -2229,6 +2242,15 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testMarkTransportInterruptedShowsChatReconnectOverlay() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.markTransportInterrupted("mock interruption")
+
+        XCTAssertTrue(appState.shouldShowChatReconnectOverlay)
+    }
+
     func testRecoverInterruptedSessionRoundTripCallsReconnectAndOpen() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)
@@ -2254,11 +2276,59 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(openedSessionIDs, [sessionId])
         XCTAssertEqual(appState.connectionStatus, .connected)
         XCTAssertNil(appState.connectionError)
+        XCTAssertFalse(appState.shouldShowChatReconnectOverlay)
 
         // Recovery flag should be cleared after success (no second attempt).
         await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
         XCTAssertEqual(connectCalls, 1)
         XCTAssertEqual(openedSessionIDs, [sessionId])
+    }
+
+    func testRecoverInterruptedSessionDoesNotReuseInMemoryTranscriptWhenReconnectPending() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard appState.mockTransport != nil else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        let conversationId = try XCTUnwrap(appState.activeSession?.conversationId)
+
+        XCTAssertTrue(appState.sendMessage("keep the transcript visible"))
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+        XCTAssertFalse(appState.messages.isEmpty)
+
+        appState.markTransportInterrupted("mock interruption")
+        XCTAssertTrue(appState.shouldShowChatReconnectOverlay)
+
+        appState.autoReconnectConnectHandler = { _ in
+            self.appState.connectMock(workspace: self.workspace, isAutoReconnect: true)
+            try? await self.waitFor(timeout: 5) { self.appState.connectionStatus == .connected }
+            guard let transport = self.appState.mockTransport else { return }
+            await transport.setMockConversationList([
+                [
+                    "conversationId": .string(conversationId),
+                    "runtimeId": .string(conversationId),
+                    "state": .string("attached"),
+                    "cwd": .string("/test/path"),
+                    "origin": .string("managed"),
+                    "lastEventSeq": .int(3),
+                ]
+            ])
+        }
+
+        await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
+
+        guard let reconnectedTransport = appState.mockTransport else {
+            XCTFail("Mock transport not available after reconnect")
+            return
+        }
+        let methods = await reconnectedTransport.getReceivedMethods()
+        let reopenedConversationId = await reconnectedTransport.getLastOpenConversationId()
+        let attachedSessionId = await reconnectedTransport.getLastAttachSessionId()
+        XCTAssertTrue(methods.contains(DaemonMethods.conversationOpen))
+        XCTAssertEqual(reopenedConversationId, conversationId)
+        XCTAssertEqual(attachedSessionId, conversationId)
     }
 
     func testRecoverInterruptedSessionPrefersConversationIdOverStaleRuntimeId() async throws {
@@ -2349,7 +2419,7 @@ final class AppStateTests: XCTestCase {
         appState.messages = []
 
         appState.autoReconnectConnectHandler = { _ in
-            self.appState.connectMock(workspace: self.workspace)
+            self.appState.connectMock(workspace: self.workspace, isAutoReconnect: true)
             try? await self.waitFor(timeout: 5) { self.appState.connectionStatus == .connected }
             guard let transport = self.appState.mockTransport else { return }
             await transport.setMockConversationList([
@@ -2407,7 +2477,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.connectionStatus, .disconnected)
 
         appState.autoReconnectConnectHandler = { _ in
-            self.appState.connectMock(workspace: self.workspace)
+            self.appState.connectMock(workspace: self.workspace, isAutoReconnect: true)
             try? await self.waitFor(timeout: 5) { self.appState.connectionStatus == .connected }
             guard let transport = self.appState.mockTransport else { return }
             await transport.setMockConversationList([
@@ -2473,7 +2543,7 @@ final class AppStateTests: XCTestCase {
         var connectCalls = 0
         appState.autoReconnectConnectHandler = { _ in
             connectCalls += 1
-            self.appState.connectMock(workspace: self.workspace)
+            self.appState.connectMock(workspace: self.workspace, isAutoReconnect: true)
             try? await self.waitFor(timeout: 5) { self.appState.connectionStatus == .connected }
             guard let transport = self.appState.mockTransport else { return }
             await transport.setMockConversationList([
