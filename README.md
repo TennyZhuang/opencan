@@ -139,6 +139,19 @@ Scripts/
 - [MarkdownView](https://github.com/Lakr233/MarkdownView) — Markdown rendering
 - [ListViewKit](https://github.com/Lakr233/ListViewKit) — stable streaming chat timeline rendering
 
+## Acknowledgements
+
+- OpenCAN's chat timeline UI direction was informed by [FlowDown](https://github.com/Lakr233/FlowDown) by Lakr233.
+- OpenCAN uses [ListViewKit](https://github.com/Lakr233/ListViewKit) and [MarkdownView](https://github.com/Lakr233/MarkdownView), which are maintained by Lakr233 and are used directly in the app.
+- FlowDown's repository currently states that its source code is AGPL-3.0, while the FlowDown name, icon, and artwork remain proprietary. OpenCAN does not claim rights to those brand assets.
+- See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) for dependency license texts and attribution notes.
+
 ## License
 
-TBD
+Copyright (C) 2026 TennyZhuang.
+
+OpenCAN is released under the GNU Affero General Public License v3.0 or later. See [LICENSE](./LICENSE).
+
+If you distribute binaries of OpenCAN or make a modified networked deployment of `opencan-daemon` available to users, you are responsible for providing the corresponding source and keeping the required legal notices visible.
+
+See [docs/open-source-release.md](./docs/open-source-release.md) for the current provenance audit, source-availability policy, and release checklist.

@@ -13,9 +13,10 @@ xcodegen generate
 # Build for iOS Simulator
 xcodebuild -scheme OpenCAN -destination "platform=iOS Simulator,name=iPhone 17 Pro" -quiet build
 
-# Note: OpenCAN target has a post-build script that cross-compiles the
+# Note: OpenCAN target has post-build scripts that cross-compile the
 # daemon into the app bundle as opencan-daemon-linux-amd64 when daemon
-# sources change; otherwise it reuses the existing bundled binary.
+# sources change, and stamp source repository + git revision metadata
+# into the built app Info.plist for About/Licenses disclosure.
 # Set SKIP_DAEMON_BUNDLE_BUILD=1 to skip this in local builds.
 
 # Install and launch on simulator (replace UDID as needed)
@@ -95,7 +96,7 @@ OpenCAN is an iOS ACP (Agent Client Protocol) client that connects to configured
 
 7. **AppState** - `@MainActor @Observable` coordinator. `connect(node:)` establishes SSH + daemon with 30s timeout (`daemon/hello`). `refreshAvailableAgents()` probes launcher availability and marks reliability (`hasReliableAgentAvailability`). AppState persists a stable per-install `daemonAttachClientID` in `UserDefaults` and sends it as `ownerId` on `daemon/conversation.open` / `daemon/conversation.create` so reconnects can reclaim ownership from stale transports. Unexpected transport exits call `markTransportInterrupted(...)` to preserve active node/workspace/session context while clearing runtime transport state; `recoverInterruptedSessionIfNeeded(...)` provides the reconnect primitive used by `ChatView`'s active overlay retry loop and re-entry recovery hooks.
 
-8. **SwiftUI/UIKit hybrid UI** - `ContentView` hosts `NavigationStack`: `NodeListView -> WorkspaceListView -> SessionPickerView -> ChatView`. Connection scope is node-level at `WorkspaceListView`. `NodeListView` gear menu includes **Agent Settings** and **Diagnostics**. `SessionPickerView` merges daemon + local sessions into `UnifiedSession`, applies workspace path normalization (tilde/home aliases), and shows conversation-oriented state badges (`attached/ready/running/restorable/unavailable`), while still mapping legacy runtime snapshots when needed. `ChatMessageListView` uses ListViewKit (FlowDown-style timeline) for stable streaming updates; `InputBarView` supports PhotosPicker uploads and `@mention` autocomplete. `ChatView` shows a reconnecting overlay and keeps retrying interrupted-session recovery while the app stays active, in addition to recovery on `onAppear` and when scene phase returns to active. `--uitesting-integration` implies UI testing mode, but `WorkspaceListView` still takes the real SSH path for integration runs (`isUITesting && !isUIIntegrationTesting` gate).
+8. **SwiftUI/UIKit hybrid UI** - `ContentView` hosts `NavigationStack`: `NodeListView -> WorkspaceListView -> SessionPickerView -> ChatView`. Connection scope is node-level at `WorkspaceListView`. `NodeListView` gear menu includes **About & Licenses**, **Agent Settings**, and **Diagnostics**. `SessionPickerView` merges daemon + local sessions into `UnifiedSession`, applies workspace path normalization (tilde/home aliases), and shows conversation-oriented state badges (`attached/ready/running/restorable/unavailable`), while still mapping legacy runtime snapshots when needed. `ChatMessageListView` uses ListViewKit (FlowDown-style timeline) for stable streaming updates; `InputBarView` supports PhotosPicker uploads and `@mention` autocomplete. `ChatView` shows a reconnecting overlay and keeps retrying interrupted-session recovery while the app stays active, in addition to recovery on `onAppear` and when scene phase returns to active. `--uitesting-integration` implies UI testing mode, but `WorkspaceListView` still takes the real SSH path for integration runs (`isUITesting && !isUIIntegrationTesting` gate).
 
 **Key protocol details:**
 - iOS connects through `opencan-daemon attach`, not directly to ACP binaries.
@@ -158,6 +159,7 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
 ## Conventions
 
 - **Testing strategy:** `docs/testing-strategy.md` records what to test at each layer, what the current suite covers, and which regressions are worth adding next.
+- **Open source release notes:** `docs/open-source-release.md` records the repository license choice, provenance audit findings, source-availability policy, and release checklist.
 
 - **SwiftData** for persistent host/workspace/session/key configuration.
 - **Actors** for protocol and transport state (`ACPClient`, `JSONRPCFramer`, `SSHStdioTransport`, `SSHConnectionManager`).
