@@ -128,7 +128,7 @@ final class AppState {
         return traceId
     }
 
-    func fetchDaemonLogs(count: Int = 200, traceId: String? = nil) async throws -> [DaemonLogEntry] {
+    func fetchDaemonLogs(count: Int = 200, traceId: String? = nil) async throws -> DaemonLogSnapshot {
         guard let daemonClient else {
             throw AppStateError.notConnected
         }

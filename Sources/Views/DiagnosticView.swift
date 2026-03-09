@@ -14,7 +14,9 @@ struct DiagnosticView: View {
 
     @State private var selectedTab: Tab = .iosLogs
     @State private var iosLogs: [LogEntry] = []
+    @State private var iosLogMetadata = Log.diagnosticsMetadata()
     @State private var daemonLogs: [DaemonLogEntry] = []
+    @State private var daemonLogMetadata: LogStorageMetadata?
     @State private var daemonTraceFilter = ""
     @State private var daemonError: String?
 
@@ -59,17 +61,21 @@ struct DiagnosticView: View {
     private var contentView: some View {
         switch selectedTab {
         case .iosLogs:
-            List(Array(iosLogs.reversed())) { entry in
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(entry.message)
-                        .font(.body)
-                    Text("\(entry.timestamp.formatted(.dateTime.hour().minute().second())) • \(entry.component) • \(entry.level)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    if let traceId = entry.traceId, !traceId.isEmpty {
-                        Text("traceId: \(traceId)")
-                            .font(.caption2)
+            List {
+                metadataSection(title: "iOS Log Storage", metadata: iosLogMetadata)
+
+                ForEach(Array(iosLogs.reversed())) { entry in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(entry.message)
+                            .font(.body)
+                        Text("\(entry.timestamp.formatted(.dateTime.hour().minute().second())) • \(entry.component) • \(entry.level)")
+                            .font(.caption)
                             .foregroundStyle(.secondary)
+                        if let traceId = entry.traceId, !traceId.isEmpty {
+                            Text("traceId: \(traceId)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -95,17 +101,23 @@ struct DiagnosticView: View {
                         .foregroundStyle(.red)
                 }
 
-                List(Array(daemonLogs.reversed())) { entry in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(entry.message)
-                            .font(.body)
-                        Text("\(entry.timestamp) • \(entry.level)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        if !entry.attrs.isEmpty {
-                            Text(entry.attrs.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " "))
-                                .font(.caption2)
+                List {
+                    if let daemonLogMetadata {
+                        metadataSection(title: "Daemon Log Storage", metadata: daemonLogMetadata)
+                    }
+
+                    ForEach(Array(daemonLogs.reversed())) { entry in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(entry.message)
+                                .font(.body)
+                            Text("\(entry.timestamp) • \(entry.level)")
+                                .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if !entry.attrs.isEmpty {
+                                Text(entry.attrs.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " "))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -151,21 +163,46 @@ struct DiagnosticView: View {
         }
     }
 
+    @ViewBuilder
+    private func metadataSection(title: String, metadata: LogStorageMetadata) -> some View {
+        Section(title) {
+            keyValueRow("schemaVersion", "\(metadata.schemaVersion)")
+            keyValueRow("service", metadata.service)
+            keyValueRow("currentFile", metadata.currentFilePath)
+            keyValueRow("currentSize", formatBytes(metadata.currentFileSizeBytes))
+            keyValueRow("rotation", "\(formatBytes(metadata.maxFileBytes)) x \(metadata.maxArchivedFiles) archives")
+            if let bufferEntryCapacity = metadata.bufferEntryCapacity {
+                keyValueRow("bufferCapacity", "\(bufferEntryCapacity)")
+            }
+            if metadata.archivedFiles.isEmpty {
+                keyValueRow("archives", "none")
+            } else {
+                ForEach(metadata.archivedFiles, id: \.path) { file in
+                    keyValueRow(file.name, formatBytes(file.sizeBytes))
+                }
+            }
+        }
+    }
+
     private func loadIOSLogs() {
         iosLogs = Log.buffer.allEntries()
+        iosLogMetadata = Log.diagnosticsMetadata()
     }
 
     private func loadDaemonLogs() async {
         do {
             daemonError = nil
             let traceId = daemonTraceFilter.trimmingCharacters(in: .whitespacesAndNewlines)
-            daemonLogs = try await appState.fetchDaemonLogs(
+            let snapshot = try await appState.fetchDaemonLogs(
                 count: 200,
                 traceId: traceId.isEmpty ? nil : traceId
             )
+            daemonLogs = snapshot.entries
+            daemonLogMetadata = snapshot.metadata
         } catch {
             daemonError = error.localizedDescription
             daemonLogs = []
+            daemonLogMetadata = nil
         }
     }
 
@@ -182,6 +219,9 @@ struct DiagnosticView: View {
 
         struct Snapshot: Codable {
             let exportedAt: Date
+            let schemaVersion: Int
+            let iosLogMetadata: LogStorageMetadata
+            let daemonLogMetadata: LogStorageMetadata?
             let iosLogs: [LogEntry]
             let daemonLogs: [DaemonLogEntry]
             let state: StateSnapshot
@@ -189,6 +229,9 @@ struct DiagnosticView: View {
 
         let payload = Snapshot(
             exportedAt: Date(),
+            schemaVersion: 1,
+            iosLogMetadata: iosLogMetadata,
+            daemonLogMetadata: daemonLogMetadata,
             iosLogs: iosLogs,
             daemonLogs: daemonLogs,
             state: StateSnapshot(
@@ -210,5 +253,9 @@ struct DiagnosticView: View {
             return "{}"
         }
         return string
+    }
+
+    private func formatBytes(_ count: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
     }
 }
