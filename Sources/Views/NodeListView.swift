@@ -8,6 +8,7 @@ struct NodeListView: View {
     @State private var showAddNode = false
     @State private var showAgentSettings = false
     @State private var showDiagnostics = false
+    @State private var showAbout = false
 
     var body: some View {
         List {
@@ -38,6 +39,9 @@ struct NodeListView: View {
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Menu {
+                    Button("About & Licenses") {
+                        showAbout = true
+                    }
                     Button("Agent Settings") {
                         showAgentSettings = true
                     }
@@ -64,6 +68,9 @@ struct NodeListView: View {
         }
         .sheet(isPresented: $showDiagnostics) {
             DiagnosticView()
+        }
+        .sheet(isPresented: $showAbout) {
+            AboutView()
         }
     }
 

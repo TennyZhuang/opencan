@@ -37,6 +37,11 @@ targets:
           set -euo pipefail
           "${SRCROOT}/Scripts/build-daemon-bundle.sh"
         basedOnDependencyAnalysis: false
+      - name: Stamp source metadata
+        script: |
+          set -euo pipefail
+          "${SRCROOT}/Scripts/stamp-build-info.sh"
+        basedOnDependencyAnalysis: false
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
