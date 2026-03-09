@@ -128,7 +128,7 @@ final class AppState {
         return traceId
     }
 
-    func fetchDaemonLogs(count: Int = 200, traceId: String? = nil) async throws -> [DaemonLogEntry] {
+    func fetchDaemonLogs(count: Int = 200, traceId: String? = nil) async throws -> DaemonLogSnapshot {
         guard let daemonClient else {
             throw AppStateError.notConnected
         }
@@ -295,11 +295,14 @@ final class AppState {
                 self.daemonSessions = info.sessions
                 self.daemonConversations = []
                 await self.refreshAvailableAgents()
-                Log.app.info("Daemon connected: v\(info.daemonVersion), \(info.sessions.count) sessions")
                 Log.log(
                     component: "AppState",
-                    "daemon connected: v\(info.daemonVersion)",
-                    traceId: traceId
+                    "daemon connected",
+                    traceId: traceId,
+                    extra: [
+                        "daemonVersion": info.daemonVersion,
+                        "sessionCount": "\(info.sessions.count)"
+                    ]
                 )
 
                 // Start notification listener once for the entire connection.
@@ -308,7 +311,6 @@ final class AppState {
 
                 self.connectionStatus = .connected
             } catch {
-                Log.app.error("Connection error: \(error)")
                 Log.log(
                     level: "error",
                     component: "AppState",

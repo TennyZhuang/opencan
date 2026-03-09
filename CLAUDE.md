@@ -42,7 +42,7 @@ OPENCAN_INTEGRATION_TEST_MODE=smoke ./Scripts/run-local-integration.sh
 OPENCAN_INTEGRATION_TEST_MODE=full ./Scripts/run-local-integration.sh
 ```
 
-App logs are JSON lines (`LogEntry`). Daemon logs are also structured JSON and live on the remote host at `~/.opencan/daemon.log` (rotates to `daemon.log.prev` at 10MB).
+App logs are JSON lines (`LogEntry`). Daemon logs are also structured JSON and live on the remote host at `~/.opencan/daemon.log` (size-rotated at 10MB with `daemon.log.1` through `daemon.log.3`).
 
 Local integration harness notes:
 - `run-local-integration.sh` writes a temporary `.env.integration.*` file and exports `OPENCAN_TEST_DOTENV_PATH`; it does not overwrite your existing `.env`.
@@ -160,7 +160,7 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
 - **`@MainActor @Observable`** for UI state (`AppState`, `ChatMessage`).
 - **`AsyncStream`** for notifications and transport message pipelines.
 - **Structured logging:** prefer `Log.log(...)` and `Log.timed(...)` (JSON lines + in-memory ring buffer). `Log.toFile(...)` remains for legacy call sites.
-- **Diagnostics:** `DiagnosticView` can inspect iOS log ring buffer, fetch daemon logs (`daemon/logs`), inspect state snapshot, and export JSON.
+- **Diagnostics:** `DiagnosticView` can inspect iOS log ring buffer, fetch daemon logs (`daemon/logs`), inspect state snapshot, and export JSON with log storage metadata (schema version, file sizes, retention).
 - **XcodeGen** (`project.yml`) generates `.xcodeproj`; run `xcodegen generate` after file list changes.
 - **Unit tests:** `AppStateTests` cover agent probing/fallback, image mention prompts, single-owner conversation reopen behavior, interrupted-session auto reconnect paths, detach-before-switch, cross-session filtering, dead-conversation handling, and empty-runtime pruning.
 - **Other tests:** `ACPClientTests`, `SessionPickerPathMatchingTests`, `SessionUpdateParserTests`, `JSONRPCMessageTests`.
@@ -169,7 +169,7 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
 **Daemon architecture:**
 - `opencan-daemon/` contains the Go daemon source. See `docs/daemon-architecture.md` for protocol/lifecycle details.
 - **Auto-deploy:** `SSHConnectionManager.ensureDaemonInstalled()` uploads bundled `opencan-daemon-linux-amd64` when remote hash mismatches.
-- Daemon startup uses `slog.NewJSONHandler` and writes to `~/.opencan/daemon.log` (plus stderr in true foreground mode), with simple size rotation to `.prev` at 10MB.
+- Daemon startup uses `slog.NewJSONHandler` and writes to `~/.opencan/daemon.log` (plus stderr in true foreground mode), with runtime size rotation at 10MB and retention of `daemon.log.1` through `daemon.log.3`.
 - Daemon logs are mirrored into an in-memory `LogRingBuffer` (default 2000 entries) via `BufferingHandler`, exposed by `daemon/logs`.
 - ACPProxy state machine: `Starting -> Idle -> Prompting -> Draining -> Completed -> Dead`, plus `External` for sessions discovered from ACP but unmanaged by daemon.
 - `daemon/session.list` remains the runtime-oriented diagnostic view: it returns managed runtimes and external ACP history rows (up to 50), optionally scoped by cwd. External discovery falls back to probing ACP directly (commands from `OPENCAN_DISCOVERY_COMMANDS`, default `claude-agent-acp,codex-acp`) when no managed proxy is available.

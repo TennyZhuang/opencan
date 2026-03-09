@@ -165,6 +165,7 @@ These are the next tests worth adding before broadening the suite further.
 
 - key open/recover/prompt boundaries emit enough structured context for log correlation
 - `traceId` is easy to follow across app and daemon logs for a single lifecycle
+- app/daemon log rotation policies stay bounded and diagnostics export enough storage metadata to explain retention
 
 ## What to test at each layer
 

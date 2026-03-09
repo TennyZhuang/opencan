@@ -3,24 +3,23 @@ import os
 
 /// Shared loggers for the app. Writes to both os_log and a file for debugging.
 enum Log {
+    static let schemaVersion = 1
     static let ssh = Logger(subsystem: "com.tianyizhuang.OpenCAN", category: "SSH")
     static let acp = Logger(subsystem: "com.tianyizhuang.OpenCAN", category: "ACP")
     static let transport = Logger(subsystem: "com.tianyizhuang.OpenCAN", category: "Transport")
     static let app = Logger(subsystem: "com.tianyizhuang.OpenCAN", category: "App")
 
-    static let buffer = LogRingBuffer(maxSize: 2000)
+    static let bufferCapacity = 2000
+    static let buffer = LogRingBuffer(maxSize: bufferCapacity)
 
     /// Also write to a file for easy retrieval from simulator container.
     static let logFileURL: URL = {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("opencan.log")
     }()
-    private static let previousLogFileURL: URL = {
-        logFileURL.deletingPathExtension().appendingPathExtension("log.prev")
-    }()
-
     private static let fileQueue = DispatchQueue(label: "com.tianyizhuang.OpenCAN.log")
     private static let maxLogFileBytes = 10 * 1024 * 1024
+    private static let maxArchivedLogFiles = 3
     private static let syncWriteBatchSize = 20
     private static let syncInterval: TimeInterval = 2
     private static var fileHandle: FileHandle?
@@ -48,6 +47,7 @@ enum Log {
             sessionId: sessionId,
             extra: extra
         )
+        writeToUnifiedLogger(entry)
         buffer.append(entry)
         writeToFile(entry)
     }
@@ -97,6 +97,20 @@ enum Log {
         }
     }
 
+    static func diagnosticsMetadata() -> LogStorageMetadata {
+        let archivedFiles = archivedLogFileURLs().compactMap(fileInfo(for:))
+        return LogStorageMetadata(
+            schemaVersion: schemaVersion,
+            service: "ios-app",
+            currentFilePath: logFileURL.path,
+            currentFileSizeBytes: currentLogFileSize(),
+            archivedFiles: archivedFiles,
+            maxFileBytes: Int64(maxLogFileBytes),
+            maxArchivedFiles: maxArchivedLogFiles,
+            bufferEntryCapacity: bufferCapacity
+        )
+    }
+
     private static func writeToFile(_ entry: LogEntry) {
         fileQueue.async {
             guard let data = try? encoder.encode(entry) else { return }
@@ -128,16 +142,58 @@ enum Log {
         fileHandle = nil
         pendingSyncWrites = 0
 
-        if FileManager.default.fileExists(atPath: previousLogFileURL.path) {
-            try? FileManager.default.removeItem(at: previousLogFileURL)
+        rotateLogFiles(baseURL: logFileURL, maxArchivedFiles: maxArchivedLogFiles)
+    }
+
+    static func rotateLogFiles(
+        baseURL: URL,
+        maxArchivedFiles: Int,
+        fileManager: FileManager = .default
+    ) {
+        guard maxArchivedFiles > 0 else {
+            try? fileManager.removeItem(at: baseURL)
+            return
         }
-        if FileManager.default.fileExists(atPath: logFileURL.path) {
-            try? FileManager.default.moveItem(at: logFileURL, to: previousLogFileURL)
+
+        for index in stride(from: maxArchivedFiles, through: 1, by: -1) {
+            let destination = archivedLogFileURL(index: index, baseURL: baseURL)
+            let source = index == 1
+                ? baseURL
+                : archivedLogFileURL(index: index - 1, baseURL: baseURL)
+            if fileManager.fileExists(atPath: destination.path) {
+                try? fileManager.removeItem(at: destination)
+            }
+            if fileManager.fileExists(atPath: source.path) {
+                try? fileManager.moveItem(at: source, to: destination)
+            }
         }
     }
 
+    static func archivedLogFileURL(index: Int, baseURL: URL) -> URL {
+        URL(fileURLWithPath: "\(baseURL.path).\(index)")
+    }
+
+    private static func archivedLogFileURLs() -> [URL] {
+        guard maxArchivedLogFiles > 0 else { return [] }
+        return (1...maxArchivedLogFiles).map { archivedLogFileURL(index: $0, baseURL: logFileURL) }
+    }
+
+    private static func fileInfo(for url: URL) -> LogArchiveFileInfo? {
+        let size = fileSize(at: url)
+        guard size > 0 else { return nil }
+        return LogArchiveFileInfo(
+            name: url.lastPathComponent,
+            path: url.path,
+            sizeBytes: size
+        )
+    }
+
     private static func currentLogFileSize() -> Int64 {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: logFileURL.path),
+        fileSize(at: logFileURL)
+    }
+
+    private static func fileSize(at url: URL) -> Int64 {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = attrs[.size] as? NSNumber else {
             return 0
         }
@@ -181,5 +237,53 @@ enum Log {
         let ms = Double(components.seconds) * 1000.0
             + Double(components.attoseconds) / 1_000_000_000_000_000.0
         return Int(ms.rounded())
+    }
+
+    private static func writeToUnifiedLogger(_ entry: LogEntry) {
+        let logger = logger(for: entry.component)
+        let rendered = renderedUnifiedMessage(for: entry)
+        switch entry.level.lowercased() {
+        case "debug":
+            logger.debug("\(rendered, privacy: .public)")
+        case "warning", "warn":
+            logger.warning("\(rendered, privacy: .public)")
+        case "error":
+            logger.error("\(rendered, privacy: .public)")
+        case "fault":
+            logger.fault("\(rendered, privacy: .public)")
+        default:
+            logger.info("\(rendered, privacy: .public)")
+        }
+    }
+
+    private static func logger(for component: String) -> Logger {
+        switch component.lowercased() {
+        case let value where value.contains("ssh"):
+            return ssh
+        case let value where value.contains("acp"):
+            return acp
+        case let value where value.contains("transport"):
+            return transport
+        default:
+            return app
+        }
+    }
+
+    private static func renderedUnifiedMessage(for entry: LogEntry) -> String {
+        var parts = [entry.message]
+        if let traceId = entry.traceId, !traceId.isEmpty {
+            parts.append("traceId=\(traceId)")
+        }
+        if let sessionId = entry.sessionId, !sessionId.isEmpty {
+            parts.append("sessionId=\(sessionId)")
+        }
+        if let extra = entry.extra, !extra.isEmpty {
+            let renderedExtras = extra
+                .sorted(by: { $0.key < $1.key })
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: " ")
+            parts.append(renderedExtras)
+        }
+        return parts.joined(separator: " ")
     }
 }

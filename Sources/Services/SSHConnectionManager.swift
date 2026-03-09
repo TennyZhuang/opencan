@@ -4,7 +4,6 @@ import CommonCrypto
 import Crypto
 import NIOCore
 import NIOSSH
-import os
 
 /// Manages SSH connection lifecycle: connect through jump host, create transport.
 actor SSHConnectionManager {
@@ -42,7 +41,11 @@ actor SSHConnectionManager {
 
     func connect(params: ConnectionParams) async throws -> SSHStdioTransport {
         state = .connecting
-        Log.ssh.warning("Host key verification is disabled — connections are vulnerable to MITM")
+        Log.log(
+            level: "warning",
+            component: "SSH",
+            "Host key verification is disabled; connections are vulnerable to MITM"
+        )
 
         do {
             let privateKey = try loadPrivateKey(pem: params.privateKeyPEM)
@@ -63,12 +66,10 @@ actor SSHConnectionManager {
                 )
                 jumpSettings.algorithms = .all
 
-                Log.ssh.info("Connecting to jump host \(jumpHost)...")
-                Log.toFile("[SSH] Connecting to jump host \(jumpHost)...")
+                Log.log(component: "SSH", "Connecting to jump host \(jumpHost)...")
                 let jump = try await SSHClient.connect(to: jumpSettings)
                 self.jumpClient = jump
-                Log.ssh.info("Connected to jump host")
-                Log.toFile("[SSH] Connected to jump host")
+                Log.log(component: "SSH", "Connected to jump host")
 
                 let targetUser = params.username
                 var targetSettings = SSHClientSettings(
@@ -79,12 +80,10 @@ actor SSHConnectionManager {
                 )
                 targetSettings.algorithms = .all
 
-                Log.ssh.info("Jumping to target \(params.host)...")
-                Log.toFile("[SSH] Jumping to target \(params.host)...")
+                Log.log(component: "SSH", "Jumping to target \(params.host)...")
                 let target = try await jump.jump(to: targetSettings)
                 self.targetClient = target
-                Log.ssh.info("Connected to target")
-                Log.toFile("[SSH] Connected to target")
+                Log.log(component: "SSH", "Connected to target")
             } else {
                 let user = params.username
                 var settings = SSHClientSettings(

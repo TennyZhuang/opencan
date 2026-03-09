@@ -31,6 +31,7 @@ func testDaemonWithTimeout(t *testing.T, idleTimeout time.Duration) (*daemon.Dae
 	t.Cleanup(func() { os.RemoveAll(tmpDir) })
 	sockPath := filepath.Join(tmpDir, "d.sock")
 	pidFile := filepath.Join(tmpDir, "d.pid")
+	logPath := filepath.Join(tmpDir, "daemon.log")
 
 	logBuffer := daemon.NewLogRingBuffer(2000)
 	logger := slog.New(
@@ -46,6 +47,13 @@ func testDaemonWithTimeout(t *testing.T, idleTimeout time.Duration) (*daemon.Dae
 		IdleTimeout: idleTimeout,
 		Logger:      logger,
 		LogBuffer:   logBuffer,
+		LogStorage: daemon.LogStorageConfig{
+			Service:          "daemon",
+			CurrentFilePath:  logPath,
+			MaxFileBytes:     10 * 1024 * 1024,
+			MaxArchivedFiles: 3,
+			BufferEntryCap:   2000,
+		},
 	}
 
 	d := daemon.New(cfg)
@@ -286,9 +294,20 @@ func TestDaemon_LogsEndpointSupportsTraceFiltering(t *testing.T) {
 	if resp["error"] != nil {
 		t.Fatalf("daemon/logs error: %v", resp["error"])
 	}
-	entries := resp["result"].(map[string]interface{})["entries"].([]interface{})
+	result := resp["result"].(map[string]interface{})
+	entries := result["entries"].([]interface{})
 	if len(entries) == 0 {
 		t.Fatal("expected daemon/logs to return entries")
+	}
+	metadata, ok := result["metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected daemon/logs metadata, got %#v", result["metadata"])
+	}
+	if metadata["service"] != "daemon" {
+		t.Fatalf("expected daemon service metadata, got %#v", metadata)
+	}
+	if metadata["maxArchivedFiles"].(float64) != 3 {
+		t.Fatalf("expected maxArchivedFiles=3, got %#v", metadata["maxArchivedFiles"])
 	}
 
 	sendJSON(conn, map[string]interface{}{

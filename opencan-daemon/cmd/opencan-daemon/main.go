@@ -18,6 +18,12 @@ import (
 
 var version = "dev"
 
+const (
+	daemonLogMaxFileBytes     = 10 * 1024 * 1024
+	daemonLogMaxArchivedFiles = 3
+	daemonLogBufferCapacity   = 2000
+)
+
 func main() {
 	root := &cobra.Command{
 		Use:   "opencan-daemon",
@@ -66,19 +72,20 @@ func startCmd() *cobra.Command {
 			if verbose {
 				level = slog.LevelDebug
 			}
-			logWriter, closeWriter, err := openLogWriter(foreground && !godaemon.WasReborn())
+			logWriter, storageConfig, closeWriter, err := openLogWriter(foreground && !godaemon.WasReborn())
 			if err != nil {
 				return err
 			}
 			defer closeWriter()
 
-			logBuffer := daemon.NewLogRingBuffer(2000)
+			logBuffer := daemon.NewLogRingBuffer(daemonLogBufferCapacity)
 			innerHandler := slog.NewJSONHandler(logWriter, &slog.HandlerOptions{Level: level})
 			logger := slog.New(daemon.NewBufferingHandler(innerHandler, logBuffer))
 
 			cfg := daemon.DefaultConfig()
 			cfg.Logger = logger
 			cfg.LogBuffer = logBuffer
+			cfg.LogStorage = storageConfig
 
 			d := daemon.New(cfg)
 
@@ -164,48 +171,31 @@ func versionCmd() *cobra.Command {
 	}
 }
 
-func openLogWriter(includeStderr bool) (io.Writer, func(), error) {
+func openLogWriter(includeStderr bool) (io.Writer, daemon.LogStorageConfig, func(), error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve home directory: %w", err)
+		return nil, daemon.LogStorageConfig{}, nil, fmt.Errorf("resolve home directory: %w", err)
 	}
 	logDir := filepath.Join(home, ".opencan")
-	if err := os.MkdirAll(logDir, 0700); err != nil {
-		return nil, nil, fmt.Errorf("create log directory: %w", err)
-	}
-
 	logPath := filepath.Join(logDir, "daemon.log")
-	if err := rotateLogIfNeeded(logPath, 10*1024*1024); err != nil {
-		return nil, nil, err
-	}
-
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	rotatingWriter, err := daemon.NewRotatingFileWriter(
+		logPath,
+		daemonLogMaxFileBytes,
+		daemonLogMaxArchivedFiles,
+	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open daemon log file: %w", err)
+		return nil, daemon.LogStorageConfig{}, nil, err
 	}
 
-	writer := io.Writer(file)
+	writer := io.Writer(rotatingWriter)
 	if includeStderr {
-		writer = io.MultiWriter(os.Stderr, file)
+		writer = io.MultiWriter(os.Stderr, rotatingWriter)
 	}
-	return writer, func() { _ = file.Close() }, nil
-}
-
-func rotateLogIfNeeded(path string, maxSize int64) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("stat daemon log: %w", err)
-	}
-	if info.Size() <= maxSize {
-		return nil
-	}
-	prevPath := path + ".prev"
-	_ = os.Remove(prevPath)
-	if err := os.Rename(path, prevPath); err != nil {
-		return fmt.Errorf("rotate daemon log: %w", err)
-	}
-	return nil
+	return writer, daemon.LogStorageConfig{
+		Service:          "daemon",
+		CurrentFilePath:  logPath,
+		MaxFileBytes:     daemonLogMaxFileBytes,
+		MaxArchivedFiles: daemonLogMaxArchivedFiles,
+		BufferEntryCap:   daemonLogBufferCapacity,
+	}, func() { _ = rotatingWriter.Close() }, nil
 }

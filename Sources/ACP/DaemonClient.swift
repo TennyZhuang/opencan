@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 /// Client for daemon/ prefixed JSON-RPC methods.
 /// Wraps ACPClient for typed daemon method calls.
@@ -146,7 +145,7 @@ actor DaemonClient {
     }
 
     /// Fetch recent daemon logs from in-memory ring buffer.
-    func fetchLogs(count: Int = 200, traceId: String? = nil, requestTraceId: String? = nil) async throws -> [DaemonLogEntry] {
+    func fetchLogs(count: Int = 200, traceId: String? = nil, requestTraceId: String? = nil) async throws -> DaemonLogSnapshot {
         var params: [String: JSONValue] = [
             "count": .int(count)
         ]
@@ -158,7 +157,10 @@ actor DaemonClient {
             params: .object(params),
             traceId: requestTraceId
         )
-        return parseDaemonLogs(result["entries"])
+        return DaemonLogSnapshot(
+            entries: parseDaemonLogs(result["entries"]),
+            metadata: parseLogStorageMetadata(result["metadata"])
+        )
     }
 
     // MARK: - Parsing helpers
@@ -304,5 +306,35 @@ actor DaemonClient {
                 attrs: attrs
             )
         }
+    }
+
+    private func parseLogStorageMetadata(_ value: JSONValue?) -> LogStorageMetadata? {
+        guard let value else { return nil }
+        let archivedFiles: [LogArchiveFileInfo]
+        if let files = value["archivedFiles"]?.arrayValue {
+            archivedFiles = files.compactMap { item in
+                guard let name = item["name"]?.stringValue,
+                      let path = item["path"]?.stringValue else {
+                    return nil
+                }
+                return LogArchiveFileInfo(
+                    name: name,
+                    path: path,
+                    sizeBytes: Int64(item["sizeBytes"]?.intValue ?? 0)
+                )
+            }
+        } else {
+            archivedFiles = []
+        }
+        return LogStorageMetadata(
+            schemaVersion: value["schemaVersion"]?.intValue ?? 0,
+            service: value["service"]?.stringValue ?? "daemon",
+            currentFilePath: value["currentFilePath"]?.stringValue ?? "",
+            currentFileSizeBytes: Int64(value["currentFileSizeBytes"]?.intValue ?? 0),
+            archivedFiles: archivedFiles,
+            maxFileBytes: Int64(value["maxFileBytes"]?.intValue ?? 0),
+            maxArchivedFiles: value["maxArchivedFiles"]?.intValue ?? 0,
+            bufferEntryCapacity: value["bufferEntryCapacity"]?.intValue
+        )
     }
 }
