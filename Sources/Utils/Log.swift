@@ -111,6 +111,16 @@ enum Log {
         )
     }
 
+    static func diagnosticLogFileURLs() -> [(label: String, url: URL)] {
+        var urls: [(label: String, url: URL)] = [("ios-current", logFileURL)]
+        urls.append(
+            contentsOf: (1...maxArchivedLogFiles).map {
+                ("ios-archive-\($0)", archivedLogFileURL(index: $0, baseURL: logFileURL))
+            }
+        )
+        return urls
+    }
+
     private static func writeToFile(_ entry: LogEntry) {
         fileQueue.async {
             guard let data = try? encoder.encode(entry) else { return }

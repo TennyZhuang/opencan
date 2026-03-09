@@ -64,6 +64,8 @@ xcrun devicectl device copy from --device "$DEVICE" \
 
 Remote daemon logs live at `~/.opencan/daemon.log` and rotate by size while the daemon is running, retaining `daemon.log.1` through `daemon.log.3`.
 
+The in-app Diagnostics screen can also generate a shareable JSON diagnostics bundle that captures current app log files, recent daemon log files fetched over SSH, ring-buffer snapshots, and the active app state in one file.
+
 ### Local Integration Harness
 
 Run the end-to-end SSH + daemon + mock ACP smoke suite locally:

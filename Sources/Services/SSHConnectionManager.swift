@@ -39,6 +39,14 @@ actor SSHConnectionManager {
         let sizeBytes: Int
     }
 
+    struct RemoteTextFileSnapshot: Sendable {
+        let path: String
+        let totalBytes: Int64
+        let includedBytes: Int
+        let truncated: Bool
+        let contents: String
+    }
+
     func connect(params: ConnectionParams) async throws -> SSHStdioTransport {
         state = .connecting
         Log.log(
@@ -356,6 +364,59 @@ actor SSHConnectionManager {
         guard outputString.contains("__opencan_mkdir_ok__") else {
             throw SSHError.remoteCommandFailed("Failed to create remote directory '\(path)'")
         }
+    }
+
+    func readRemoteTextFile(path: String, maxBytes: Int) async throws -> RemoteTextFileSnapshot? {
+        guard let client = targetClient else {
+            throw SSHError.notConnected
+        }
+
+        let safeMaxBytes = max(maxBytes, 1)
+        let sizeMarker = "__opencan_file_size__"
+        let missingMarker = "__opencan_file_missing__"
+        let command = try tildeResolvedCommand(
+            path: path,
+            body: """
+        if [ -f "$resolved_path" ]; then
+          file_size=$(wc -c < "$resolved_path" | tr -d '[:space:]')
+          printf '\(sizeMarker)%s\\n' "$file_size"
+          tail -c \(safeMaxBytes) "$resolved_path"
+        else
+          echo "\(missingMarker)"
+        fi
+        """
+        )
+
+        let output = try await client.executeCommand(command)
+        let data = Data(buffer: output)
+        guard let newlineIndex = data.firstIndex(of: 0x0A) else {
+            let response = String(decoding: data, as: UTF8.self)
+            if response.trimmingCharacters(in: .whitespacesAndNewlines) == missingMarker {
+                return nil
+            }
+            throw SSHError.remoteCommandFailed("Failed to read remote file '\(path)'")
+        }
+
+        let header = String(decoding: data.prefix(upTo: newlineIndex), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if header == missingMarker {
+            return nil
+        }
+        guard header.hasPrefix(sizeMarker) else {
+            throw SSHError.remoteCommandFailed("Failed to read remote file '\(path)'")
+        }
+
+        let sizeText = String(header.dropFirst(sizeMarker.count))
+        let totalBytes = Int64(sizeText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        let startIndex = data.index(after: newlineIndex)
+        let contentsData = Data(data[startIndex...])
+        return RemoteTextFileSnapshot(
+            path: path,
+            totalBytes: totalBytes,
+            includedBytes: contentsData.count,
+            truncated: totalBytes > Int64(contentsData.count),
+            contents: String(decoding: contentsData, as: UTF8.self)
+        )
     }
 
     /// Shell-escape a string by wrapping in single quotes and escaping embedded single quotes.
