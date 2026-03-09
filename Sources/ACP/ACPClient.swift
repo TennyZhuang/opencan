@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 /// JSON-RPC client with request/response correlation and notification dispatch.
 actor ACPClient {
@@ -216,12 +215,25 @@ actor ACPClient {
         case .request(let id, let method, let params):
             // PTY echoes our own requests back — ignore them
             if sentRequestIds.contains(id) {
-                Log.acp.debug("Ignoring PTY echo of our request: \(method) id=\(String(describing: id))")
-                Log.toFile("[ACPClient] Ignoring PTY echo: \(method)")
+                Log.log(
+                    level: "debug",
+                    component: "ACPClient",
+                    "Ignoring PTY echo",
+                    extra: [
+                        "method": method,
+                        "requestId": String(describing: id)
+                    ]
+                )
                 return
             }
-            Log.acp.info("Server request: \(method) id=\(String(describing: id))")
-            Log.toFile("[ACPClient] Server request: \(method)")
+            Log.log(
+                component: "ACPClient",
+                "Server request received",
+                extra: [
+                    "method": method,
+                    "requestId": String(describing: id)
+                ]
+            )
             Task { await self.handleServerRequest(id: id, method: method, params: params) }
         }
     }
@@ -251,10 +263,18 @@ actor ACPClient {
             do {
                 try await transport.send(reply)
             } catch {
-                Log.acp.error("Failed to send permission reply: \(error)")
-                Log.toFile("[ACPClient] Failed to send permission reply: \(error)")
+                Log.log(
+                    level: "error",
+                    component: "ACPClient",
+                    "Failed to send permission reply",
+                    extra: ["error": error.localizedDescription]
+                )
             }
-            Log.toFile("[ACPClient] Auto-approved permission: \(selectedOptionId)")
+            Log.log(
+                component: "ACPClient",
+                "Auto-approved permission",
+                extra: ["selectedOptionId": selectedOptionId]
+            )
         default:
             let errMsg = JSONRPCMessage.error(
                 id: id, code: -32601,
@@ -263,8 +283,12 @@ actor ACPClient {
             do {
                 try await transport.send(errMsg)
             } catch {
-                Log.acp.error("Failed to send error reply: \(error)")
-                Log.toFile("[ACPClient] Failed to send error reply: \(error)")
+                Log.log(
+                    level: "error",
+                    component: "ACPClient",
+                    "Failed to send error reply",
+                    extra: ["error": error.localizedDescription]
+                )
             }
         }
     }
