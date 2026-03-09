@@ -212,4 +212,51 @@ final class ACPClientTests: XCTestCase {
 
         XCTAssertTrue(queryClosed.isQueryClosedBeforeResponse)
     }
+
+    func testAutoApprovesPermissionRequestUsingFirstAllowOption() async throws {
+        let transport = TestACPTransport()
+        let client = ACPClient(transport: transport)
+        await client.start()
+        defer { Task { await client.stop() } }
+
+        await transport.yield(.request(
+            id: .int(77),
+            method: "session/request_permission",
+            params: .object([
+                "sessionId": .string("sess-1"),
+                "toolCall": .object([
+                    "toolCallId": .string("tool-1")
+                ]),
+                "options": .array([
+                    .object([
+                        "kind": .string("reject_once"),
+                        "optionId": .string("reject"),
+                    ]),
+                    .object([
+                        "kind": .string("allow_once"),
+                        "optionId": .string("allow-once"),
+                    ]),
+                    .object([
+                        "kind": .string("allow_always"),
+                        "optionId": .string("allow-always"),
+                    ]),
+                ])
+            ])
+        ))
+
+        try await Task.sleep(for: .milliseconds(20))
+        guard let reply = await transport.lastSentMessage() else {
+            XCTFail("Expected a permission response")
+            return
+        }
+
+        guard case .response(let id, let result) = reply else {
+            XCTFail("Expected JSON-RPC response, got \(reply)")
+            return
+        }
+
+        XCTAssertEqual(id, .int(77))
+        XCTAssertEqual(result["outcome"]?["outcome"], .string("selected"))
+        XCTAssertEqual(result["outcome"]?["optionId"], .string("allow-once"))
+    }
 }

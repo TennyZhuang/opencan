@@ -5,6 +5,12 @@ import SwiftData
 /// Root state coordinator connecting SSH, ACP, and UI.
 @MainActor @Observable
 final class AppState {
+    private struct PendingPromptDraft {
+        let conversationId: String
+        let text: String
+        let promptBlocks: [PromptBlock]
+    }
+
     private let chatUploadTTLHours = 24
     private let chatUploadCleanupInterval: TimeInterval = 15 * 60
     private let maxChatImageBytes = 12 * 1024 * 1024
@@ -98,9 +104,11 @@ final class AppState {
     private var isRefreshingDaemonSessions = false
     /// Session-scoped uploaded image mentions.
     private var imageMentionsBySession: [String: [UploadedImageMention]] = [:]
+    /// Product-level queue for follow-up messages while ACP turn is still busy.
+    private var pendingPromptQueue: [PendingPromptDraft] = []
     /// Last time we ran remote upload cleanup.
     private var lastChatUploadCleanupAt: Date?
-    /// True when an unexpected transport drop should trigger auto reconnect on chat reopen.
+    /// True when an unexpected transport drop should trigger auto reconnect for chat recovery.
     private var shouldAutoReconnectInterruptedSession = false
     /// Guards against overlapping reconnect+open recovery attempts.
     private var isAutoReconnectInProgress = false
@@ -108,6 +116,22 @@ final class AppState {
     var autoReconnectConnectHandler: ((Node) async -> Void)?
     /// Test hook for mocking the auto-reconnect open step.
     var autoReconnectOpenHandler: ((String, ModelContext) async throws -> Void)?
+
+    /// True when chat should stay on-page and show the reconnecting overlay
+    /// until the interrupted conversation is attached again.
+    var shouldShowChatReconnectOverlay: Bool {
+        let hasConversationTarget = !((activeSession?.conversationId ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty)
+        let hasRuntimeTarget = !((currentSessionId ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty)
+        let hasRecoveryTarget = activeNode != nil
+            && activeWorkspace != nil
+            && (hasConversationTarget || hasRuntimeTarget)
+        guard hasRecoveryTarget else { return false }
+        return shouldAutoReconnectInterruptedSession || isAutoReconnectInProgress
+    }
 
     /// Uploaded image mentions available to the active chat session.
     var availableImageMentions: [UploadedImageMention] {
@@ -326,14 +350,20 @@ final class AppState {
 
     /// Connect using a mock transport for offline UI testing.
     /// Skips SSH entirely — plugs MockACPTransport directly into ACPClient.
-    func connectMock(workspace: Workspace, scenario: MockScenario = .simple) {
+    func connectMock(
+        workspace: Workspace,
+        scenario: MockScenario = .simple,
+        isAutoReconnect: Bool = false
+    ) {
         if connectionStatus == .connected || connectionStatus == .connecting {
             cleanupConnection()
         }
 
         connectionStatus = .connecting
         connectionError = nil
-        shouldAutoReconnectInterruptedSession = false
+        if !isAutoReconnect {
+            shouldAutoReconnectInterruptedSession = false
+        }
         activeWorkspace = workspace
         activeNode = workspace.node
         availableNodeAgents = []
@@ -562,7 +592,7 @@ final class AppState {
     }
 
     /// Mark the current chat transport as unexpectedly interrupted and preserve
-    /// enough UI/session context for automatic reconnect on next page reopen.
+    /// enough UI/session context for automatic in-place reconnect/re-attach.
     func markTransportInterrupted(_ errorMessage: String) {
         let hasLiveConnection = acpClient != nil || daemonClient != nil || transport != nil || mockTransport != nil
         guard hasLiveConnection || connectionStatus == .connected || connectionStatus == .connecting else {
@@ -602,6 +632,7 @@ final class AppState {
         currentTraceId = nil
         isPrompting = false
         PromptLifecycle.clearAllPromptActivity(appState: self)
+        clearPendingPromptQueue()
         isCreatingSession = false
         isUploadingImage = false
         isRefreshingDaemonSessions = false
@@ -742,13 +773,9 @@ final class AppState {
     @discardableResult
     func sendMessage(_ text: String) -> Bool {
         guard !text.isEmpty else { return false }
-        guard !isPrompting else {
-            Log.toFile("[AppState] sendMessage blocked — isPrompting=true, currentSessionId=\(currentSessionId ?? "nil")")
-            addSystemMessage("Still waiting for response...")
-            return false
-        }
         guard let service = acpService,
-              let sessionId = currentSessionId else {
+              let sessionId = currentSessionId,
+              let conversationId = activeSession?.conversationId ?? currentSessionId else {
             addSystemMessage("Not connected — please reconnect")
             return false
         }
@@ -763,46 +790,29 @@ final class AppState {
         var promptBlocks: [PromptBlock] = [.text(text)]
         promptBlocks.append(contentsOf: referencedMentions.map { .resourceLink($0.promptResourceLink) })
 
-        let userMsg = ChatMessage(role: .user, content: text)
-        messages.append(userMsg)
-
-        // Set session title from first user message
-        if let session = activeSession, session.title == nil {
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let firstLine = trimmed.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? trimmed
-            session.title = String(firstLine.prefix(50))
-        }
-
-        let assistantMsg = ChatMessage(role: .assistant, isStreaming: true)
-        messages.append(assistantMsg)
-        isPrompting = true
-        PromptLifecycle.markPromptActivity(appState: self, for: sessionId)
-        forceScrollToBottom = true
-
-        let traceId = newTraceId()
-        Log.log(
-            component: "AppState",
-            "sendMessage dispatching prompt, resourceLinks=\(referencedMentions.count), promptSessionId=\(sessionId)",
-            traceId: traceId,
-            sessionId: sessionId,
-            extra: [
-                "promptSessionId": sessionId,
-                "activeConversationId": activeSession?.conversationId ?? "",
-                "activeRuntimeId": activeSession?.runtimeId ?? "",
-                "currentSessionId": currentSessionId ?? "",
-                "resourceLinkCount": String(referencedMentions.count)
-            ]
-        )
-
-        Task {
-            await PromptLifecycle.executePrompt(
-                appState: self,
-                service: service,
-                sessionId: sessionId,
-                prompt: promptBlocks,
-                traceId: traceId
+        if isPrompting {
+            pendingPromptQueue.append(PendingPromptDraft(
+                conversationId: conversationId,
+                text: text,
+                promptBlocks: promptBlocks
+            ))
+            Log.toFile(
+                "[AppState] sendMessage queued — currentSessionId=\(sessionId), queuedCount=\(pendingPromptQueue.count)"
             )
+            addSystemMessage("Queued message \(pendingPromptQueue.count). It will send when the current response finishes.")
+            forceScrollToBottom = true
+            contentDidChange()
+            return true
         }
+
+        dispatchPrompt(
+            service: service,
+            conversationId: conversationId,
+            sessionId: sessionId,
+            text: text,
+            promptBlocks: promptBlocks,
+            resourceLinkCount: referencedMentions.count
+        )
         return true
     }
 
@@ -1181,6 +1191,7 @@ final class AppState {
     private func settlePromptingStateForSessionSwitch(clearMessages: Bool) {
         isPrompting = false
         PromptLifecycle.clearAllPromptActivity(appState: self)
+        clearPendingPromptQueue()
         for msg in messages where msg.isStreaming {
             msg.isStreaming = false
         }
@@ -1247,6 +1258,61 @@ final class AppState {
 
     private func addSystemMessage(_ text: String) {
         messages.append(ChatMessage(role: .system, content: text))
+    }
+
+    private func dispatchPrompt(
+        service: ACPService,
+        conversationId: String,
+        sessionId: String,
+        text: String,
+        promptBlocks: [PromptBlock],
+        resourceLinkCount: Int
+    ) {
+        let userMsg = ChatMessage(role: .user, content: text)
+        messages.append(userMsg)
+
+        if let session = activeSession, session.title == nil {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let firstLine = trimmed.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? trimmed
+            session.title = String(firstLine.prefix(50))
+        }
+
+        let assistantMsg = ChatMessage(role: .assistant, isStreaming: true)
+        messages.append(assistantMsg)
+        isPrompting = true
+        PromptLifecycle.markPromptActivity(appState: self, for: sessionId)
+        forceScrollToBottom = true
+
+        let traceId = newTraceId()
+        Log.log(
+            component: "AppState",
+            "sendMessage dispatching prompt, resourceLinks=\(resourceLinkCount), promptSessionId=\(sessionId)",
+            traceId: traceId,
+            sessionId: sessionId,
+            extra: [
+                "conversationId": conversationId,
+                "promptSessionId": sessionId,
+                "activeConversationId": activeSession?.conversationId ?? "",
+                "activeRuntimeId": activeSession?.runtimeId ?? "",
+                "currentSessionId": currentSessionId ?? "",
+                "resourceLinkCount": String(resourceLinkCount),
+                "queuedCountAfterDispatch": String(pendingPromptQueue.count)
+            ]
+        )
+
+        Task {
+            await PromptLifecycle.executePrompt(
+                appState: self,
+                service: service,
+                sessionId: sessionId,
+                prompt: promptBlocks,
+                traceId: traceId
+            )
+        }
+    }
+
+    private func clearPendingPromptQueue() {
+        pendingPromptQueue.removeAll()
     }
 }
 
@@ -1359,6 +1425,10 @@ extension AppState: ConversationLifecycleAppState {
     func lifecycleAddSystemMessage(_ text: String) {
         addSystemMessage(text)
     }
+
+    func lifecycleRecoverBusyPromptingState(sessionId: String) {
+        promptLifecycleRecoverBusyState(sessionId: sessionId)
+    }
 }
 
 extension AppState: PromptLifecycleAppState {
@@ -1390,6 +1460,43 @@ extension AppState: PromptLifecycleAppState {
 
     func promptLifecycleLastAssistantMessage() -> ChatMessage {
         lastAssistantMessage()
+    }
+
+    func promptLifecycleRecoverBusyState(sessionId: String) {
+        isPrompting = true
+        PromptLifecycle.markPromptActivity(appState: self, for: sessionId)
+        if let lastAssistant = messages.last(where: { $0.role == .assistant }) {
+            let hasVisibleOutput = !lastAssistant.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !lastAssistant.toolCalls.isEmpty
+            if !hasVisibleOutput {
+                lastAssistant.isStreaming = true
+            }
+        } else {
+            messages.append(ChatMessage(role: .assistant, isStreaming: true))
+        }
+    }
+
+    func promptLifecycleDidSettlePrompt(sessionId: String?) {
+        guard !isPrompting else { return }
+        guard let service = acpService,
+              let runtimeId = currentSessionId,
+              let activeConversationId = activeSession?.conversationId ?? currentSessionId else {
+            return
+        }
+        guard let next = pendingPromptQueue.first,
+              next.conversationId == activeConversationId else {
+            return
+        }
+
+        pendingPromptQueue.removeFirst()
+        dispatchPrompt(
+            service: service,
+            conversationId: activeConversationId,
+            sessionId: runtimeId,
+            text: next.text,
+            promptBlocks: next.promptBlocks,
+            resourceLinkCount: max(0, next.promptBlocks.count - 1)
+        )
     }
 }
 

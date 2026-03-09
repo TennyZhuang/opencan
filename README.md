@@ -88,7 +88,8 @@ OpenCAN now uses a daemon-owned conversation/runtime model.
 | JSON-RPC | `JSONRPCFramer`, `JSONRPCMessage`, `JSONValue` | Newline-delimited JSON-RPC 2.0 framing |
 | Daemon | `opencan-daemon`, `ClientHandler`, `SessionManager`, `ACPProxy` | Conversation registry, runtime lifecycle, replay, restore, diagnostics |
 | ACP | `ACPClient`, `DaemonClient`, `ACPService`, `SessionUpdateParser` | Request correlation, daemon RPCs, ACP passthrough, notification parsing |
-| AppState | `AppState`, `ChatMessage` | Conversation open/recover/send coordination and rendered transcript state |
+| Conversation | `ConversationLifecycle`, `ConversationPersistence`, `PromptLifecycle` | Conversation open/recover flows, local session sync, prompt terminal-state handling |
+| AppState | `AppState`, `ChatMessage` | UI-facing coordinator, connection state, transcript state, and navigation context |
 | SwiftUI | `ContentView`, `SessionPickerView`, `ChatView`, `DiagnosticView` | Navigation, picker, chat UX, diagnostics UI |
 
 ### Core identities
@@ -105,8 +106,9 @@ OpenCAN now uses a daemon-owned conversation/runtime model.
 - Forwarded `session/update` notifications include `__seq`, `conversationId`, and `runtimeId`
 - On restored conversations, daemon routes by `runtimeId` internally but forwards upstream ACP requests with the stable wire `sessionId = conversationId`; using `runtimeId` on the ACP wire loses history context
 - Prompt termination must be observable via `prompt_complete`, prompt error, or prompt success fallback
+- App-side follow-up sends stay serial with ACP turns: if a conversation is reopened in `starting` / `prompting` / `draining`, the app keeps the session busy and queues new user sends on the active conversation until the turn settles
 
-For more detail, see `docs/daemon-architecture.md` and `docs/conversation-runtime-refactor.md`.
+For the current implemented contract, see `docs/daemon-architecture.md` and `CLAUDE.md`. `docs/conversation-runtime-refactor.md` remains useful as design background, not the canonical source for current behavior.
 
 ## Project Structure
 

@@ -1,4 +1,4 @@
-// mock_acp_server simulates claude-agent-acp for testing.
+// mock_acp_server simulates ACP agent adapters for testing.
 // It reads JSON-RPC from stdin and writes responses/notifications to stdout.
 //
 // Environment variables:
@@ -27,6 +27,13 @@ var omitCreatedFromList = false
 var loadErrorDetails = ""
 var sessions []string
 var configuredListSessions []string
+var sessionRecords = map[string]sessionRecord{}
+
+type sessionRecord struct {
+	CWD       string
+	Title     string
+	UpdatedAt string
+}
 
 func init() {
 	if v := os.Getenv("MOCK_PROMPT_DELAY"); v != "" {
@@ -58,6 +65,7 @@ func init() {
 				continue
 			}
 			configuredListSessions = append(configuredListSessions, id)
+			upsertSessionRecord(id, "/tmp/mock-workspace")
 		}
 	}
 }
@@ -99,6 +107,8 @@ func main() {
 			handleSessionList(msg.ID)
 		case "session/load":
 			handleSessionLoad(msg.ID, msg.Params)
+		case "session/cancel":
+			respond(msg.ID, map[string]interface{}{})
 		}
 	}
 }
@@ -143,26 +153,44 @@ func notify(method string, params interface{}) {
 func handleInitialize(id *json.RawMessage) {
 	respond(id, map[string]interface{}{
 		"protocolVersion": 1,
-		"serverCapabilities": map[string]interface{}{
-			"prompts": true,
+		"agentCapabilities": map[string]interface{}{
+			"loadSession": true,
+			"promptCapabilities": map[string]interface{}{
+				"image":           true,
+				"embeddedContext": true,
+			},
+			"sessionCapabilities": map[string]interface{}{
+				"list": map[string]interface{}{},
+			},
 		},
-		"serverInfo": map[string]interface{}{
+		"agentInfo": map[string]interface{}{
 			"name":    "mock-acp-server",
-			"version": "0.1.0",
+			"title":   "Mock ACP Server",
+			"version": "0.2.0",
 		},
 	})
 }
 
 func handleSessionNew(id *json.RawMessage, params json.RawMessage) {
+	var payload struct {
+		CWD string `json:"cwd"`
+	}
+	_ = json.Unmarshal(params, &payload)
+
 	sessionCounter++
 	sessionID := fmt.Sprintf("mock-sess-%04d", sessionCounter)
 	sessions = append(sessions, sessionID)
+	upsertSessionRecord(sessionID, payload.CWD)
 
 	respond(id, map[string]interface{}{
-		"sessionId": sessionID,
+		"sessionId":     sessionID,
+		"modes":         mockModes(),
+		"models":        mockModels(),
+		"configOptions": mockConfigOptions(),
 	})
 
-	// Send system message
+	sendSessionMetadataUpdates(sessionID)
+
 	notify("session/update", map[string]interface{}{
 		"sessionId": sessionID,
 		"update": map[string]interface{}{
@@ -179,7 +207,7 @@ func handleSessionPrompt(id *json.RawMessage, params json.RawMessage) {
 	var p struct {
 		SessionID string `json:"sessionId"`
 	}
-	json.Unmarshal(params, &p)
+	_ = json.Unmarshal(params, &p)
 
 	eventCount := 0
 	sendEvent := func(update map[string]interface{}) bool {
@@ -195,7 +223,6 @@ func handleSessionPrompt(id *json.RawMessage, params json.RawMessage) {
 		return true
 	}
 
-	// Stream text chunks
 	chunks := []string{"Hello", "! I'm ", "the mock ", "ACP server", ". How can ", "I help you?"}
 	for _, chunk := range chunks {
 		sendEvent(map[string]interface{}{
@@ -208,24 +235,33 @@ func handleSessionPrompt(id *json.RawMessage, params json.RawMessage) {
 	}
 
 	if includeToolCall {
-		// Tool call start
 		sendEvent(map[string]interface{}{
 			"sessionUpdate": "tool_call",
 			"toolCallId":    "tool-1",
 			"title":         "Read",
+			"kind":          "read",
+			"status":        "pending",
 			"rawInput":      map[string]interface{}{"file_path": "/tmp/test.txt"},
 		})
 
-		// Tool call update with output
+		sendEvent(map[string]interface{}{
+			"sessionUpdate": "tool_call_update",
+			"toolCallId":    "tool-1",
+			"title":         "Read",
+			"status":        "in_progress",
+		})
+
 		sendEvent(map[string]interface{}{
 			"sessionUpdate": "tool_call_update",
 			"toolCallId":    "tool-1",
 			"title":         "Read",
 			"status":        "completed",
-			"rawOutput":     "file contents here",
+			"rawOutput": []map[string]interface{}{{
+				"type": "text",
+				"text": "file contents here",
+			}},
 		})
 
-		// More text after tool call
 		sendEvent(map[string]interface{}{
 			"sessionUpdate": "agent_message_chunk",
 			"content": map[string]interface{}{
@@ -235,7 +271,6 @@ func handleSessionPrompt(id *json.RawMessage, params json.RawMessage) {
 		})
 	}
 
-	// Full message
 	sendEvent(map[string]interface{}{
 		"sessionUpdate": "agent_message",
 		"content": map[string]interface{}{
@@ -245,7 +280,6 @@ func handleSessionPrompt(id *json.RawMessage, params json.RawMessage) {
 	})
 
 	if !omitPromptComplete {
-		// Prompt complete
 		sendEvent(map[string]interface{}{
 			"sessionUpdate": "prompt_complete",
 			"stopReason":    "end_turn",
@@ -261,15 +295,11 @@ func handleSessionList(id *json.RawMessage) {
 	items := make([]map[string]interface{}, 0, len(sessions)+len(configuredListSessions))
 	if !omitCreatedFromList {
 		for _, sid := range sessions {
-			items = append(items, map[string]interface{}{
-				"sessionId": sid,
-			})
+			items = append(items, sessionListItem(sid))
 		}
 	}
 	for _, sid := range configuredListSessions {
-		items = append(items, map[string]interface{}{
-			"sessionId": sid,
-		})
+		items = append(items, sessionListItem(sid))
 	}
 
 	respond(id, map[string]interface{}{
@@ -305,5 +335,121 @@ func handleSessionLoad(id *json.RawMessage, params json.RawMessage) {
 		})
 		return
 	}
-	respond(id, map[string]interface{}{})
+	upsertSessionRecord(payload.SessionID, payload.CWD)
+	respond(id, map[string]interface{}{
+		"sessionId":     payload.SessionID,
+		"modes":         mockModes(),
+		"models":        mockModels(),
+		"configOptions": mockConfigOptions(),
+	})
+	sendSessionMetadataUpdates(payload.SessionID)
+}
+
+func sendSessionMetadataUpdates(sessionID string) {
+	notify("session/update", map[string]interface{}{
+		"sessionId": sessionID,
+		"update": map[string]interface{}{
+			"sessionUpdate": "current_mode_update",
+			"currentModeId": "default",
+		},
+	})
+	notify("session/update", map[string]interface{}{
+		"sessionId": sessionID,
+		"update": map[string]interface{}{
+			"sessionUpdate": "config_options_update",
+			"configOptions": mockConfigOptions(),
+		},
+	})
+	notify("session/update", map[string]interface{}{
+		"sessionId": sessionID,
+		"update": map[string]interface{}{
+			"sessionUpdate":     "available_commands_update",
+			"availableCommands": mockAvailableCommands(),
+		},
+	})
+}
+
+func mockModes() map[string]interface{} {
+	return map[string]interface{}{
+		"currentModeId": "default",
+		"availableModes": []map[string]interface{}{
+			{"id": "default", "name": "Default", "description": "Standard behavior"},
+			{"id": "plan", "name": "Plan Mode", "description": "Planning mode"},
+			{"id": "acceptEdits", "name": "Accept Edits", "description": "Auto-accept edits"},
+		},
+	}
+}
+
+func mockModels() map[string]interface{} {
+	return map[string]interface{}{
+		"currentModelId": "mock-model",
+		"availableModels": []map[string]interface{}{
+			{"modelId": "mock-model", "name": "Mock Model", "description": "Mock ACP test model"},
+		},
+	}
+}
+
+func mockConfigOptions() []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"id":           "mode",
+			"name":         "Mode",
+			"description":  "Session permission mode",
+			"category":     "mode",
+			"type":         "select",
+			"currentValue": "default",
+			"options": []map[string]interface{}{
+				{"value": "default", "name": "Default", "description": "Standard behavior"},
+				{"value": "plan", "name": "Plan Mode", "description": "Planning mode"},
+				{"value": "acceptEdits", "name": "Accept Edits", "description": "Auto-accept edits"},
+			},
+		},
+		{
+			"id":           "model",
+			"name":         "Model",
+			"description":  "AI model to use",
+			"category":     "model",
+			"type":         "select",
+			"currentValue": "mock-model",
+			"options": []map[string]interface{}{
+				{"value": "mock-model", "name": "Mock Model", "description": "Mock ACP test model"},
+			},
+		},
+	}
+}
+
+func mockAvailableCommands() []map[string]interface{} {
+	return []map[string]interface{}{
+		{"name": "status", "description": "Show current session status"},
+		{"name": "review", "description": "Review current changes and find issues"},
+		{"name": "compact", "description": "Compact the conversation"},
+	}
+}
+
+func upsertSessionRecord(sessionID, cwd string) {
+	trimmedCWD := strings.TrimSpace(cwd)
+	if trimmedCWD == "" {
+		trimmedCWD = "/tmp/mock-workspace"
+	}
+	record := sessionRecords[sessionID]
+	record.CWD = trimmedCWD
+	if strings.TrimSpace(record.Title) == "" {
+		record.Title = fmt.Sprintf("Mock Session %s", sessionID)
+	}
+	record.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	sessionRecords[sessionID] = record
+}
+
+func sessionListItem(sessionID string) map[string]interface{} {
+	record, ok := sessionRecords[sessionID]
+	if !ok {
+		upsertSessionRecord(sessionID, "/tmp/mock-workspace")
+		record = sessionRecords[sessionID]
+	}
+	return map[string]interface{}{
+		"sessionId": sessionID,
+		"cwd":       record.CWD,
+		"title":     record.Title,
+		"updatedAt": record.UpdatedAt,
+	}
 }

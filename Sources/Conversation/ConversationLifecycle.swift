@@ -50,6 +50,7 @@ protocol ConversationLifecycleAppState: AnyObject {
     func lifecycleHandleSessionEvent(_ event: SessionEvent, sessionId: String?)
     func lifecycleRefreshDaemonSessions() async
     func lifecycleAddSystemMessage(_ text: String)
+    func lifecycleRecoverBusyPromptingState(sessionId: String)
 }
 
 enum ConversationLifecycle {
@@ -80,6 +81,7 @@ enum ConversationLifecycle {
         if currentConversationId == conversationId,
            let activeRuntimeId = appState.activeSession?.runtimeId,
            appState.currentSessionId == activeRuntimeId,
+           !appState.shouldAutoReconnectInterruptedSessionForLifecycle,
            !appState.messages.isEmpty {
             if let existingSession {
                 appState.lifecycleBackfillConversationIdentity(existingSession, conversationId: conversationId)
@@ -196,14 +198,21 @@ enum ConversationLifecycle {
         appState.lastEventSeqByRuntimeIDForLifecycle[runtimeId] = result.attachment.bufferedEvents.last?.seq ?? 0
         appState.lifecycleSettlePromptingStateForSessionSwitch(clearMessages: true)
 
+        var bufferedPromptCompleted = false
         for buffered in result.attachment.bufferedEvents {
             if let event = SessionUpdateParser.parse(buffered.event) {
+                if case .promptComplete = event {
+                    bufferedPromptCompleted = true
+                }
                 appState.lifecycleHandleSessionEvent(event, sessionId: runtimeId)
             }
             appState.lastEventSeqByRuntimeIDForLifecycle[runtimeId] = buffered.seq
         }
         for msg in appState.messages where msg.isStreaming {
             msg.isStreaming = false
+        }
+        if attachmentRequiresPromptRecovery(result.attachment.state) && !bufferedPromptCompleted {
+            appState.lifecycleRecoverBusyPromptingState(sessionId: runtimeId)
         }
 
         let persistedSession = ConversationPersistence.upsertLocalSessionForOpen(
@@ -337,6 +346,10 @@ enum ConversationLifecycle {
         } else {
             return "Conversation opened"
         }
+    }
+
+    private static func attachmentRequiresPromptRecovery(_ state: String) -> Bool {
+        state == "starting" || state == "prompting" || state == "draining"
     }
 
     @MainActor

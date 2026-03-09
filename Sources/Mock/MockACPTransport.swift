@@ -440,8 +440,8 @@ actor MockACPTransport: ACPTransport {
                 "sessionUpdate": .string("tool_call"),
                 "toolCallId": .string(id),
                 "title": .string(name),
-                "kind": .string("tool_use"),
-                "status": .string("running"),
+                "kind": .string(mockToolKind(for: name)),
+                "status": .string("pending"),
                 "rawInput": .null
             ]))
 
@@ -449,10 +449,10 @@ actor MockACPTransport: ACPTransport {
             var updateObj: [String: JSONValue] = [
                 "sessionUpdate": .string("tool_call_update"),
                 "toolCallId": .string(id),
-                "status": .string("running"),
+                "status": .string("in_progress"),
             ]
             if let output {
-                updateObj["rawOutput"] = .string(output)
+                updateObj["rawOutput"] = mockToolOutputValue(output)
             }
             yieldSessionUpdate(sessionId: sessionId, update: .object(updateObj))
 
@@ -461,7 +461,7 @@ actor MockACPTransport: ACPTransport {
                 "sessionUpdate": .string("tool_call_update"),
                 "toolCallId": .string(id),
                 "status": .string(failed ? "failed" : "completed"),
-                "rawOutput": .string(output)
+                "rawOutput": mockToolOutputValue(output)
             ]))
 
         case .promptComplete(let reason):
@@ -482,6 +482,31 @@ actor MockACPTransport: ACPTransport {
             params["conversationId"] = .string(conversationId)
         }
         messageContinuation.yield(.notification(method: ACPMethods.sessionUpdate, params: .object(params)))
+    }
+
+
+    private func mockToolKind(for name: String) -> String {
+        switch name.lowercased() {
+        case "read":
+            return "read"
+        case "edit", "write":
+            return "edit"
+        case "bash", "shell":
+            return "execute"
+        case "search", "fetch":
+            return "fetch"
+        default:
+            return "tool_use"
+        }
+    }
+
+    private func mockToolOutputValue(_ output: String) -> JSONValue {
+        .array([
+            .object([
+                "type": .string("text"),
+                "text": .string(output)
+            ])
+        ])
     }
 
     private func conversationID(forRuntimeID runtimeId: String) -> String? {
@@ -660,18 +685,18 @@ actor MockACPTransport: ACPTransport {
                     "sessionUpdate": .string("tool_call"),
                     "toolCallId": .string(id),
                     "title": .string(name),
-                    "kind": .string("tool_use"),
-                    "status": .string("running"),
+                    "kind": .string(mockToolKind(for: name)),
+                    "status": .string("pending"),
                     "rawInput": .null
                 ])
             case .toolCallUpdate(let id, let output):
                 var updateObj: [String: JSONValue] = [
                     "sessionUpdate": .string("tool_call_update"),
                     "toolCallId": .string(id),
-                    "status": .string("running")
+                    "status": .string("in_progress")
                 ]
                 if let output {
-                    updateObj["rawOutput"] = .string(output)
+                    updateObj["rawOutput"] = mockToolOutputValue(output)
                 }
                 update = .object(updateObj)
             case .toolCallComplete(let id, let output, let failed):
@@ -679,7 +704,7 @@ actor MockACPTransport: ACPTransport {
                     "sessionUpdate": .string("tool_call_update"),
                     "toolCallId": .string(id),
                     "status": .string(failed ? "failed" : "completed"),
-                    "rawOutput": .string(output)
+                    "rawOutput": mockToolOutputValue(output)
                 ])
             case .promptComplete(let reason):
                 update = .object([
@@ -724,6 +749,34 @@ actor MockACPTransport: ACPTransport {
                     "type": .string("text"),
                     "text": .string(text),
                 ])
+            ])
+        ]
+        if let runtimeId {
+            params["runtimeId"] = .string(runtimeId)
+        }
+        if let conversationId {
+            params["conversationId"] = .string(conversationId)
+        }
+        if let seq {
+            params["__seq"] = .int(seq)
+        }
+        messageContinuation.yield(
+            .notification(method: ACPMethods.sessionUpdate, params: .object(params))
+        )
+    }
+
+    func emitPromptCompleteForTest(
+        sessionId: String,
+        runtimeId: String? = nil,
+        conversationId: String? = nil,
+        reason: StopReason = .endTurn,
+        seq: Int? = nil
+    ) {
+        var params: [String: JSONValue] = [
+            "sessionId": .string(sessionId),
+            "update": .object([
+                "sessionUpdate": .string("prompt_complete"),
+                "stopReason": .string(reason.rawValue)
             ])
         ]
         if let runtimeId {
