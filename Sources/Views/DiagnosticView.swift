@@ -4,6 +4,11 @@ struct DiagnosticView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
 
+    private struct SharedBundle: Identifiable {
+        let id = UUID()
+        let url: URL
+    }
+
     private enum Tab: String, CaseIterable, Identifiable {
         case iosLogs = "iOS Logs"
         case daemonLogs = "Daemon Logs"
@@ -19,6 +24,9 @@ struct DiagnosticView: View {
     @State private var daemonLogMetadata: LogStorageMetadata?
     @State private var daemonTraceFilter = ""
     @State private var daemonError: String?
+    @State private var sharedBundle: SharedBundle?
+    @State private var bundleGenerationError: String?
+    @State private var isGeneratingBundle = false
 
     var body: some View {
         NavigationStack {
@@ -45,14 +53,31 @@ struct DiagnosticView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarLeading) {
-                    ShareLink(item: exportJSONString()) {
-                        Image(systemName: "square.and.arrow.up")
+                    Button {
+                        Task { await generateDiagnosticsBundle() }
+                    } label: {
+                        if isGeneratingBundle {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "square.and.arrow.up")
+                        }
                     }
+                    .disabled(isGeneratingBundle)
                 }
             }
             .task {
                 loadIOSLogs()
                 await loadDaemonLogs()
+            }
+            .sheet(item: $sharedBundle) { bundle in
+                ActivityShareSheet(activityItems: [bundle.url])
+            }
+            .alert("Couldn't create diagnostics bundle", isPresented: bundleGenerationErrorBinding) {
+                Button("OK", role: .cancel) {
+                    bundleGenerationError = nil
+                }
+            } message: {
+                Text(bundleGenerationError ?? "Unknown error")
             }
         }
     }
@@ -206,53 +231,38 @@ struct DiagnosticView: View {
         }
     }
 
-    private func exportJSONString() -> String {
-        struct StateSnapshot: Codable {
-            let connectionStatus: String
-            let activeNode: String?
-            let activeWorkspace: String?
-            let currentSessionId: String?
-            let isPrompting: Bool
-            let messageCount: Int
-            let daemonSessions: [DaemonSessionInfo]
-        }
-
-        struct Snapshot: Codable {
-            let exportedAt: Date
-            let schemaVersion: Int
-            let iosLogMetadata: LogStorageMetadata
-            let daemonLogMetadata: LogStorageMetadata?
-            let iosLogs: [LogEntry]
-            let daemonLogs: [DaemonLogEntry]
-            let state: StateSnapshot
-        }
-
-        let payload = Snapshot(
-            exportedAt: Date(),
-            schemaVersion: 1,
-            iosLogMetadata: iosLogMetadata,
-            daemonLogMetadata: daemonLogMetadata,
-            iosLogs: iosLogs,
-            daemonLogs: daemonLogs,
-            state: StateSnapshot(
-                connectionStatus: appState.connectionStatusLabel,
-                activeNode: appState.activeNode?.name,
-                activeWorkspace: appState.activeWorkspace?.name,
-                currentSessionId: appState.currentSessionId,
-                isPrompting: appState.isPrompting,
-                messageCount: appState.messages.count,
-                daemonSessions: appState.daemonSessions
-            )
+    private var bundleGenerationErrorBinding: Binding<Bool> {
+        Binding(
+            get: { bundleGenerationError != nil },
+            set: { newValue in
+                if !newValue {
+                    bundleGenerationError = nil
+                }
+            }
         )
+    }
 
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(payload),
-              let string = String(data: data, encoding: .utf8) else {
-            return "{}"
+    private func generateDiagnosticsBundle() async {
+        isGeneratingBundle = true
+        bundleGenerationError = nil
+        loadIOSLogs()
+        await loadDaemonLogs()
+
+        let traceId = daemonTraceFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let url = try await appState.createDiagnosticsBundle(
+                iosLogs: iosLogs,
+                iosLogMetadata: iosLogMetadata,
+                daemonLogs: daemonLogs,
+                daemonLogMetadata: daemonLogMetadata,
+                daemonTraceFilter: traceId.isEmpty ? nil : traceId
+            )
+            sharedBundle = SharedBundle(url: url)
+        } catch {
+            bundleGenerationError = error.localizedDescription
         }
-        return string
+
+        isGeneratingBundle = false
     }
 
     private func formatBytes(_ count: Int64) -> String {

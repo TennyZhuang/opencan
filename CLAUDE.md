@@ -164,7 +164,7 @@ This is the end-to-end contract for "agent output reaches UI" and is treated as 
 - **`@MainActor @Observable`** for UI state (`AppState`, `ChatMessage`).
 - **`AsyncStream`** for notifications and transport message pipelines.
 - **Structured logging:** prefer `Log.log(...)` and `Log.timed(...)` (JSON lines + in-memory ring buffer). `Log.toFile(...)` remains for legacy call sites.
-- **Diagnostics:** `DiagnosticView` can inspect iOS log ring buffer, fetch daemon logs (`daemon/logs`), inspect state snapshot, and export JSON with log storage metadata (schema version, file sizes, retention).
+- **Diagnostics:** `DiagnosticView` can inspect iOS log ring buffer, fetch daemon logs (`daemon/logs`), inspect state snapshot, and generate a shareable JSON diagnostics bundle containing app/daemon log files, ring-buffer snapshots, and log storage metadata.
 - **XcodeGen** (`project.yml`) generates `.xcodeproj`; run `xcodegen generate` after file list changes.
 - **Unit tests:** `AppStateTests` cover agent probing/fallback, image mention prompts, single-owner conversation reopen behavior, interrupted-session auto reconnect paths, detach-before-switch, cross-session filtering, dead-conversation handling, and empty-runtime pruning.
 - **Other tests:** `ACPClientTests`, `SessionPickerPathMatchingTests`, `SessionUpdateParserTests`, `JSONRPCMessageTests`.

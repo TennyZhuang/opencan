@@ -159,12 +159,125 @@ final class AppState {
         return try await daemonClient.fetchLogs(count: count, traceId: traceId)
     }
 
+    func createDiagnosticsBundle(
+        iosLogs: [LogEntry],
+        iosLogMetadata: LogStorageMetadata,
+        daemonLogs: [DaemonLogEntry],
+        daemonLogMetadata: LogStorageMetadata?,
+        daemonTraceFilter: String?
+    ) async throws -> URL {
+        let exportedAt = Date()
+        let payload = DiagnosticsBundlePayload(
+            schemaVersion: DiagnosticsBundleWriter.schemaVersion,
+            exportedAt: exportedAt,
+            bundle: DiagnosticsBundleInfo(
+                fileName: DiagnosticsBundleWriter.bundleFileName(exportedAt: exportedAt),
+                maxBytesPerLogFile: DiagnosticsBundleWriter.maxBytesPerLogFile
+            ),
+            app: DiagnosticsBundleWriter.appInfo(),
+            device: DiagnosticsBundleWriter.deviceInfo(),
+            filters: DiagnosticsBundleFilters(daemonTraceId: daemonTraceFilter),
+            state: diagnosticsStateSnapshot(),
+            iosLogMetadata: iosLogMetadata,
+            daemonLogMetadata: daemonLogMetadata,
+            iosLogs: iosLogs,
+            daemonLogs: daemonLogs,
+            iosLogFiles: DiagnosticsBundleWriter.captureLocalLogFiles(
+                labeledURLs: Log.diagnosticLogFileURLs(),
+                maxBytes: DiagnosticsBundleWriter.maxBytesPerLogFile
+            ),
+            daemonLogFiles: await captureRemoteDaemonLogFiles(maxBytes: DiagnosticsBundleWriter.maxBytesPerLogFile),
+            notes: [
+                "Remote daemon file capture uses tail sampling and may be truncated per file.",
+                "Daemon ring buffer entries are included separately in daemonLogs."
+            ]
+        )
+        return try DiagnosticsBundleWriter.writeBundle(payload)
+    }
+
     var connectionStatusLabel: String {
         switch connectionStatus {
         case .disconnected: return "disconnected"
         case .connecting: return "connecting"
         case .connected: return "connected"
         case .failed: return "failed"
+        }
+    }
+
+    private func diagnosticsStateSnapshot() -> DiagnosticsBundleState {
+        DiagnosticsBundleState(
+            connectionStatus: connectionStatusLabel,
+            connectionError: connectionError,
+            currentTraceId: currentTraceId,
+            currentSessionId: currentSessionId,
+            isPrompting: isPrompting,
+            messageCount: messages.count,
+            activeNode: activeNode.map {
+                DiagnosticsNodeSnapshot(
+                    name: $0.name,
+                    host: $0.host,
+                    port: $0.port,
+                    username: $0.username,
+                    jumpHost: $0.jumpServer?.host
+                )
+            },
+            activeWorkspace: activeWorkspace.map {
+                DiagnosticsWorkspaceSnapshot(
+                    name: $0.name,
+                    path: $0.path
+                )
+            },
+            activeSession: activeSession.map {
+                DiagnosticsSessionSnapshot(
+                    runtimeId: $0.runtimeId,
+                    conversationId: $0.conversationId,
+                    conversationCwd: $0.conversationCwd,
+                    title: $0.title,
+                    agentID: $0.agentID,
+                    agentCommand: $0.agentCommand,
+                    createdAt: $0.createdAt,
+                    lastUsedAt: $0.lastUsedAt
+                )
+            },
+            availableNodeAgents: availableNodeAgents.map(\.rawValue),
+            hasReliableAgentAvailability: hasReliableAgentAvailability,
+            daemonSessions: daemonSessions
+        )
+    }
+
+    private func captureRemoteDaemonLogFiles(maxBytes: Int) async -> [DiagnosticsCapturedLogFile] {
+        let remoteFiles = [
+            (label: "daemon-current", path: "~/.opencan/daemon.log"),
+            (label: "daemon-archive-1", path: "~/.opencan/daemon.log.1"),
+            (label: "daemon-archive-2", path: "~/.opencan/daemon.log.2"),
+            (label: "daemon-archive-3", path: "~/.opencan/daemon.log.3"),
+        ]
+
+        do {
+            var captures: [DiagnosticsCapturedLogFile] = []
+            for remoteFile in remoteFiles {
+                if let snapshot = try await sshManager.readRemoteTextFile(path: remoteFile.path, maxBytes: maxBytes) {
+                    captures.append(
+                        DiagnosticsCapturedLogFile(
+                            label: remoteFile.label,
+                            path: snapshot.path,
+                            exists: true,
+                            totalBytes: snapshot.totalBytes,
+                            includedBytes: snapshot.includedBytes,
+                            truncated: snapshot.truncated,
+                            contents: snapshot.contents,
+                            error: nil
+                        )
+                    )
+                } else {
+                    captures.append(.missing(label: remoteFile.label, path: remoteFile.path))
+                }
+            }
+            return captures
+        } catch {
+            return remoteFiles.map {
+                .failure(label: $0.label, path: $0.path, error: error.localizedDescription)
+            }
         }
     }
 
