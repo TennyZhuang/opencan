@@ -51,6 +51,8 @@ CONTAINER=$(xcrun simctl get_app_container "$SIM" com.tianyizhuang.OpenCAN data)
 cat "$CONTAINER/Documents/opencan.log"
 ```
 
+The app rotates `opencan.log` by size and retains `opencan.log.1` through `opencan.log.3`.
+
 Copy logs from a real device:
 
 ```bash
@@ -60,7 +62,7 @@ xcrun devicectl device copy from --device "$DEVICE" \
   --domain-type appDataContainer --domain-identifier com.tianyizhuang.OpenCAN
 ```
 
-Remote daemon logs live at `~/.opencan/daemon.log` and rotate to `daemon.log.prev`.
+Remote daemon logs live at `~/.opencan/daemon.log` and rotate by size while the daemon is running, retaining `daemon.log.1` through `daemon.log.3`.
 
 ### Local Integration Harness
 

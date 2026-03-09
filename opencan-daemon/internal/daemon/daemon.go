@@ -21,6 +21,7 @@ type Daemon struct {
 	sessions   *SessionManager
 	logger     *slog.Logger
 	logBuffer  *LogRingBuffer
+	logStorage LogStorageConfig
 
 	clientsMu sync.Mutex
 	clients   map[*ClientHandler]struct{}
@@ -38,6 +39,7 @@ type Config struct {
 	IdleTimeout time.Duration
 	Logger      *slog.Logger
 	LogBuffer   *LogRingBuffer
+	LogStorage  LogStorageConfig
 }
 
 // DefaultConfig returns the default daemon configuration.
@@ -49,11 +51,19 @@ func DefaultConfig() Config {
 		PIDFile:     filepath.Join(dir, "daemon.pid"),
 		IdleTimeout: 30 * time.Minute,
 		Logger:      slog.Default(),
+		LogStorage: LogStorageConfig{
+			Service:          "daemon",
+			CurrentFilePath:  filepath.Join(dir, "daemon.log"),
+			MaxFileBytes:     10 * 1024 * 1024,
+			MaxArchivedFiles: 3,
+			BufferEntryCap:   2000,
+		},
 	}
 }
 
 // New creates a new Daemon with the given config.
 func New(cfg Config) *Daemon {
+	defaults := DefaultConfig()
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -62,12 +72,17 @@ func New(cfg Config) *Daemon {
 	if logBuffer == nil {
 		logBuffer = NewLogRingBuffer(2000)
 	}
+	logStorage := cfg.LogStorage
+	if logStorage.CurrentFilePath == "" {
+		logStorage = defaults.LogStorage
+	}
 	return &Daemon{
 		socketPath:  cfg.SocketPath,
 		pidFile:     cfg.PIDFile,
 		sessions:    NewSessionManager(logger),
 		logger:      logger.With("component", "daemon"),
 		logBuffer:   logBuffer,
+		logStorage:  logStorage,
 		clients:     make(map[*ClientHandler]struct{}),
 		idleTimeout: cfg.IdleTimeout,
 		stopCh:      make(chan struct{}),
@@ -140,6 +155,10 @@ func (d *Daemon) SocketPath() string {
 // LogBuffer exposes recent daemon logs for diagnostics.
 func (d *Daemon) LogBuffer() *LogRingBuffer {
 	return d.logBuffer
+}
+
+func (d *Daemon) LogStorageMetadata() LogStorageMetadata {
+	return d.logStorage.Metadata()
 }
 
 func (d *Daemon) acceptLoop() {

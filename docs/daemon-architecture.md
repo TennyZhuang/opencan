@@ -115,7 +115,7 @@ opencan-daemon
   - checks launcher availability on the remote host
 
 - `daemon/logs`
-  - returns recent in-memory daemon logs
+  - returns recent in-memory daemon logs plus current log storage metadata
 
 ## Ownership Rules
 

@@ -342,7 +342,8 @@ func (h *ClientHandler) handleLogs(msg *protocol.Message) {
 	}
 
 	result, _ := json.Marshal(map[string]interface{}{
-		"entries": entries,
+		"entries":  entries,
+		"metadata": h.daemon.LogStorageMetadata(),
 	})
 	h.Send(protocol.NewResponse(*msg.ID, result))
 }
