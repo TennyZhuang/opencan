@@ -1127,6 +1127,7 @@ final class AppStateTests: XCTestCase {
         // Configure for draining session
         await transport.setMockAttachState("draining")
         let bufferedEvents = buildBufferedEvents([
+            .userMessageChunk("Please keep working on the previous request."),
             .textDelta("I'm working on your request..."),
         ])
         await transport.setMockAttachBufferedEvents(bufferedEvents)
@@ -1146,7 +1147,7 @@ final class AppStateTests: XCTestCase {
             sessionId: runtimeId,
             runtimeId: runtimeId,
             conversationId: "draining-session",
-            seq: 2
+            seq: 3
         )
 
         try await waitFor(timeout: 5) { !self.appState.isPrompting }
@@ -2587,6 +2588,14 @@ final class AppStateTests: XCTestCase {
         for step in steps {
             let update: JSONValue
             switch step {
+            case .userMessageChunk(let text):
+                update = .object([
+                    "sessionUpdate": .string("user_message_chunk"),
+                    "content": .object([
+                        "type": .string("text"),
+                        "text": .string(text)
+                    ])
+                ])
             case .textDelta(let text):
                 update = .object([
                     "sessionUpdate": .string("agent_message_chunk"),
