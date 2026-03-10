@@ -1,24 +1,42 @@
 # OpenCAN
 
-An iOS client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) that drives remote coding agents through a persistent daemon over SSH. It is designed for unstable mobile networks: the SSH connection may drop, but the remote conversation/runtime can survive and later be reopened from the phone.
+OpenCAN is an iOS client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) that drives remote coding agents through a persistent daemon over SSH.
+
+It is built for the annoying real-world case where you are still in the app, but the network is not. The SSH connection can drop, the remote daemon can keep the conversation alive, and the phone can later reopen the same chat instead of starting over.
+
+The name `OpenCAN` comes from "You CAN just build". If you prefer, you can also read it as "open can" as in opening a can. Both readings are fine.
+
+## Why OpenCAN
+
+- Keep remote coding sessions usable on unstable mobile networks.
+- Treat conversations as durable identities instead of tying UX to a fragile live runtime.
+- Reopen daemon-owned conversations from the phone, including sessions adopted from elsewhere.
+- Preserve enough diagnostics on both client and server to debug reconnect and delivery problems.
 
 ## Features
 
 - Persistent remote `opencan-daemon` that decouples agent/runtime lifetime from mobile SSH lifetime
-- Conversation-oriented reopen/restore flow for agents started on phone or adopted later from another machine
-- Full ACP / JSON-RPC 2.0 transport over SSH PTY stdio
+- Conversation-oriented reopen and restore flow for sessions started on phone or adopted later from another machine
+- Full ACP over JSON-RPC 2.0 using SSH PTY stdio
 - Streaming chat, tool call rendering, image mention uploads, and Markdown rendering
-- Structured diagnostics in both the iOS app (`opencan.log`) and remote daemon (`~/.opencan/daemon.log`)
+- Structured diagnostics in the iOS app (`opencan.log`) and on the remote host (`~/.opencan/daemon.log`)
 - Local SSH-backed integration harness for deterministic end-to-end testing on macOS
+
+## How It Works
+
+1. The iPhone connects to a remote host over SSH.
+2. Instead of launching ACP agents directly from the app, OpenCAN talks to `opencan-daemon`.
+3. The daemon owns conversation lifecycle, buffering, replay, restore, and diagnostics.
+4. When the mobile transport drops, the daemon can keep the conversation alive and the app can later reopen it.
 
 ## Requirements
 
 - iOS 17.0+
 - Xcode 16+
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
-- A reachable remote host with an ACP launcher command (for example `claude-agent-acp` or `codex-acp`)
+- A reachable remote host with an ACP launcher command such as `claude-agent-acp` or `codex-acp`
 
-## Build & Run
+## Quick Start
 
 ```bash
 # Generate the Xcode project from project.yml
@@ -30,7 +48,7 @@ xcodebuild -scheme OpenCAN \
   -quiet build
 ```
 
-### Install on Simulator
+Install and launch on a simulator:
 
 ```bash
 SIM=<your-simulator-udid>
@@ -42,9 +60,11 @@ xcrun simctl terminate "$SIM" com.tianyizhuang.OpenCAN 2>/dev/null
 xcrun simctl launch "$SIM" com.tianyizhuang.OpenCAN
 ```
 
-### Logs & Diagnostics
+After launch, add a node, configure SSH credentials, and point the app at a remote host that can launch an ACP server.
 
-App logs are written to the sandbox rather than the simulator system log:
+## Logs And Diagnostics
+
+App logs are written to the app sandbox rather than the simulator system log:
 
 ```bash
 CONTAINER=$(xcrun simctl get_app_container "$SIM" com.tianyizhuang.OpenCAN data)
@@ -66,7 +86,15 @@ Remote daemon logs live at `~/.opencan/daemon.log` and rotate by size while the 
 
 The in-app Diagnostics screen can also generate a shareable JSON diagnostics bundle that captures current app log files, recent daemon log files fetched over SSH, ring-buffer snapshots, and the active app state in one file.
 
-### Local Integration Harness
+## Testing
+
+Run the unit test target:
+
+```bash
+xcodebuild test -scheme OpenCAN \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+  -only-testing:OpenCANTests
+```
 
 Run the end-to-end SSH + daemon + mock ACP smoke suite locally:
 
@@ -80,11 +108,11 @@ Run the full integration target:
 OPENCAN_INTEGRATION_TEST_MODE=full ./Scripts/run-local-integration.sh
 ```
 
-See `docs/local-integration-testing.md` for setup details.
+For more detail, see [docs/local-integration-testing.md](./docs/local-integration-testing.md) and [docs/testing-strategy.md](./docs/testing-strategy.md).
 
 ## Architecture
 
-OpenCAN now uses a daemon-owned conversation/runtime model.
+OpenCAN uses a daemon-owned conversation/runtime model.
 
 | Layer | Key Types | Role |
 |-------|-----------|------|
@@ -96,23 +124,23 @@ OpenCAN now uses a daemon-owned conversation/runtime model.
 | AppState | `AppState`, `ChatMessage` | UI-facing coordinator, connection state, transcript state, and navigation context |
 | SwiftUI | `ContentView`, `SessionPickerView`, `ChatView`, `DiagnosticView` | Navigation, picker, chat UX, diagnostics UI |
 
-### Core identities
+### Core Identities
 
 - `conversationId`: stable identity persisted by the app and used to reopen chat history
 - `runtimeId`: ephemeral daemon-managed live runtime identity used for attachment and replay
 - `ownerId`: stable per-install client identity used for same-owner reclaim after reconnect
 
-### Protocol notes
+### Protocol Notes
 
 - iOS connects to `opencan-daemon attach`, not directly to ACP launchers
 - `daemon/conversation.create|open|detach|list` are the product-facing lifecycle APIs
-- `daemon/session.list|kill` remain low-level diagnostic/operational APIs
+- `daemon/session.list|kill` remain low-level diagnostic and operational APIs
 - Forwarded `session/update` notifications include `__seq`, `conversationId`, and `runtimeId`
 - On restored conversations, daemon routes by `runtimeId` internally but forwards upstream ACP requests with the stable wire `sessionId = conversationId`; using `runtimeId` on the ACP wire loses history context
 - Prompt termination must be observable via `prompt_complete`, prompt error, or prompt success fallback
-- App-side follow-up sends stay serial with ACP turns: if a conversation is reopened in `starting` / `prompting` / `draining`, the app keeps the session busy and queues new user sends on the active conversation until the turn settles
+- App-side follow-up sends stay serial with ACP turns: if a conversation is reopened in `starting`, `prompting`, or `draining`, the app keeps the session busy and queues new user sends on the active conversation until the turn settles
 
-For the current implemented contract, see `docs/daemon-architecture.md` and `CLAUDE.md`. `docs/conversation-runtime-refactor.md` remains useful as design background, not the canonical source for current behavior.
+For the current implemented contract, see [docs/daemon-architecture.md](./docs/daemon-architecture.md) and [`CLAUDE.md`](./CLAUDE.md). [docs/conversation-runtime-refactor.md](./docs/conversation-runtime-refactor.md) remains useful as design background, not the canonical source for current behavior.
 
 ## Project Structure
 
@@ -137,11 +165,20 @@ Scripts/
 └── setup-local-ssh.sh        # Local sshd setup for integration tests
 ```
 
+## Contributing
+
+Contributions are welcome, but please keep the repo's contract boundaries and docs in sync.
+
+- Run `xcodegen generate` after adding or removing files tracked by `project.yml`.
+- Run `xcodebuild test -scheme OpenCAN -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -only-testing:OpenCANTests` before opening a PR.
+- If you change daemon or conversation lifecycle behavior, update `README.md`, `CLAUDE.md`, and [docs/daemon-architecture.md](./docs/daemon-architecture.md) in the same patch.
+- Prefer adding regression tests for prompt termination, replay ordering, reopen semantics, restore behavior, and cross-session filtering.
+
 ## Dependencies
 
-- [Citadel](https://github.com/orlandos-nl/Citadel) — SSH client for Swift
-- [MarkdownView](https://github.com/Lakr233/MarkdownView) — Markdown rendering
-- [ListViewKit](https://github.com/Lakr233/ListViewKit) — stable streaming chat timeline rendering
+- [Citadel](https://github.com/orlandos-nl/Citadel) for SSH
+- [MarkdownView](https://github.com/Lakr233/MarkdownView) for Markdown rendering
+- [ListViewKit](https://github.com/Lakr233/ListViewKit) for stable streaming chat timeline rendering
 
 ## Acknowledgements
 
