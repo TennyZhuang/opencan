@@ -8,9 +8,11 @@ The name `OpenCAN` comes from "You CAN just build". If you prefer, you can also 
 
 ## Why OpenCAN
 
+- Many remote coding-agent products already exist, but this space often asks high-privilege agents to run behind convenience-first connectivity layers. OpenCAN takes a security-first position instead.
 - Keep remote coding sessions usable on unstable mobile networks.
 - Treat conversations as durable identities instead of tying UX to a fragile live runtime.
 - Reopen daemon-owned conversations from the phone, including sessions adopted from elsewhere.
+- Open the can from the original, correct entry point: SSH. No inbound tunnels, no third-party long-lived relay, and no need to punch through or weaken your server's existing firewall posture.
 - Preserve enough diagnostics on both client and server to debug reconnect and delivery problems.
 
 ## Features
