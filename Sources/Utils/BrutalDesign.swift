@@ -157,6 +157,7 @@ struct BrutalChip: View {
         Text(text)
             .font(Brutal.mono(fontSize, weight: .bold))
             .textCase(.uppercase)
+            .foregroundStyle(.black)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(fill)

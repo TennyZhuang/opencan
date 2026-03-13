@@ -35,6 +35,7 @@ struct WorkspaceListView: View {
                 HStack(spacing: 6) {
                     Text(node.name)
                         .font(Brutal.display(17, weight: .bold))
+                        .foregroundStyle(.black)
                     ForEach(nodeAgentBadges) { agent in
                         AgentAvailabilityBadge(agent: agent)
                     }
