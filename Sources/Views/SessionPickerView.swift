@@ -349,9 +349,9 @@ struct SessionPickerView: View {
 
     private func sessionCardFill(_ session: UnifiedSession) -> Color {
         switch session.displayState {
-        case "running", "prompting", "draining": Brutal.lime.opacity(0.15)
-        case "attached": Brutal.cyan.opacity(0.15)
-        case "starting": Brutal.orange.opacity(0.15)
+        case "running", "prompting", "draining": Brutal.limeTint
+        case "attached": Brutal.cyanTint
+        case "starting": Brutal.orangeTint
         default: .white
         }
     }

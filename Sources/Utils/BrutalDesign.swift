@@ -13,6 +13,11 @@ enum Brutal {
     static let cream     = Color(hex: 0xFAFAE0)  // Page background
     static let mintLight = Color(hex: 0xBFF8E7)  // User bubble (25% mint on white, opaque)
 
+    // Opaque tint colors for cards (pre-mixed on white to avoid shadow bleed)
+    static let limeTint    = Color(hex: 0xF0FFD9)  // ~15% lime on white
+    static let cyanTint    = Color(hex: 0xD9F5FF)  // ~15% cyan on white
+    static let orangeTint  = Color(hex: 0xFFF0D9)  // ~15% orange on white
+
     // Shadows — offset only, no blur
     static let shadowSm: CGFloat   = 2   // Small inputs, chips
     static let shadow: CGFloat     = 4   // Standard cards, buttons
