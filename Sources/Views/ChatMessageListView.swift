@@ -618,7 +618,7 @@ final class FlowUserMessageRowView: FlowMessageRowView {
         shadowView.backgroundColor = .black
 
         // Bubble (mint fill + black border)
-        bubbleView.backgroundColor = BrutalUIKit.mint.withAlphaComponent(0.25)
+        bubbleView.backgroundColor = .white
         bubbleView.layer.borderColor = UIColor.black.cgColor
         bubbleView.layer.borderWidth = BrutalUIKit.borderWidth
         bubbleView.clipsToBounds = true

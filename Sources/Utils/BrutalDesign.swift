@@ -11,6 +11,7 @@ enum Brutal {
     static let orange    = Color(hex: 0xFF9F43)  // Warning / jump server
     static let pink      = Color(hex: 0xFF6B9D)  // Error / destructive
     static let cream     = Color(hex: 0xFAFAE0)  // Page background
+    static let mintLight = Color(hex: 0xBFF8E7)  // User bubble (25% mint on white, opaque)
 
     // Shadows — offset only, no blur
     static let shadowSm: CGFloat   = 2   // Small inputs, chips
@@ -41,6 +42,7 @@ enum BrutalUIKit {
     static let cream     = UIColor(red: 0xFA/255.0, green: 0xFA/255.0, blue: 0xE0/255.0, alpha: 1)
     static let orange    = UIColor(red: 0xFF/255.0, green: 0x9F/255.0, blue: 0x43/255.0, alpha: 1)
     static let pink      = UIColor(red: 0xFF/255.0, green: 0x6B/255.0, blue: 0x9D/255.0, alpha: 1)
+    static let mintLight = UIColor(red: 0xBF/255.0, green: 0xF8/255.0, blue: 0xE7/255.0, alpha: 1)
     static let borderColor = UIColor.black
     static let borderWidth: CGFloat = 2
     static let shadow: CGFloat = 4

@@ -20,7 +20,7 @@ struct MessageRowView: View {
                         Text(message.content)
                             .padding(Theme.bubblePadding)
                             .foregroundStyle(.black)
-                            .brutalCard(fill: Brutal.mint.opacity(0.25), shadow: Brutal.shadowSm)
+                            .brutalCard(fill: .white, shadow: Brutal.shadowSm)
                             .textSelection(.enabled)
                             .contextMenu { copyButton }
                     } else {
