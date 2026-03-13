@@ -164,6 +164,22 @@ struct WorkspaceListView: View {
     private var workspaceListContent: some View {
         ScrollView {
             VStack(spacing: 12) {
+                // Connection status banner
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(Brutal.lime)
+                        .frame(width: 8, height: 8)
+                    Text("CONNECTED")
+                        .font(Brutal.mono(11, weight: .bold))
+                        .foregroundStyle(.black)
+                    Spacer()
+                    BrutalChip("\((node.workspaces ?? []).count) workspaces", fill: Brutal.cyan, fontSize: 9)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Brutal.lime.opacity(0.12))
+                .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
+
                 ForEach(node.workspaces ?? []) { workspace in
                     NavigationLink {
                         SessionPickerView(workspace: workspace)

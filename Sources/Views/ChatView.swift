@@ -41,10 +41,21 @@ struct ChatView: View {
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .toolbar {
+            #if os(iOS)
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 6) {
+                    Text(appState.activeWorkspace?.name ?? "Chat")
+                        .font(Brutal.display(17, weight: .bold))
+                        .foregroundStyle(.black)
+                    BrutalChip("LIVE", fill: Brutal.lime, fontSize: 9)
+                }
+            }
+            #endif
             ToolbarItem(placement: .confirmationAction) {
                 Button("Disconnect", role: .destructive) {
                     appState.disconnect()
                 }
+                .font(Brutal.mono(13, weight: .bold))
                 .foregroundStyle(Brutal.pink)
             }
         }

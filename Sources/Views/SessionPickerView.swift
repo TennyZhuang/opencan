@@ -212,10 +212,17 @@ struct SessionPickerView: View {
                 // Session list
                 let sessions = unifiedSessions
                 if !sessions.isEmpty {
-                    HStack {
+                    HStack(spacing: 6) {
                         Text("SESSIONS")
                             .font(Brutal.mono(12, weight: .bold))
                             .foregroundStyle(.black.opacity(0.5))
+                        BrutalChip("\(sessions.count)", fill: Brutal.cyan, fontSize: 9)
+                        let running = sessions.filter {
+                            ["running", "prompting", "draining", "attached"].contains($0.displayState)
+                        }.count
+                        if running > 0 {
+                            BrutalChip("\(running) active", fill: Brutal.lime, fontSize: 9)
+                        }
                         Spacer()
                     }
                     .padding(.top, 8)
@@ -337,7 +344,16 @@ struct SessionPickerView: View {
             }
         }
         .padding(14)
-        .brutalCard(fill: .white, shadow: Brutal.shadowSm)
+        .brutalCard(fill: sessionCardFill(session), shadow: Brutal.shadowSm)
+    }
+
+    private func sessionCardFill(_ session: UnifiedSession) -> Color {
+        switch session.displayState {
+        case "running", "prompting", "draining": Brutal.lime.opacity(0.15)
+        case "attached": Brutal.mint.opacity(0.15)
+        case "starting": Brutal.orange.opacity(0.15)
+        default: .white
+        }
     }
 
     @MainActor

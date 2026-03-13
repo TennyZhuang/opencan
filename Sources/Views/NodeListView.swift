@@ -16,6 +16,16 @@ struct NodeListView: View {
                 brandingRow
                     .padding(.top, 20)
 
+                if !nodes.isEmpty {
+                    HStack {
+                        Text("NODES")
+                            .font(Brutal.mono(12, weight: .bold))
+                            .foregroundStyle(.black.opacity(0.5))
+                        BrutalChip("\(nodes.count)", fill: Brutal.lime, fontSize: 10)
+                        Spacer()
+                    }
+                }
+
                 ForEach(nodes) { node in
                     NavigationLink {
                         WorkspaceListView(node: node)
@@ -101,24 +111,30 @@ struct NodeListView: View {
     }
 
     private var brandingRow: some View {
-        VStack(spacing: 8) {
-            Image("LogoMark")
-                .resizable()
-                .interpolation(.high)
-                .scaledToFit()
-                .frame(width: 80, height: 80)
+        VStack(spacing: 0) {
+            VStack(spacing: 8) {
+                Image("LogoMark")
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(width: 80, height: 80)
 
-            Image("LogoWordmark")
-                .resizable()
-                .interpolation(.high)
-                .scaledToFit()
-                .frame(height: 32)
+                Image("LogoWordmark")
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(height: 32)
 
-            Image("LogoTagline")
-                .resizable()
-                .interpolation(.high)
-                .scaledToFit()
-                .frame(height: 18)
+                Image("LogoTagline")
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(height: 18)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 16)
+            .background(Brutal.lime.opacity(0.15))
+            .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("OpenCAN logo")
