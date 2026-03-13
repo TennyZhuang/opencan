@@ -167,7 +167,7 @@ struct WorkspaceListView: View {
                 // Connection status banner
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(Brutal.lime)
+                        .fill(Brutal.mint)
                         .frame(width: 8, height: 8)
                     Text("CONNECTED")
                         .font(Brutal.mono(11, weight: .bold))
@@ -177,7 +177,7 @@ struct WorkspaceListView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
-                .background(Brutal.lime.opacity(0.12))
+                .background(Brutal.mint.opacity(0.12))
                 .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
 
                 ForEach(node.workspaces ?? []) { workspace in

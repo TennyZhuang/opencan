@@ -47,7 +47,7 @@ struct ChatView: View {
                     Text(appState.activeWorkspace?.name ?? "Chat")
                         .font(Brutal.display(17, weight: .bold))
                         .foregroundStyle(.black)
-                    BrutalChip("LIVE", fill: Brutal.lime, fontSize: 9)
+                    BrutalChip("LIVE", fill: Brutal.mint, fontSize: 9)
                 }
             }
             #endif

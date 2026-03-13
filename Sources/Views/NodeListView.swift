@@ -21,7 +21,7 @@ struct NodeListView: View {
                         Text("NODES")
                             .font(Brutal.mono(12, weight: .bold))
                             .foregroundStyle(.black.opacity(0.5))
-                        BrutalChip("\(nodes.count)", fill: Brutal.lime, fontSize: 10)
+                        BrutalChip("\(nodes.count)", fill: Brutal.cyan, fontSize: 10)
                         Spacer()
                     }
                 }
@@ -133,7 +133,7 @@ struct NodeListView: View {
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 16)
-            .background(Brutal.lime.opacity(0.15))
+            .background(.white)
             .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
         }
         .accessibilityElement(children: .ignore)

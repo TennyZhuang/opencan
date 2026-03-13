@@ -221,7 +221,7 @@ struct SessionPickerView: View {
                             ["running", "prompting", "draining", "attached"].contains($0.displayState)
                         }.count
                         if running > 0 {
-                            BrutalChip("\(running) active", fill: Brutal.lime, fontSize: 9)
+                            BrutalChip("\(running) active", fill: Brutal.mint, fontSize: 9)
                         }
                         Spacer()
                     }
