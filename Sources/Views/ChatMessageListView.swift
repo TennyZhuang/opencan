@@ -789,15 +789,15 @@ final class FlowToolHintRowView: FlowMessageRowView {
 
         let configuration = UIImage.SymbolConfiguration(scale: .small)
         if toolCall.isFailed {
-            bubbleView.backgroundColor = BrutalUIKit.pink.withAlphaComponent(0.2)
+            bubbleView.backgroundColor = BrutalUIKit.pinkTint
             symbolView.image = UIImage(systemName: "xmark.seal", withConfiguration: configuration)
             symbolView.tintColor = .black
         } else if toolCall.isComplete {
-            bubbleView.backgroundColor = BrutalUIKit.mint.withAlphaComponent(0.2)
+            bubbleView.backgroundColor = BrutalUIKit.mintTint
             symbolView.image = UIImage(systemName: "checkmark.seal", withConfiguration: configuration)
             symbolView.tintColor = .black
         } else {
-            bubbleView.backgroundColor = BrutalUIKit.cyan.withAlphaComponent(0.2)
+            bubbleView.backgroundColor = BrutalUIKit.cyanTint
             symbolView.image = UIImage(systemName: "hourglass", withConfiguration: configuration)
             symbolView.tintColor = .black
         }
@@ -890,6 +890,7 @@ final class RawTextViewController: UIViewController {
         textView.isEditable = false
         textView.isSelectable = true
         textView.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        textView.textColor = .black
         textView.backgroundColor = .clear
         textView.textContainerInset = .init(top: 16, left: 16, bottom: 16, right: 16)
         textView.autoresizingMask = [.flexibleWidth, .flexibleHeight]

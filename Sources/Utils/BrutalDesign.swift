@@ -43,6 +43,10 @@ enum BrutalUIKit {
     static let orange    = UIColor(red: 0xFF/255.0, green: 0x9F/255.0, blue: 0x43/255.0, alpha: 1)
     static let pink      = UIColor(red: 0xFF/255.0, green: 0x6B/255.0, blue: 0x9D/255.0, alpha: 1)
     static let mintLight = UIColor(red: 0xBF/255.0, green: 0xF8/255.0, blue: 0xE7/255.0, alpha: 1)
+    // Opaque tints (20% color on white) for tool call status backgrounds
+    static let mintTint  = UIColor(red: 0xCC/255.0, green: 0xFA/255.0, blue: 0xEC/255.0, alpha: 1)
+    static let pinkTint  = UIColor(red: 0xFF/255.0, green: 0xE1/255.0, blue: 0xEB/255.0, alpha: 1)
+    static let cyanTint  = UIColor(red: 0xCC/255.0, green: 0xF5/255.0, blue: 0xFF/255.0, alpha: 1)
     static let borderColor = UIColor.black
     static let borderWidth: CGFloat = 2
     static let shadow: CGFloat = 4
