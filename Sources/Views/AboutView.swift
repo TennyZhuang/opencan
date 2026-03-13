@@ -67,6 +67,8 @@ struct AboutView: View {
                     Text("Before public release, verify that distributed app and daemon builds map to the exact corresponding source revision and that no proprietary FlowDown brand assets are reused.")
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(Brutal.cream.ignoresSafeArea())
             .navigationTitle("About & Licenses")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)

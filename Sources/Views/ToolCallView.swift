@@ -21,35 +21,36 @@ struct ToolCallView: View {
             } label: {
                 HStack {
                     Image(systemName: statusIcon)
-                        .foregroundStyle(statusColor)
+                        .foregroundStyle(.black)
                     Text(toolCall.name)
-                        .font(.system(.caption, design: .monospaced))
-                        .fontWeight(.medium)
+                        .font(Brutal.mono(12, weight: .medium))
                         .lineLimit(1)
                     Spacer()
                     Image(systemName: "chevron.right")
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .font(.caption2)
                 }
-                .foregroundStyle(.primary)
+                .foregroundStyle(.black)
             }
 
             if isExpanded {
                 // Input
                 if let input = cachedInput {
                     Text(input)
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .font(Brutal.mono(11))
+                        .foregroundStyle(.black.opacity(0.6))
                         .lineLimit(showFullOutput ? nil : previewLineLimit)
                         .textSelection(.enabled)
                 }
 
                 // Output
                 if let output = toolCall.output, !output.isEmpty {
-                    Divider()
+                    Rectangle()
+                        .fill(Color.black)
+                        .frame(height: 1)
                     Text(output)
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(toolCall.isFailed ? .red : .secondary)
+                        .font(Brutal.mono(11))
+                        .foregroundStyle(toolCall.isFailed ? Color.black : .black.opacity(0.6))
                         .lineLimit(showFullOutput ? nil : previewLineLimit)
                         .textSelection(.enabled)
 
@@ -59,16 +60,16 @@ struct ToolCallView: View {
                             withAnimation { showFullOutput.toggle() }
                         } label: {
                             Text(showFullOutput ? "Show less" : "Show more...")
-                                .font(.caption2)
-                                .foregroundStyle(.blue)
+                                .font(Brutal.mono(11, weight: .bold))
+                                .foregroundStyle(.black)
                         }
                     }
                 }
             }
         }
         .padding(10)
-        .background(Theme.toolCallBg)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .background(statusFill)
+        .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
     }
 
     private var statusIcon: String {
@@ -77,10 +78,10 @@ struct ToolCallView: View {
         return "gear"
     }
 
-    private var statusColor: Color {
-        if toolCall.isFailed { return .red }
-        if toolCall.isComplete { return .green }
-        return .orange
+    private var statusFill: Color {
+        if toolCall.isFailed { return Brutal.pink.opacity(0.15) }
+        if toolCall.isComplete { return Brutal.mint.opacity(0.15) }
+        return Brutal.cyan.opacity(0.15)
     }
 
     private func outputIsLong(_ text: String) -> Bool {

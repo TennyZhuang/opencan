@@ -44,6 +44,7 @@ struct NodeFormView: View {
                     Button("Import New Key...") {
                         showImportKey = true
                     }
+                    .foregroundStyle(.black)
                 }
 
                 Section("Jump Server") {
@@ -55,6 +56,8 @@ struct NodeFormView: View {
                     }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(Brutal.cream.ignoresSafeArea())
             .navigationTitle(editingNode == nil ? "Add Node" : "Edit Node")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -66,6 +69,7 @@ struct NodeFormView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
                         .disabled(name.isEmpty || host.isEmpty || username.isEmpty)
+                        .fontWeight(.bold)
                 }
             }
             .onAppear { loadExisting() }
@@ -107,6 +111,8 @@ struct NodeFormView: View {
                         .frame(minHeight: 200)
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(Brutal.cream.ignoresSafeArea())
             .navigationTitle("Import SSH Key")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -126,6 +132,7 @@ struct NodeFormView: View {
                         }
                     }
                     .disabled(importKeyName.isEmpty || importKeyPEM.isEmpty)
+                    .fontWeight(.bold)
                 }
             }
         }

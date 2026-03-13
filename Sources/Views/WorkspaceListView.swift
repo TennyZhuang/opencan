@@ -24,6 +24,7 @@ struct WorkspaceListView: View {
                 workspaceListContent
             }
         }
+        .background(Brutal.cream.ignoresSafeArea())
         .navigationTitle(node.name)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -33,7 +34,8 @@ struct WorkspaceListView: View {
             ToolbarItem(placement: .principal) {
                 HStack(spacing: 6) {
                     Text(node.name)
-                        .font(.headline)
+                        .font(Brutal.display(17, weight: .bold))
+                        .foregroundStyle(.black)
                     ForEach(nodeAgentBadges) { agent in
                         AgentAvailabilityBadge(agent: agent)
                     }
@@ -46,6 +48,8 @@ struct WorkspaceListView: View {
                     showAddWorkspace = true
                 } label: {
                     Image(systemName: "plus")
+                        .fontWeight(.bold)
+                        .foregroundStyle(.black)
                 }
             }
         }
@@ -91,12 +95,10 @@ struct WorkspaceListView: View {
         .onAppear {
             let isSameNode = appState.activeNode?.persistentModelID == node.persistentModelID
             if appState.connectionStatus == .connected, isSameNode {
-                // Already connected to this node
                 Task { await appState.refreshAvailableAgents() }
             } else if appState.connectionStatus == .connecting, isSameNode {
                 // Already connecting to this node, wait
             } else if OpenCANApp.isUITesting && !OpenCANApp.isUIIntegrationTesting {
-                // UI tests use mock transport — connectMock needs a workspace
                 if let workspace = node.workspaces?.first {
                     appState.connectMock(workspace: workspace, scenario: OpenCANApp.uiTestMockScenario)
                 }
@@ -117,52 +119,100 @@ struct WorkspaceListView: View {
         VStack(spacing: 16) {
             if appState.connectionStatus == .connecting {
                 if let progress = appState.daemonUploadProgress {
-                    ProgressView(value: progress) {
-                        Text("Installing daemon...")
-                            .foregroundStyle(.secondary)
-                    } currentValueLabel: {
+                    VStack(spacing: 12) {
+                        Text("INSTALLING DAEMON")
+                            .font(Brutal.mono(12, weight: .bold))
+                            .foregroundStyle(.black)
+                        ProgressView(value: progress)
+                            .tint(Brutal.lime)
                         Text("\(Int(progress * 100))%")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(Brutal.mono(11))
+                            .foregroundStyle(.black.opacity(0.6))
                     }
-                    .progressViewStyle(.linear)
+                    .padding(20)
+                    .brutalCard(fill: .white)
                     .padding(.horizontal, 40)
                 } else {
-                    ProgressView()
-                    Text("Connecting to \(node.name)...")
-                        .foregroundStyle(.secondary)
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .tint(.black)
+                        Text("Connecting to \(node.name)...")
+                            .font(Brutal.display(15))
+                            .foregroundStyle(.black.opacity(0.6))
+                    }
                 }
             } else if let error = appState.connectionError {
-                Image(systemName: "xmark.circle")
-                    .font(.largeTitle)
-                    .foregroundStyle(.red)
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                Button("Retry") { appState.connect(node: node) }
+                VStack(spacing: 12) {
+                    Image(systemName: "xmark.circle")
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundStyle(.black)
+                    Text(error)
+                        .font(Brutal.mono(12))
+                        .foregroundStyle(.black)
+                        .multilineTextAlignment(.center)
+                    Button("Retry") { appState.connect(node: node) }
+                        .buttonStyle(BrutalButtonStyle(fill: Brutal.mint, compact: true))
+                }
+                .padding(20)
+                .brutalCard(fill: Brutal.pink.opacity(0.2))
+                .padding(.horizontal, 40)
             }
         }
-        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var workspaceListContent: some View {
-        List {
-            ForEach(node.workspaces ?? []) { workspace in
-                NavigationLink {
-                    SessionPickerView(workspace: workspace)
-                } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(workspace.name)
-                            .font(.headline)
-                        Text(workspace.path)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+        ScrollView {
+            VStack(spacing: 12) {
+                // Connection status banner
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(Brutal.mint)
+                        .frame(width: 8, height: 8)
+                    Text("CONNECTED")
+                        .font(Brutal.mono(11, weight: .bold))
+                        .foregroundStyle(.black)
+                    Spacer()
+                    BrutalChip("\((node.workspaces ?? []).count) workspaces", fill: Brutal.cyan, fontSize: 9)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Brutal.mint.opacity(0.12))
+                .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
+
+                ForEach(node.workspaces ?? []) { workspace in
+                    NavigationLink {
+                        SessionPickerView(workspace: workspace)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(workspace.name)
+                                    .font(Brutal.display(16, weight: .bold))
+                                    .foregroundStyle(.black)
+                                Text(workspace.path)
+                                    .font(Brutal.mono(12))
+                                    .foregroundStyle(.black.opacity(0.6))
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(Brutal.display(14, weight: .bold))
+                                .foregroundStyle(.black.opacity(0.4))
+                        }
+                        .padding(16)
+                        .brutalCard(fill: .white)
                     }
-                    .padding(.vertical, 2)
+                    .buttonStyle(.plain)
+                }
+
+                if (node.workspaces ?? []).isEmpty {
+                    Text("NO WORKSPACES YET")
+                        .font(Brutal.mono(14, weight: .bold))
+                        .foregroundStyle(.black.opacity(0.4))
+                        .padding(.top, 40)
                 }
             }
-            .onDelete(perform: deleteWorkspaces)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
         }
     }
 
@@ -178,7 +228,6 @@ struct WorkspaceListView: View {
 
     @MainActor
     private func validateWorkspacePathAndAdd(name: String, path: String) async {
-        // Only verify/create directories on the active connected node.
         let shouldVerifyRemotePath = appState.connectionStatus == .connected
             && appState.activeNode?.persistentModelID == node.persistentModelID
 
@@ -255,20 +304,13 @@ struct AgentAvailabilityBadge: View {
     let agent: AgentKind
 
     var body: some View {
-        Text(agent.displayName)
-            .font(.caption2)
-            .fontWeight(.medium)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.15))
-            .foregroundStyle(color)
-            .clipShape(Capsule())
+        BrutalChip(agent.displayName, fill: color, fontSize: 10)
     }
 
     private var color: Color {
         switch agent {
-        case .claude: .blue
-        case .codex: .purple
+        case .claude: Brutal.cyan
+        case .codex: Brutal.lavender
         }
     }
 }

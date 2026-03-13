@@ -11,30 +11,41 @@ struct NodeListView: View {
     @State private var showAbout = false
 
     var body: some View {
-        List {
-            brandingRow
+        ScrollView {
+            VStack(spacing: 16) {
+                brandingRow
+                    .padding(.top, 20)
 
-            ForEach(nodes) { node in
-                NavigationLink {
-                    WorkspaceListView(node: node)
-                } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(node.name)
-                            .font(.headline)
-                        Text("\(node.username)@\(node.host):\(node.port)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        if let jump = node.jumpServer {
-                            Text("via \(jump.name)")
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                        }
+                if !nodes.isEmpty {
+                    HStack {
+                        Text("NODES")
+                            .font(Brutal.mono(12, weight: .bold))
+                            .foregroundStyle(.black.opacity(0.5))
+                        BrutalChip("\(nodes.count)", fill: Brutal.cyan, fontSize: 10)
+                        Spacer()
                     }
-                    .padding(.vertical, 2)
+                }
+
+                ForEach(nodes) { node in
+                    NavigationLink {
+                        WorkspaceListView(node: node)
+                    } label: {
+                        nodeCard(node)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if nodes.isEmpty {
+                    Text("NO NODES YET")
+                        .font(Brutal.mono(14, weight: .bold))
+                        .foregroundStyle(.black.opacity(0.4))
+                        .padding(.top, 40)
                 }
             }
-            .onDelete(perform: deleteNodes)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
         }
+        .background(Brutal.cream.ignoresSafeArea())
         .navigationTitle("Nodes")
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -50,6 +61,7 @@ struct NodeListView: View {
                     }
                 } label: {
                     Image(systemName: "gearshape")
+                        .foregroundStyle(.black)
                 }
             }
             ToolbarItem(placement: .primaryAction) {
@@ -57,6 +69,8 @@ struct NodeListView: View {
                     showAddNode = true
                 } label: {
                     Image(systemName: "plus")
+                        .fontWeight(.bold)
+                        .foregroundStyle(.black)
                 }
             }
         }
@@ -74,32 +88,54 @@ struct NodeListView: View {
         }
     }
 
-    private var brandingRow: some View {
+    private func nodeCard(_ node: Node) -> some View {
         HStack {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(node.name)
+                    .font(Brutal.display(17, weight: .bold))
+                    .foregroundStyle(.black)
+                Text("\(node.username)@\(node.host):\(node.port)")
+                    .font(Brutal.mono(12))
+                    .foregroundStyle(.black.opacity(0.6))
+                if let jump = node.jumpServer {
+                    BrutalChip("via \(jump.name)", fill: Brutal.orange, fontSize: 10)
+                }
+            }
             Spacer()
+            Image(systemName: "chevron.right")
+                .font(Brutal.display(14, weight: .bold))
+                .foregroundStyle(.black.opacity(0.4))
+        }
+        .padding(16)
+        .brutalCard(fill: .white)
+    }
+
+    private var brandingRow: some View {
+        VStack(spacing: 0) {
             VStack(spacing: 8) {
                 Image("LogoMark")
                     .resizable()
                     .interpolation(.high)
                     .scaledToFit()
-                    .frame(width: 96, height: 96)
+                    .frame(width: 80, height: 80)
 
                 Image("LogoWordmark")
                     .resizable()
                     .interpolation(.high)
                     .scaledToFit()
-                    .frame(height: 36)
+                    .frame(height: 32)
 
                 Image("LogoTagline")
                     .resizable()
                     .interpolation(.high)
                     .scaledToFit()
-                    .frame(height: 20)
+                    .frame(height: 18)
             }
-            Spacer()
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 16)
+            .background(.white)
+            .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
         }
-        .listRowSeparator(.hidden)
-        .listRowBackground(Color.clear)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("OpenCAN logo")
     }

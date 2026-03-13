@@ -20,11 +20,11 @@ struct InputBarView: View {
                             Button(mention.mentionToken) {
                                 applyMentionToken(mention.mentionToken)
                             }
-                            .buttonStyle(.bordered)
-                            .font(.caption)
+                            .buttonStyle(BrutalButtonStyle(fill: Brutal.cyan, compact: true))
+                            .font(Brutal.mono(12, weight: .bold))
                         }
                     }
-                    .padding(.horizontal)
+                    .padding(.horizontal, 16)
                 }
             }
 
@@ -35,33 +35,45 @@ struct InputBarView: View {
                     photoLibrary: .shared()
                 ) {
                     Image(systemName: "photo")
-                        .font(.title3)
-                        .foregroundStyle(isUploadingImage ? .gray : Theme.accentColor)
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundStyle(isUploadingImage ? .black.opacity(0.3) : .black)
                 }
                 .disabled(appState.isPrompting || isUploadingImage)
 
                 TextField("Message...", text: $text, axis: .vertical)
                     .id(textFieldResetToken)
-                    .textFieldStyle(.plain)
+                    .font(Brutal.display(15))
                     .lineLimit(1...5)
                     .focused($isFocused)
                     .onSubmit { send() }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(
+                        ZStack {
+                            Rectangle().fill(Color.black).offset(x: Brutal.shadowSm, y: Brutal.shadowSm)
+                            Rectangle().fill(.white)
+                        }
+                    )
+                    .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
 
                 if isUploadingImage {
                     ProgressView()
+                        .tint(.black)
                         .controlSize(.small)
                 } else {
                     Button(action: send) {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)
-                            .foregroundStyle(canSend ? Theme.accentColor : .gray)
+                            .foregroundStyle(canSend ? Color.black : .black.opacity(0.3))
                     }
+                    .disabled(!canSend)
                     .disabled(!canSend)
                 }
             }
-            .padding(.horizontal)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
         }
+        .background(Brutal.cream)
         .onChange(of: selectedPhotoItem) { _, item in
             guard let item else { return }
             Task {
@@ -80,8 +92,6 @@ struct InputBarView: View {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard appState.sendMessage(trimmed) else { return }
-        // Work around occasional stale UITextField rendering where cleared text
-        // stays visible until the next layout/scroll tick.
         let shouldRestoreFocus = isFocused
         if shouldRestoreFocus {
             isFocused = false
@@ -137,8 +147,6 @@ struct InputBarView: View {
         return String(text[range])
     }
 
-    // Known limitation: SwiftUI TextField doesn't expose caret position, so
-    // mention matching assumes the active token is at the end of the text.
     private var activeMentionRange: Range<String.Index>? {
         guard !text.isEmpty else { return nil }
 
