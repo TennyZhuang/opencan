@@ -23,7 +23,10 @@ struct ChatView: View {
                     forceScrollToken += 1
                 }
 
-                Divider()
+                Rectangle()
+                    .fill(Color.black)
+                    .frame(height: Brutal.border)
+
                 InputBarView()
             }
             .disabled(appState.shouldShowChatReconnectOverlay)
@@ -32,6 +35,7 @@ struct ChatView: View {
                 reconnectOverlay
             }
         }
+        .background(Brutal.cream.ignoresSafeArea())
         .navigationTitle(appState.activeWorkspace?.name ?? "Chat")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -41,6 +45,7 @@ struct ChatView: View {
                 Button("Disconnect", role: .destructive) {
                     appState.disconnect()
                 }
+                .foregroundStyle(Brutal.pink)
             }
         }
         .onAppear {
@@ -63,26 +68,26 @@ struct ChatView: View {
 
     @ViewBuilder
     private var reconnectOverlay: some View {
-        Rectangle()
-            .fill(.ultraThinMaterial)
+        Color.black.opacity(0.3)
             .ignoresSafeArea()
             .overlay {
                 VStack(spacing: 14) {
                     Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
-                        .font(.system(size: 42, weight: .semibold))
-                        .symbolRenderingMode(.hierarchical)
+                        .font(.system(size: 42, weight: .bold))
+                        .foregroundStyle(.black)
                     ProgressView()
+                        .tint(.black)
                     Text(reconnectOverlayTitle)
-                        .font(.headline)
+                        .font(Brutal.display(17, weight: .bold))
+                        .foregroundStyle(.black)
                     Text(reconnectOverlayMessage)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .font(Brutal.display(14))
+                        .foregroundStyle(.black.opacity(0.6))
                         .multilineTextAlignment(.center)
                 }
                 .padding(.horizontal, 28)
                 .padding(.vertical, 24)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-                .shadow(color: .black.opacity(0.08), radius: 18, y: 10)
+                .brutalCard(fill: .white, shadow: Brutal.shadowLg, border: Brutal.borderThick)
                 .padding(24)
             }
     }

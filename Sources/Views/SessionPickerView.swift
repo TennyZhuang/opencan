@@ -134,6 +134,7 @@ struct SessionPickerView: View {
 
     var body: some View {
         sessionListView
+            .background(Brutal.cream.ignoresSafeArea())
             .navigationTitle("Sessions")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -202,103 +203,141 @@ struct SessionPickerView: View {
     }
 
     private var sessionListView: some View {
-        List {
-            Section {
-                if OpenCANApp.isUITesting {
-                    Button {
-                        guard let agent = defaultCreateAgent else { return }
-                        Task { @MainActor in await createNew(agent: agent) }
-                    } label: {
-                        HStack {
-                            Label("New Session", systemImage: "plus.circle")
-                            if appState.isCreatingSession, loadingConversationId == nil {
-                                Spacer()
-                                ProgressView()
-                            }
-                        }
-                    }
-                    .disabled(appState.isCreatingSession || defaultCreateAgent == nil)
-                } else {
-                    Menu {
-                        if appState.hasReliableAgentAvailability && availableAgents.isEmpty {
-                            Text("No available agents on this node")
-                        } else {
-                            ForEach(availableAgents) { agent in
-                                Button {
-                                    Task { @MainActor in await createNew(agent: agent) }
-                                } label: {
-                                    let command = AgentCommandStore.command(for: agent)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(agent.displayName)
-                                        Text(command)
-                                            .font(.caption2)
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        HStack {
-                            Label("New Session", systemImage: "plus.circle")
-                            if appState.isCreatingSession, loadingConversationId == nil {
-                                Spacer()
-                                ProgressView()
-                            }
-                        }
-                    }
-                    .disabled(appState.isCreatingSession || (appState.hasReliableAgentAvailability && availableAgents.isEmpty))
-                }
-            }
+        ScrollView {
+            VStack(spacing: 12) {
+                // New Session button
+                newSessionButton
+                    .padding(.top, 8)
 
-            let sessions = unifiedSessions
-            if !sessions.isEmpty {
-                Section("Sessions") {
+                // Session list
+                let sessions = unifiedSessions
+                if !sessions.isEmpty {
+                    HStack {
+                        Text("SESSIONS")
+                            .font(Brutal.mono(12, weight: .bold))
+                            .foregroundStyle(.black.opacity(0.5))
+                        Spacer()
+                    }
+                    .padding(.top, 8)
+
                     ForEach(sessions) { session in
                         Button {
                             Task { @MainActor in await openConversation(conversationId: session.conversationId) }
                         } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(session.displayTitle)
-                                        .font(.system(.body, design: .monospaced))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
-                                    if let agentName = session.agentDisplayName {
-                                        Text(agentName)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Text(session.conversationId)
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                        .lineLimit(1)
-                                    if let runtimeId = session.effectiveRuntimeId,
-                                       runtimeId != session.conversationId {
-                                        Text("runtime: \(runtimeId)")
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
-                                            .lineLimit(1)
-                                    }
-                                    if let date = session.effectiveLastUsedAt {
-                                        Text(date.formatted(.relative(presentation: .named)))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                Spacer()
-                                SessionStateBadge(state: session.displayState)
-                                if loadingConversationId == session.conversationId {
-                                    ProgressView()
-                                }
-                            }
+                            sessionCard(session)
                         }
+                        .buttonStyle(.plain)
                         .disabled(appState.isCreatingSession || !session.isResumable)
                     }
                 }
             }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
         }
-        .refreshable {
-            await appState.refreshDaemonSessions()
+    }
+
+    @ViewBuilder
+    private var newSessionButton: some View {
+        if OpenCANApp.isUITesting {
+            Button {
+                guard let agent = defaultCreateAgent else { return }
+                Task { @MainActor in await createNew(agent: agent) }
+            } label: {
+                HStack {
+                    Image(systemName: "plus.circle")
+                        .font(Brutal.display(16, weight: .bold))
+                    Text("New Session")
+                        .font(Brutal.display(16, weight: .bold))
+                    if appState.isCreatingSession, loadingConversationId == nil {
+                        Spacer()
+                        ProgressView()
+                            .tint(.black)
+                    }
+                }
+                .foregroundStyle(.black)
+            }
+            .buttonStyle(BrutalButtonStyle(fill: Brutal.lime))
+            .disabled(appState.isCreatingSession || defaultCreateAgent == nil)
+        } else {
+            Menu {
+                if appState.hasReliableAgentAvailability && availableAgents.isEmpty {
+                    Text("No available agents on this node")
+                } else {
+                    ForEach(availableAgents) { agent in
+                        Button {
+                            Task { @MainActor in await createNew(agent: agent) }
+                        } label: {
+                            let command = AgentCommandStore.command(for: agent)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(agent.displayName)
+                                Text(command)
+                                    .font(.caption2)
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack {
+                    Image(systemName: "plus.circle")
+                        .font(Brutal.display(16, weight: .bold))
+                    Text("New Session")
+                        .font(Brutal.display(16, weight: .bold))
+                    if appState.isCreatingSession, loadingConversationId == nil {
+                        Spacer()
+                        ProgressView()
+                            .tint(.black)
+                    }
+                }
+                .foregroundStyle(.black)
+                .padding(.vertical, 10)
+                .padding(.horizontal, 16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .brutalCard(fill: Brutal.lime)
+            }
+            .disabled(appState.isCreatingSession || (appState.hasReliableAgentAvailability && availableAgents.isEmpty))
         }
+    }
+
+    private func sessionCard(_ session: UnifiedSession) -> some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(session.displayTitle)
+                    .font(Brutal.mono(14, weight: .medium))
+                    .foregroundStyle(.black)
+                    .lineLimit(1)
+                if let agentName = session.agentDisplayName {
+                    Text(agentName)
+                        .font(Brutal.mono(11))
+                        .foregroundStyle(.black.opacity(0.5))
+                }
+                Text(session.conversationId)
+                    .font(Brutal.mono(10))
+                    .foregroundStyle(.black.opacity(0.3))
+                    .lineLimit(1)
+                if let runtimeId = session.effectiveRuntimeId,
+                   runtimeId != session.conversationId {
+                    Text("runtime: \(runtimeId)")
+                        .font(Brutal.mono(10))
+                        .foregroundStyle(.black.opacity(0.3))
+                        .lineLimit(1)
+                }
+                if let date = session.effectiveLastUsedAt {
+                    Text(date.formatted(.relative(presentation: .named)))
+                        .font(Brutal.mono(11))
+                        .foregroundStyle(.black.opacity(0.5))
+                }
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 4) {
+                SessionStateBadge(state: session.displayState)
+                if loadingConversationId == session.conversationId {
+                    ProgressView()
+                        .tint(.black)
+                }
+            }
+        }
+        .padding(14)
+        .brutalCard(fill: .white, shadow: Brutal.shadowSm)
     }
 
     @MainActor
@@ -336,14 +375,7 @@ struct SessionStateBadge: View {
     let state: String
 
     var body: some View {
-        Text(displayText)
-            .font(.caption2)
-            .fontWeight(.medium)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(backgroundColor.opacity(0.15))
-            .foregroundStyle(backgroundColor)
-            .clipShape(Capsule())
+        BrutalChip(displayText, fill: backgroundColor, fontSize: 10)
     }
 
     private var displayText: String {
@@ -360,13 +392,13 @@ struct SessionStateBadge: View {
 
     private var backgroundColor: Color {
         switch state {
-        case "running", "prompting", "draining": .blue
-        case "attached": .green
-        case "ready", "idle", "completed": .gray
-        case "restorable", "external": .purple
-        case "unavailable", "dead": .red
-        case "starting": .yellow
-        default: .gray
+        case "running", "prompting", "draining": Brutal.lime
+        case "attached": Brutal.mint
+        case "ready", "idle", "completed": Color(hex: 0xDDDDDD)
+        case "restorable", "external": Brutal.lavender
+        case "unavailable", "dead": Brutal.pink
+        case "starting": Brutal.orange
+        default: Color(hex: 0xDDDDDD)
         }
     }
 }

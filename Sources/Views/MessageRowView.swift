@@ -11,25 +11,22 @@ struct MessageRowView: View {
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
                 if !message.content.isEmpty {
                     if message.role == .assistant {
-                        // LTXLabel supports double-tap word selection, but SwiftUI's
-                        // ScrollView intercepts touches. Use contextMenu for copy.
                         MarkdownView(message.content)
                             .padding(Theme.bubblePadding)
                             .background(Theme.assistantBubble)
-                            .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
+                            .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
                             .contextMenu { copyButton }
                     } else if message.role == .user {
                         Text(message.content)
                             .padding(Theme.bubblePadding)
-                            .background(Theme.userBubble)
-                            .foregroundStyle(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
+                            .foregroundStyle(.black)
+                            .brutalCard(fill: Brutal.mint.opacity(0.25), shadow: Brutal.shadowSm)
                             .textSelection(.enabled)
                             .contextMenu { copyButton }
                     } else {
                         Text(message.content)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(Brutal.mono(12))
+                            .foregroundStyle(.black.opacity(0.5))
                             .frame(maxWidth: .infinity)
                             .textSelection(.enabled)
                             .contextMenu { copyButton }
@@ -43,10 +40,11 @@ struct MessageRowView: View {
                 if message.isStreaming {
                     HStack(spacing: 4) {
                         ProgressView()
+                            .tint(.black)
                             .scaleEffect(0.7)
                         Text("Thinking...")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(Brutal.mono(12))
+                            .foregroundStyle(.black.opacity(0.5))
                     }
                 }
             }

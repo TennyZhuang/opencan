@@ -42,6 +42,7 @@ struct DiagnosticView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .padding()
+            .background(Brutal.cream.ignoresSafeArea())
             .navigationTitle("Diagnostics")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -117,7 +118,7 @@ struct DiagnosticView: View {
                     Button("Apply") {
                         Task { await loadDaemonLogs() }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(BrutalButtonStyle(fill: Brutal.mint, compact: true))
                 }
 
                 if let daemonError {

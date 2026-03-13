@@ -17,6 +17,7 @@ struct ChatMessageListView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> ListViewKit.ListView {
         let listView = ListViewKit.ListView(frame: .zero)
+        listView.backgroundColor = BrutalUIKit.cream
         context.coordinator.install(on: listView)
         return listView
     }
@@ -92,8 +93,6 @@ extension ChatMessageListView {
         ) {
             guard let dataSource else { return }
 
-            // Replay bursts can emit many updates in one runloop; disable row
-            // animations to avoid diff/apply races in ListViewKit.
             let shouldAnimate = hasLoadedData && !isPrompting
             dataSource.applySnapshot(using: entries, animatingDifferences: shouldAnimate)
 
@@ -277,7 +276,8 @@ extension ChatMessageListView {
                 )
                 let availableWidth = FlowUserMessageRowView.availableTextWidth(for: containerWidth)
                 let textHeight = boundingHeight(with: availableWidth, attributedText: attributed)
-                contentHeight = textHeight + FlowUserMessageRowView.textPadding * 2
+                // text padding + border (2px top + 2px bottom) + shadow offset (2px)
+                contentHeight = textHeight + FlowUserMessageRowView.textPadding * 2 + BrutalUIKit.borderWidth * 2 + BrutalUIKit.shadowSm
 
             case .assistantMessage:
                 let package = markdownPackage(for: entry.text)
@@ -288,7 +288,8 @@ extension ChatMessageListView {
                 contentHeight = ceil(UIFont.preferredFont(forTextStyle: .footnote).lineHeight + 16)
 
             case .toolHint:
-                contentHeight = ceil(UIFont.preferredFont(forTextStyle: .body).lineHeight + 20)
+                // text padding + border + shadow
+                contentHeight = ceil(UIFont.preferredFont(forTextStyle: .body).lineHeight + 20 + BrutalUIKit.borderWidth * 2 + BrutalUIKit.shadowSm)
 
             case .activity:
                 let textHeight = UIFont.preferredFont(forTextStyle: .body).lineHeight
@@ -538,6 +539,7 @@ class FlowMessageRowView: ListRowView, UIContextMenuInteractionDelegate {
     override init(frame: CGRect) {
         super.init(frame: frame)
         clipsToBounds = false
+        backgroundColor = BrutalUIKit.cream
         addSubview(containerView)
         containerView.isUserInteractionEnabled = true
         containerView.addInteraction(UIContextMenuInteraction(delegate: self))
@@ -592,7 +594,7 @@ final class FlowUserMessageRowView: FlowMessageRowView {
                 string: text,
                 attributes: [
                     .font: UIFont.preferredFont(forTextStyle: .body),
-                    .foregroundColor: UIColor.label,
+                    .foregroundColor: UIColor.black,
                 ]
             )
             textLabel.attributedText = attributed
@@ -600,6 +602,7 @@ final class FlowUserMessageRowView: FlowMessageRowView {
         }
     }
 
+    private let shadowView = UIView()
     private let bubbleView = UIView()
     private let textLabel: LTXLabel = {
         let label = LTXLabel()
@@ -608,24 +611,19 @@ final class FlowUserMessageRowView: FlowMessageRowView {
         return label
     }()
 
-    private let backgroundGradientLayer = CAGradientLayer()
-
     override init(frame: CGRect) {
         super.init(frame: frame)
 
-        let accentColor = UIColor.systemBlue
-        backgroundGradientLayer.colors = [
-            accentColor.withAlphaComponent(0.10).cgColor,
-            accentColor.withAlphaComponent(0.15).cgColor,
-        ]
-        backgroundGradientLayer.startPoint = .init(x: 0.6, y: 0)
-        backgroundGradientLayer.endPoint = .init(x: 0.4, y: 1)
+        // Shadow layer (black offset rectangle)
+        shadowView.backgroundColor = .black
 
-        bubbleView.layer.cornerRadius = 12
-        bubbleView.layer.cornerCurve = .continuous
-        bubbleView.layer.insertSublayer(backgroundGradientLayer, at: 0)
+        // Bubble (mint fill + black border)
+        bubbleView.backgroundColor = BrutalUIKit.mint.withAlphaComponent(0.25)
+        bubbleView.layer.borderColor = UIColor.black.cgColor
+        bubbleView.layer.borderWidth = BrutalUIKit.borderWidth
         bubbleView.clipsToBounds = true
 
+        containerView.addSubview(shadowView)
         containerView.addSubview(bubbleView)
         bubbleView.addSubview(textLabel)
 
@@ -640,15 +638,11 @@ final class FlowUserMessageRowView: FlowMessageRowView {
 
         let bubbleWidth = ceil(textSize.width) + Self.textPadding * 2
         let width = min(containerView.bounds.width, bubbleWidth)
-        bubbleView.frame = CGRect(
-            x: max(0, containerView.bounds.width - width),
-            y: 0,
-            width: width,
-            height: containerView.bounds.height
-        )
+        let bubbleHeight = containerView.bounds.height - BrutalUIKit.shadowSm
 
-        backgroundGradientLayer.frame = bubbleView.bounds
-        backgroundGradientLayer.cornerRadius = bubbleView.layer.cornerRadius
+        let bubbleX = max(0, containerView.bounds.width - width)
+        bubbleView.frame = CGRect(x: bubbleX, y: 0, width: width, height: bubbleHeight)
+        shadowView.frame = bubbleView.frame.offsetBy(dx: BrutalUIKit.shadowSm, dy: BrutalUIKit.shadowSm)
         textLabel.frame = bubbleView.bounds.insetBy(dx: Self.textPadding, dy: Self.textPadding)
     }
 
@@ -702,7 +696,7 @@ final class FlowHintRowView: FlowMessageRowView {
         label.textAlignment = .center
         label.alpha = 0.5
         label.font = UIFont.preferredFont(forTextStyle: .footnote)
-        label.textColor = .secondaryLabel
+        label.textColor = .black
         return label
     }()
 
@@ -726,6 +720,7 @@ final class FlowToolHintRowView: FlowMessageRowView {
         }
     }
 
+    private let shadowView = UIView()
     private let bubbleView = UIView()
     private let symbolView: UIImageView = {
         let imageView = UIImageView()
@@ -738,22 +733,20 @@ final class FlowToolHintRowView: FlowMessageRowView {
         label.font = UIFont.preferredFont(forTextStyle: .body)
         label.numberOfLines = 1
         label.lineBreakMode = .byTruncatingTail
+        label.textColor = .black
         return label
     }()
-
-    private let backgroundGradientLayer = CAGradientLayer()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
 
-        backgroundGradientLayer.startPoint = .init(x: 0.6, y: 0)
-        backgroundGradientLayer.endPoint = .init(x: 0.4, y: 1)
+        shadowView.backgroundColor = .black
 
-        bubbleView.layer.cornerRadius = 12
-        bubbleView.layer.cornerCurve = .continuous
-        bubbleView.layer.insertSublayer(backgroundGradientLayer, at: 0)
+        bubbleView.layer.borderColor = UIColor.black.cgColor
+        bubbleView.layer.borderWidth = BrutalUIKit.borderWidth
         bubbleView.clipsToBounds = true
 
+        containerView.addSubview(shadowView)
         containerView.addSubview(bubbleView)
         bubbleView.addSubview(symbolView)
         bubbleView.addSubview(label)
@@ -769,13 +762,10 @@ final class FlowToolHintRowView: FlowMessageRowView {
             containerView.bounds.width,
             symbolSize + 8 + labelSize.width + 24
         )
+        let bubbleHeight = containerView.bounds.height - BrutalUIKit.shadowSm
 
-        bubbleView.frame = CGRect(
-            x: 0,
-            y: 0,
-            width: bubbleWidth,
-            height: containerView.bounds.height
-        )
+        bubbleView.frame = CGRect(x: 0, y: 0, width: bubbleWidth, height: bubbleHeight)
+        shadowView.frame = bubbleView.frame.offsetBy(dx: BrutalUIKit.shadowSm, dy: BrutalUIKit.shadowSm)
 
         symbolView.frame = CGRect(
             x: 12,
@@ -790,9 +780,6 @@ final class FlowToolHintRowView: FlowMessageRowView {
             width: max(0, bubbleView.bounds.width - symbolView.frame.maxX - 20),
             height: labelSize.height
         )
-
-        backgroundGradientLayer.frame = bubbleView.bounds
-        backgroundGradientLayer.cornerRadius = bubbleView.layer.cornerRadius
     }
 
     private func updateState() {
@@ -802,26 +789,17 @@ final class FlowToolHintRowView: FlowMessageRowView {
 
         let configuration = UIImage.SymbolConfiguration(scale: .small)
         if toolCall.isFailed {
-            backgroundGradientLayer.colors = [
-                UIColor.systemRed.withAlphaComponent(0.08).cgColor,
-                UIColor.systemRed.withAlphaComponent(0.12).cgColor,
-            ]
+            bubbleView.backgroundColor = BrutalUIKit.pink.withAlphaComponent(0.2)
             symbolView.image = UIImage(systemName: "xmark.seal", withConfiguration: configuration)
-            symbolView.tintColor = .systemRed
+            symbolView.tintColor = .black
         } else if toolCall.isComplete {
-            backgroundGradientLayer.colors = [
-                UIColor.systemGreen.withAlphaComponent(0.08).cgColor,
-                UIColor.systemGreen.withAlphaComponent(0.12).cgColor,
-            ]
+            bubbleView.backgroundColor = BrutalUIKit.mint.withAlphaComponent(0.2)
             symbolView.image = UIImage(systemName: "checkmark.seal", withConfiguration: configuration)
-            symbolView.tintColor = .systemGreen
+            symbolView.tintColor = .black
         } else {
-            backgroundGradientLayer.colors = [
-                UIColor.systemBlue.withAlphaComponent(0.08).cgColor,
-                UIColor.systemBlue.withAlphaComponent(0.12).cgColor,
-            ]
+            bubbleView.backgroundColor = BrutalUIKit.cyan.withAlphaComponent(0.2)
             symbolView.image = UIImage(systemName: "hourglass", withConfiguration: configuration)
-            symbolView.tintColor = .systemBlue
+            symbolView.tintColor = .black
         }
 
         setNeedsLayout()
@@ -852,13 +830,14 @@ final class FlowActivityRowView: FlowMessageRowView {
     private let label: UILabel = {
         let label = UILabel()
         label.font = UIFont.preferredFont(forTextStyle: .body)
-        label.textColor = .secondaryLabel
+        label.textColor = .black.withAlphaComponent(0.6)
         return label
     }()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
 
+        spinner.color = .black
         spinner.startAnimating()
         containerView.addSubview(spinner)
         containerView.addSubview(label)
@@ -904,7 +883,7 @@ final class RawTextViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        view.backgroundColor = .systemBackground
+        view.backgroundColor = BrutalUIKit.cream
         title = "Raw Content"
 
         textView.text = content

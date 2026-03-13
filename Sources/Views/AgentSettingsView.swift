@@ -25,10 +25,12 @@ struct AgentSettingsView: View {
 
                 Section {
                     Text("You can replace the command with custom launchers, for example npx @zed-industries/codex-acp.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(Brutal.mono(12))
+                        .foregroundStyle(.black.opacity(0.6))
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(Brutal.cream.ignoresSafeArea())
             .navigationTitle("Agent Settings")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -39,6 +41,7 @@ struct AgentSettingsView: View {
                         normalizeCommandFields()
                         dismiss()
                     }
+                    .fontWeight(.bold)
                 }
             }
             .onAppear {
@@ -54,20 +57,21 @@ struct AgentSettingsView: View {
     private func commandField(for agent: AgentKind, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(agent.displayName)
-                .font(.subheadline)
-                .fontWeight(.semibold)
+                .font(Brutal.display(15, weight: .bold))
             TextField(agent.defaultCommand, text: text)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+                .font(Brutal.mono(14))
             HStack {
                 Text("Default: \(agent.defaultCommand)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(Brutal.mono(11))
+                    .foregroundStyle(.black.opacity(0.5))
                 Spacer()
                 Button("Reset") {
                     text.wrappedValue = agent.defaultCommand
                 }
-                .font(.caption2)
+                .font(Brutal.mono(11, weight: .bold))
+                .foregroundStyle(.black)
             }
         }
     }

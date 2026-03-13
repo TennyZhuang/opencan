@@ -9,6 +9,64 @@ final class OpenCANUITests: XCTestCase {
         app.launch()
     }
 
+    // MARK: - Screenshots
+
+    func testCaptureScreenshots() throws {
+        // 1. Node List
+        XCTAssertTrue(app.navigationBars["Nodes"].waitForExistence(timeout: 5))
+        let nodeListShot = app.screenshot()
+        let attachment1 = XCTAttachment(screenshot: nodeListShot)
+        attachment1.name = "01-node-list"
+        attachment1.lifetime = .keepAlways
+        add(attachment1)
+
+        // 2. Workspace List
+        let cp32 = app.staticTexts["cp32"]
+        XCTAssertTrue(cp32.waitForExistence(timeout: 5))
+        cp32.tap()
+        let home = app.staticTexts["home"]
+        XCTAssertTrue(home.waitForExistence(timeout: 3))
+        let workspaceShot = app.screenshot()
+        let attachment2 = XCTAttachment(screenshot: workspaceShot)
+        attachment2.name = "02-workspace-list"
+        attachment2.lifetime = .keepAlways
+        add(attachment2)
+
+        // 3. Session Picker
+        home.tap()
+        let newSessionButton = app.buttons["New Session"]
+        XCTAssertTrue(newSessionButton.waitForExistence(timeout: 10))
+        let sessionShot = app.screenshot()
+        let attachment3 = XCTAttachment(screenshot: sessionShot)
+        attachment3.name = "03-session-picker"
+        attachment3.lifetime = .keepAlways
+        add(attachment3)
+
+        // 4. Chat View (create session)
+        newSessionButton.tap()
+        let systemMessage = app.staticTexts["New session on home"]
+        XCTAssertTrue(systemMessage.waitForExistence(timeout: 10))
+        let chatEmptyShot = app.screenshot()
+        let attachment4 = XCTAttachment(screenshot: chatEmptyShot)
+        attachment4.name = "04-chat-empty"
+        attachment4.lifetime = .keepAlways
+        add(attachment4)
+
+        // 5. Chat with message
+        let textField = app.textFields.firstMatch
+        XCTAssertTrue(textField.waitForExistence(timeout: 5))
+        textField.tap()
+        textField.typeText("Hello, this is a test message")
+        app.buttons["arrow.up.circle.fill"].tap()
+        XCTAssertTrue(app.staticTexts["Hello, this is a test message"].waitForExistence(timeout: 5))
+        sleep(3)
+        let chatMsgShot = app.screenshot()
+        let attachment5 = XCTAttachment(screenshot: chatMsgShot)
+        attachment5.name = "05-chat-with-response"
+        attachment5.lifetime = .keepAlways
+        add(attachment5)
+    }
+
     // MARK: - Node Management
 
     func testNodeListAppears() throws {
