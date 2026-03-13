@@ -30,6 +30,7 @@ struct OpenCANApp: App {
         WindowGroup {
             ContentView()
                 .environment(appState)
+                .preferredColorScheme(.light)
                 .onAppear {
                     Task(priority: .utility) {
                         migrateSSHKeysToKeychainIfNeeded()
