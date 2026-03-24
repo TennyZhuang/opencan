@@ -9,6 +9,10 @@ func reconnectRetryDelaySeconds(forAttempt attempt: Int, randomUnit: Double = Do
     return min(30, max(1, baseDelay * jitterFactor))
 }
 
+func shouldShowBackToBottomButton(distanceFromBottom: CGFloat, threshold: CGFloat = 200) -> Bool {
+    distanceFromBottom > threshold
+}
+
 struct ChatView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.modelContext) private var modelContext
@@ -16,6 +20,7 @@ struct ChatView: View {
     @State private var forceScrollToken = 0
     @State private var reconnectTask: Task<Void, Never>?
     @State private var nextReconnectDelaySeconds: Int?
+    @State private var showsBackToBottomButton = false
 
     var body: some View {
         ZStack {
@@ -25,7 +30,11 @@ struct ChatView: View {
                     isPrompting: appState.isPrompting,
                     contentVersion: appState.contentVersion,
                     forceScrollToken: forceScrollToken
-                )
+                ) { isVisible in
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        showsBackToBottomButton = isVisible
+                    }
+                }
                 .onChange(of: appState.forceScrollToBottom) {
                     guard appState.forceScrollToBottom else { return }
                     appState.forceScrollToBottom = false
@@ -38,6 +47,15 @@ struct ChatView: View {
 
                 InputBarView()
                     .disabled(!appState.canSendMessages)
+            }
+
+            if showsBackToBottomButton {
+                backToBottomButton
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 86)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .zIndex(1)
             }
 
             if appState.shouldShowChatReconnectOverlay {
@@ -84,6 +102,24 @@ struct ChatView: View {
                 await appState.discardEmptyActiveSessionIfNeeded(modelContext: modelContext)
             }
         }
+    }
+
+    private var backToBottomButton: some View {
+        Button {
+            forceScrollToken += 1
+            withAnimation(.easeOut(duration: 0.12)) {
+                showsBackToBottomButton = false
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 12, weight: .black))
+                Text("Bottom")
+                    .font(Brutal.mono(12, weight: .bold))
+            }
+        }
+        .buttonStyle(BrutalButtonStyle(fill: Brutal.lime, compact: true))
+        .accessibilityIdentifier("chat-back-to-bottom")
     }
 
     @ViewBuilder
