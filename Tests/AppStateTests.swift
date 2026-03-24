@@ -2250,6 +2250,28 @@ final class AppStateTests: XCTestCase {
         appState.markTransportInterrupted("mock interruption")
 
         XCTAssertTrue(appState.shouldShowChatReconnectOverlay)
+        XCTAssertFalse(appState.canSendMessages, "Interrupted chat should become read-only until recovery succeeds")
+    }
+
+    func testCancelInterruptedSessionRecoveryKeepsTranscriptVisibleButStopsOverlay() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        XCTAssertTrue(appState.sendMessage("keep transcript visible"))
+        try await waitFor(timeout: 5) { !self.appState.isPrompting }
+        let transcriptCount = appState.messages.count
+
+        appState.markTransportInterrupted("mock interruption")
+        XCTAssertTrue(appState.shouldShowChatReconnectOverlay)
+
+        appState.cancelInterruptedSessionRecovery()
+
+        XCTAssertFalse(appState.shouldShowChatReconnectOverlay)
+        XCTAssertEqual(appState.connectionStatus, .failed)
+        XCTAssertEqual(appState.connectionError, "Reconnect canceled")
+        XCTAssertEqual(appState.messages.count, transcriptCount, "Transcript should remain available for read-only browsing")
+        XCTAssertNotNil(appState.activeSession, "Active session context should remain for manual reopen later")
+        XCTAssertFalse(appState.canSendMessages, "Canceled recovery should leave chat in read-only mode")
     }
 
     func testRecoverInterruptedSessionRoundTripCallsReconnectAndOpen() async throws {
@@ -2394,6 +2416,41 @@ final class AppStateTests: XCTestCase {
         await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
         XCTAssertEqual(connectCalls, 2)
         XCTAssertEqual(openCalls, 0)
+    }
+
+    func testCancelInterruptedSessionRecoveryInvalidatesInFlightRecoveryAttempt() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.markTransportInterrupted("mock interruption")
+        XCTAssertTrue(appState.shouldShowChatReconnectOverlay)
+
+        var cancelIssued = false
+        var openCalls = 0
+        appState.autoReconnectConnectHandler = { _ in
+            self.appState.connectionStatus = .connected
+        }
+        appState.autoReconnectOpenHandler = { _, _ in
+            openCalls += 1
+            while !cancelIssued {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+
+        let recoveryTask = Task {
+            await self.appState.recoverInterruptedSessionIfNeeded(modelContext: self.modelContext)
+        }
+
+        try await waitFor(timeout: 5) { self.appState.isAutoReconnectInProgressForLifecycle }
+        appState.cancelInterruptedSessionRecovery()
+        cancelIssued = true
+        await recoveryTask.value
+
+        XCTAssertEqual(openCalls, 1, "Recovery attempt should have started once")
+        XCTAssertFalse(appState.shouldShowChatReconnectOverlay, "Canceled recovery should not keep the overlay active")
+        XCTAssertFalse(appState.shouldAutoReconnectInterruptedSessionForLifecycle, "Cancel should invalidate retry intent")
+        XCTAssertEqual(appState.connectionError, "Reconnect canceled")
+        XCTAssertEqual(appState.connectionStatus, .failed)
     }
 
     func testRecoverInterruptedPromptReconnectsAndReplaysBufferedTail() async throws {
@@ -2577,6 +2634,15 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(
             appState.messages.contains { $0.role == .assistant && $0.content.contains("open retry") }
         )
+    }
+
+    func testReconnectRetryDelaySecondsUsesExponentialBackoffWithCap() {
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 0), 1)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 1), 2)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 2), 4)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 4), 16)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 5), 30)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 8), 30)
     }
 
     // MARK: - Helpers

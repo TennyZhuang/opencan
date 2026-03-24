@@ -11,6 +11,7 @@ protocol ConversationLifecycleAppState: AnyObject {
     var daemonConversations: [DaemonConversationInfo] { get set }
     var messages: [ChatMessage] { get set }
     var currentSessionId: String? { get set }
+    var autoReconnectRecoveryGenerationForLifecycle: UInt64 { get }
     var shouldAutoReconnectInterruptedSessionForLifecycle: Bool { get set }
     var isAutoReconnectInProgressForLifecycle: Bool { get set }
     var daemonAttachClientIDForLifecycle: String { get }
@@ -58,7 +59,8 @@ enum ConversationLifecycle {
     static func openSession(
         appState: ConversationLifecycleAppState,
         conversationId: String,
-        modelContext: ModelContext
+        modelContext: ModelContext,
+        expectedRecoveryGeneration: UInt64? = nil
     ) async throws {
         guard let daemon = appState.daemonClientForLifecycle,
               let workspace = appState.activeWorkspace else {
@@ -191,6 +193,17 @@ enum ConversationLifecycle {
         }
 
         let runtimeId = result.attachment.runtimeId
+        if let expectedRecoveryGeneration,
+           expectedRecoveryGeneration != appState.autoReconnectRecoveryGenerationForLifecycle
+            || !appState.shouldAutoReconnectInterruptedSessionForLifecycle {
+            Log.log(
+                component: "ConversationLifecycle",
+                "skipping canceled recovery apply for conversation open",
+                traceId: traceId,
+                sessionId: conversationId
+            )
+            return
+        }
         if let lastRuntimeId, lastRuntimeId != runtimeId {
             appState.lastEventSeqByRuntimeIDForLifecycle.removeValue(forKey: lastRuntimeId)
         }
@@ -271,6 +284,7 @@ enum ConversationLifecycle {
         guard !appState.isAutoReconnectInProgressForLifecycle else { return }
         guard appState.connectionStatus == .disconnected || appState.connectionStatus == .failed else { return }
         guard let node = appState.activeNode else { return }
+        let recoveryGeneration = appState.autoReconnectRecoveryGenerationForLifecycle
         let recoveryTargetId = appState.activeSession?.conversationId
             ?? appState.currentSessionId
             ?? appState.activeSession?.runtimeId
@@ -298,6 +312,10 @@ enum ConversationLifecycle {
         } else {
             connected = await appState.lifecycleWaitForConnectionResult(timeoutSeconds: 30)
         }
+        guard recoveryGeneration == appState.autoReconnectRecoveryGenerationForLifecycle,
+              appState.shouldAutoReconnectInterruptedSessionForLifecycle else {
+            return
+        }
         guard connected else {
             appState.shouldAutoReconnectInterruptedSessionForLifecycle = true
             Log.log(
@@ -314,11 +332,24 @@ enum ConversationLifecycle {
             if let openHandler = appState.autoReconnectOpenHandler {
                 try await openHandler(sessionId, modelContext)
             } else {
-                try await openSession(appState: appState, conversationId: sessionId, modelContext: modelContext)
+                try await openSession(
+                    appState: appState,
+                    conversationId: sessionId,
+                    modelContext: modelContext,
+                    expectedRecoveryGeneration: recoveryGeneration
+                )
+            }
+            guard recoveryGeneration == appState.autoReconnectRecoveryGenerationForLifecycle,
+                  appState.shouldAutoReconnectInterruptedSessionForLifecycle else {
+                return
             }
             appState.connectionError = nil
             appState.shouldAutoReconnectInterruptedSessionForLifecycle = false
         } catch {
+            guard recoveryGeneration == appState.autoReconnectRecoveryGenerationForLifecycle,
+                  appState.shouldAutoReconnectInterruptedSessionForLifecycle else {
+                return
+            }
             appState.connectionError = error.localizedDescription
             appState.connectionStatus = .failed
             appState.shouldAutoReconnectInterruptedSessionForLifecycle = true
