@@ -159,6 +159,108 @@ final class ConversationAttachmentStateTests: XCTestCase {
         XCTAssertFalse(appState.shouldShowChatReconnectOverlay)
     }
 
+    func testAttachmentStateMapsDeadConversationAsUnavailable() throws {
+        let session = Session(
+            runtimeId: "runtime-dead-1",
+            conversationId: "conversation-dead-1",
+            conversationCwd: "/test/path",
+            workspace: workspace
+        )
+        modelContext.insert(session)
+        try modelContext.save()
+
+        appState.activeSession = session
+        appState.daemonConversations = [
+            DaemonConversationInfo(
+                conversationId: "conversation-dead-1",
+                runtimeId: "runtime-dead-1",
+                state: "dead",
+                cwd: "/test/path",
+                command: nil,
+                title: nil,
+                updatedAt: nil,
+                ownerId: nil,
+                origin: "managed",
+                lastEventSeq: 0
+            )
+        ]
+
+        XCTAssertEqual(
+            appState.conversationAttachmentState,
+            .unavailable(conversationId: "conversation-dead-1")
+        )
+    }
+
+    func testAttachmentStateMapsDrainingTurnStateFromDaemonSession() throws {
+        let session = Session(
+            runtimeId: "runtime-draining-1",
+            conversationId: "conversation-draining-1",
+            conversationCwd: "/test/path",
+            workspace: workspace
+        )
+
+        let state = ConversationAttachmentState.derive(
+            connectionStatus: .connected,
+            activeSession: session,
+            currentSessionId: "runtime-draining-1",
+            daemonConversations: [],
+            daemonSessions: [
+                DaemonSessionInfo(
+                    sessionId: "runtime-draining-1",
+                    cwd: "/test/path",
+                    state: "draining",
+                    lastEventSeq: 7,
+                    command: nil,
+                    title: nil
+                )
+            ],
+            isPrompting: false,
+            shouldAutoReconnectInterruptedSession: false,
+            isAutoReconnectInProgress: false,
+            lastEventSeqByRuntimeID: [:]
+        )
+
+        XCTAssertEqual(
+            state,
+            .attached(
+                conversationId: "conversation-draining-1",
+                runtimeId: "runtime-draining-1",
+                turnState: .draining
+            )
+        )
+    }
+
+    func testAttachmentStatePreservesConnectingTransportWhileRecovering() throws {
+        let session = Session(
+            runtimeId: "runtime-recovering-1",
+            conversationId: "conversation-recovering-1",
+            conversationCwd: "/test/path",
+            workspace: workspace
+        )
+
+        let state = ConversationAttachmentState.derive(
+            connectionStatus: .connecting,
+            activeSession: session,
+            currentSessionId: "runtime-recovering-1",
+            daemonConversations: [],
+            daemonSessions: [],
+            isPrompting: false,
+            shouldAutoReconnectInterruptedSession: true,
+            isAutoReconnectInProgress: false,
+            lastEventSeqByRuntimeID: ["runtime-recovering-1": 42]
+        )
+
+        XCTAssertEqual(
+            state,
+            .recovering(
+                conversationId: "conversation-recovering-1",
+                lastKnownRuntimeId: "runtime-recovering-1",
+                lastEventSeq: 42,
+                transportState: .connecting
+            )
+        )
+    }
+
     func testAttachmentStateDoesNotReportAttachedWithoutLiveConnection() {
         let session = Session(
             runtimeId: "runtime-stale-1",

@@ -119,8 +119,7 @@ final class AppState {
     /// Test hook for mocking the auto-reconnect open step.
     var autoReconnectOpenHandler: ((String, ModelContext) async throws -> Void)?
 
-    /// True when chat should stay on-page and show the reconnecting overlay
-    /// until the interrupted conversation is attached again.
+    /// Derived attachment view for the active chat conversation.
     var conversationAttachmentState: ConversationAttachmentState {
         ConversationAttachmentState.derive(
             connectionStatus: connectionStatus,
