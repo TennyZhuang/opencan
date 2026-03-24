@@ -121,18 +121,25 @@ final class AppState {
 
     /// True when chat should stay on-page and show the reconnecting overlay
     /// until the interrupted conversation is attached again.
+    var conversationAttachmentState: ConversationAttachmentState {
+        ConversationAttachmentState.derive(
+            connectionStatus: connectionStatus,
+            activeSession: activeSession,
+            currentSessionId: currentSessionId,
+            daemonConversations: daemonConversations,
+            daemonSessions: daemonSessions,
+            isPrompting: isPrompting,
+            shouldAutoReconnectInterruptedSession: shouldAutoReconnectInterruptedSession,
+            isAutoReconnectInProgress: isAutoReconnectInProgress,
+            lastEventSeqByRuntimeID: lastEventSeq
+        )
+    }
+
+    /// True when chat should stay on-page and show the reconnecting overlay
+    /// until the interrupted conversation is attached again.
     var shouldShowChatReconnectOverlay: Bool {
-        let hasConversationTarget = !((activeSession?.conversationId ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty)
-        let hasRuntimeTarget = !((currentSessionId ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty)
-        let hasRecoveryTarget = activeNode != nil
-            && activeWorkspace != nil
-            && (hasConversationTarget || hasRuntimeTarget)
-        guard hasRecoveryTarget else { return false }
-        return shouldAutoReconnectInterruptedSession || isAutoReconnectInProgress
+        guard activeNode != nil, activeWorkspace != nil else { return false }
+        return conversationAttachmentState.showsReconnectOverlay
     }
 
     /// Uploaded image mentions available to the active chat session.
