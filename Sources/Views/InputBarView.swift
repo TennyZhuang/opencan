@@ -86,7 +86,7 @@ struct InputBarView: View {
 
     private var canSend: Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && appState.canSendMessages
+            && appState.conversationAttachmentState.allowsPromptSend
     }
 
     private var textFieldPlaceholder: String {
