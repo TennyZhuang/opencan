@@ -1,12 +1,21 @@
 import SwiftUI
 import SwiftData
 
+func reconnectRetryDelaySeconds(forAttempt attempt: Int, randomUnit: Double = Double.random(in: 0 ... 1)) -> TimeInterval {
+    let clampedAttempt = max(attempt, 0)
+    let baseDelay = pow(2, Double(clampedAttempt))
+    let clampedRandom = min(max(randomUnit, 0), 1)
+    let jitterFactor = 0.8 + (clampedRandom * 0.4)
+    return min(30, max(1, baseDelay * jitterFactor))
+}
+
 struct ChatView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @State private var forceScrollToken = 0
     @State private var reconnectTask: Task<Void, Never>?
+    @State private var nextReconnectDelaySeconds: Int?
 
     var body: some View {
         ZStack {
@@ -28,8 +37,8 @@ struct ChatView: View {
                     .frame(height: Brutal.border)
 
                 InputBarView()
+                    .disabled(!appState.canSendMessages)
             }
-            .disabled(appState.shouldShowChatReconnectOverlay)
 
             if appState.shouldShowChatReconnectOverlay {
                 reconnectOverlay
@@ -79,28 +88,43 @@ struct ChatView: View {
 
     @ViewBuilder
     private var reconnectOverlay: some View {
-        Color.black.opacity(0.3)
-            .ignoresSafeArea()
-            .overlay {
-                VStack(spacing: 14) {
-                    Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
-                        .font(.system(size: 42, weight: .bold))
-                        .foregroundStyle(.black)
-                    ProgressView()
-                        .tint(.black)
-                    Text(reconnectOverlayTitle)
-                        .font(Brutal.display(17, weight: .bold))
-                        .foregroundStyle(.black)
-                    Text(reconnectOverlayMessage)
-                        .font(Brutal.display(14))
-                        .foregroundStyle(.black.opacity(0.6))
-                        .multilineTextAlignment(.center)
+        ZStack {
+            Color.black.opacity(0.18)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+
+            VStack(spacing: 14) {
+                Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                    .font(.system(size: 42, weight: .bold))
+                    .foregroundStyle(.black)
+                ProgressView()
+                    .tint(.black)
+                Text(reconnectOverlayTitle)
+                    .font(Brutal.display(17, weight: .bold))
+                    .foregroundStyle(.black)
+                Text(reconnectOverlayMessage)
+                    .font(Brutal.display(14))
+                    .foregroundStyle(.black.opacity(0.6))
+                    .multilineTextAlignment(.center)
+                Text("Chat history stays scrollable while reconnect runs.")
+                    .font(Brutal.mono(11, weight: .bold))
+                    .foregroundStyle(.black.opacity(0.5))
+                    .multilineTextAlignment(.center)
+                Button("Cancel Reconnect", role: .cancel) {
+                    reconnectTask?.cancel()
+                    reconnectTask = nil
+                    nextReconnectDelaySeconds = nil
+                    appState.cancelInterruptedSessionRecovery()
                 }
-                .padding(.horizontal, 28)
-                .padding(.vertical, 24)
-                .brutalCard(fill: .white, shadow: Brutal.shadowLg, border: Brutal.borderThick)
-                .padding(24)
+                .buttonStyle(BrutalButtonStyle(fill: Brutal.pink, compact: true))
+                .font(Brutal.mono(12, weight: .bold))
+                .accessibilityIdentifier("chat-reconnect-cancel")
             }
+            .padding(.horizontal, 28)
+            .padding(.vertical, 24)
+            .brutalCard(fill: .white, shadow: Brutal.shadowLg, border: Brutal.borderThick)
+            .padding(24)
+        }
     }
 
     private var reconnectOverlayTitle: String {
@@ -122,8 +146,14 @@ struct ChatView: View {
         case .connected:
             return "Attaching back to the current session..."
         case .failed:
+            if let nextReconnectDelaySeconds {
+                return "Reconnect failed. Retrying in \(nextReconnectDelaySeconds)s..."
+            }
             return "Reconnect failed. Retrying..."
         case .disconnected:
+            if let nextReconnectDelaySeconds {
+                return "Trying to restore the current chat. Next retry in \(nextReconnectDelaySeconds)s..."
+            }
             return "Trying to restore the current chat..."
         }
     }
@@ -133,17 +163,28 @@ struct ChatView: View {
         guard shouldRun else {
             reconnectTask?.cancel()
             reconnectTask = nil
+            nextReconnectDelaySeconds = nil
             return
         }
 
         reconnectTask?.cancel()
+        nextReconnectDelaySeconds = nil
         reconnectTask = Task {
+            var attempt = 0
             while !Task.isCancelled {
                 await appState.recoverInterruptedSessionIfNeeded(modelContext: modelContext)
                 if !appState.shouldShowChatReconnectOverlay {
                     break
                 }
-                try? await Task.sleep(for: .seconds(2))
+                let nextDelay = reconnectRetryDelaySeconds(forAttempt: attempt)
+                await MainActor.run {
+                    nextReconnectDelaySeconds = max(1, Int(ceil(nextDelay)))
+                }
+                try? await Task.sleep(for: .seconds(nextDelay))
+                attempt += 1
+            }
+            await MainActor.run {
+                nextReconnectDelaySeconds = nil
             }
         }
     }

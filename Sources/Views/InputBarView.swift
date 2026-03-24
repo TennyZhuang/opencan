@@ -11,6 +11,7 @@ struct InputBarView: View {
 
     var body: some View {
         let isUploadingImage = appState.isUploadingImage
+        let canEdit = appState.canSendMessages && !isUploadingImage
         let suggestions = mentionSuggestions
         VStack(spacing: 8) {
             if !suggestions.isEmpty {
@@ -36,11 +37,11 @@ struct InputBarView: View {
                 ) {
                     Image(systemName: "photo")
                         .font(.system(size: 20, weight: .bold))
-                        .foregroundStyle(isUploadingImage ? .black.opacity(0.3) : .black)
+                        .foregroundStyle(canEdit ? .black : .black.opacity(0.3))
                 }
-                .disabled(appState.isPrompting || isUploadingImage)
+                .disabled(!canEdit)
 
-                TextField("Message...", text: $text, axis: .vertical)
+                TextField(textFieldPlaceholder, text: $text, axis: .vertical)
                     .id(textFieldResetToken)
                     .font(Brutal.display(15))
                     .lineLimit(1...5)
@@ -55,6 +56,7 @@ struct InputBarView: View {
                         }
                     )
                     .overlay(Rectangle().stroke(Color.black, lineWidth: Brutal.border))
+                    .disabled(!canEdit)
 
                 if isUploadingImage {
                     ProgressView()
@@ -66,7 +68,6 @@ struct InputBarView: View {
                             .font(.title2)
                             .foregroundStyle(canSend ? Color.black : .black.opacity(0.3))
                     }
-                    .disabled(!canSend)
                     .disabled(!canSend)
                 }
             }
@@ -85,7 +86,17 @@ struct InputBarView: View {
 
     private var canSend: Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !appState.shouldShowChatReconnectOverlay
+            && appState.canSendMessages
+    }
+
+    private var textFieldPlaceholder: String {
+        if appState.shouldShowChatReconnectOverlay || appState.connectionStatus != .connected {
+            return "Read-only while disconnected"
+        }
+        if appState.isPrompting {
+            return "Wait for the current response"
+        }
+        return "Message..."
     }
 
     private func send() {

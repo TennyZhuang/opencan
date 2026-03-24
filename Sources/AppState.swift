@@ -112,6 +112,8 @@ final class AppState {
     private var shouldAutoReconnectInterruptedSession = false
     /// Guards against overlapping reconnect+open recovery attempts.
     private var isAutoReconnectInProgress = false
+    /// Invalidates stale in-flight reconnect/open attempts after cancel/disconnect.
+    private var autoReconnectRecoveryGeneration: UInt64 = 0
     /// Test hook for mocking the auto-reconnect connect step.
     var autoReconnectConnectHandler: ((Node) async -> Void)?
     /// Test hook for mocking the auto-reconnect open step.
@@ -137,6 +139,15 @@ final class AppState {
     var availableImageMentions: [UploadedImageMention] {
         guard let sessionId = currentSessionId else { return [] }
         return imageMentionsBySession[sessionId] ?? []
+    }
+
+    /// True only when chat input can safely send to an attached session.
+    var canSendMessages: Bool {
+        connectionStatus == .connected
+            && acpService != nil
+            && currentSessionId != nil
+            && !isPrompting
+            && !shouldShowChatReconnectOverlay
     }
 
     enum ConnectionStatus: Equatable {
@@ -723,9 +734,26 @@ final class AppState {
 
         connectionError = errorMessage
         connectionStatus = .disconnected
+        autoReconnectRecoveryGeneration &+= 1
         shouldAutoReconnectInterruptedSession = activeNode != nil && currentSessionId != nil
         isAutoReconnectInProgress = false
         clearRuntimeConnectionState()
+    }
+
+    /// Stop automatic reconnect attempts but keep the current transcript/context visible.
+    func cancelInterruptedSessionRecovery() {
+        autoReconnectRecoveryGeneration &+= 1
+        shouldAutoReconnectInterruptedSession = false
+        isAutoReconnectInProgress = false
+        connectionError = "Reconnect canceled"
+        if connectionStatus == .connecting || connectionStatus == .connected {
+            clearRuntimeConnectionState()
+        }
+        if activeSession != nil || currentSessionId != nil {
+            connectionStatus = .failed
+        } else {
+            connectionStatus = .disconnected
+        }
     }
 
     private func clearRuntimeConnectionState() {
@@ -789,6 +817,7 @@ final class AppState {
 
     /// Tear down the current connection and reset navigation/chat context.
     private func cleanupConnection() {
+        autoReconnectRecoveryGeneration &+= 1
         shouldAutoReconnectInterruptedSession = false
         isAutoReconnectInProgress = false
         clearRuntimeConnectionState()
@@ -1433,6 +1462,8 @@ final class AppState {
 
 
 extension AppState: ConversationLifecycleAppState {
+    var autoReconnectRecoveryGenerationForLifecycle: UInt64 { autoReconnectRecoveryGeneration }
+
     var shouldAutoReconnectInterruptedSessionForLifecycle: Bool {
         get { shouldAutoReconnectInterruptedSession }
         set { shouldAutoReconnectInterruptedSession = newValue }
