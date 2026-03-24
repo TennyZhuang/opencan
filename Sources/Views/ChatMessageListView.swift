@@ -434,7 +434,9 @@ extension ChatMessageListView {
         private func setBackToBottomButtonVisible(_ isVisible: Bool) {
             guard showsBackToBottomButton != isVisible else { return }
             showsBackToBottomButton = isVisible
-            onBackToBottomVisibilityChanged(isVisible)
+            DispatchQueue.main.async { [weak self] in
+                self?.onBackToBottomVisibilityChanged(isVisible)
+            }
         }
     }
 }
