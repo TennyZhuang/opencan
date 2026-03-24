@@ -10,9 +10,10 @@ struct ChatMessageListView: UIViewRepresentable {
     let isPrompting: Bool
     let contentVersion: Int
     let forceScrollToken: Int
+    var onBackToBottomVisibilityChanged: (Bool) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(onBackToBottomVisibilityChanged: onBackToBottomVisibilityChanged)
     }
 
     func makeUIView(context: Context) -> ListViewKit.ListView {
@@ -24,6 +25,7 @@ struct ChatMessageListView: UIViewRepresentable {
 
     func updateUIView(_ listView: ListViewKit.ListView, context: Context) {
         let entries = ChatListEntry.entries(from: messages)
+        context.coordinator.onBackToBottomVisibilityChanged = onBackToBottomVisibilityChanged
         context.coordinator.apply(
             entries: entries,
             isPrompting: isPrompting,
@@ -51,13 +53,16 @@ extension ChatMessageListView {
 
         private weak var listView: ListViewKit.ListView?
         private var dataSource: ListViewDiffableDataSource<ChatListEntry>?
+        var onBackToBottomVisibilityChanged: (Bool) -> Void
 
         private var hasLoadedData = false
         private var isNearBottom = true
+        private var showsBackToBottomButton = false
         private var lastContentVersion = -1
         private var lastForceScrollToken = 0
 
         private let nearBottomTolerance: CGFloat = 2
+        private let backToBottomVisibilityThreshold: CGFloat = 200
         private var measuredHeights: [String: HeightCacheEntry] = [:]
 
         private let markdownParser = MarkdownParser()
@@ -66,7 +71,8 @@ extension ChatMessageListView {
         private let markdownSizingView = MarkdownTextView()
         private let labelForSizing = LTXLabel()
 
-        override init() {
+        init(onBackToBottomVisibilityChanged: @escaping (Bool) -> Void) {
+            self.onBackToBottomVisibilityChanged = onBackToBottomVisibilityChanged
             super.init()
             labelForSizing.isSelectable = false
         }
@@ -403,17 +409,32 @@ extension ChatMessageListView {
                 listView.setContentOffset(target, animated: false)
             }
             isNearBottom = true
+            setBackToBottomButtonVisible(false)
         }
 
         private func updateNearBottomState() {
             guard let listView else {
                 isNearBottom = true
+                setBackToBottomButtonVisible(false)
                 return
             }
 
             let offset = listView.contentOffset.y
             let maxOffset = listView.maximumContentOffset.y
             isNearBottom = abs(offset - maxOffset) <= nearBottomTolerance
+            let distanceFromBottom = max(0, maxOffset - offset)
+            setBackToBottomButtonVisible(
+                shouldShowBackToBottomButton(
+                    distanceFromBottom: distanceFromBottom,
+                    threshold: backToBottomVisibilityThreshold
+                )
+            )
+        }
+
+        private func setBackToBottomButtonVisible(_ isVisible: Bool) {
+            guard showsBackToBottomButton != isVisible else { return }
+            showsBackToBottomButton = isVisible
+            onBackToBottomVisibilityChanged(isVisible)
         }
     }
 }
