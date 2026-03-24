@@ -2453,6 +2453,80 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.connectionStatus, .failed)
     }
 
+    func testCancelInterruptedSessionRecoveryDuringConnectSkipsOpen() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        appState.markTransportInterrupted("mock interruption")
+        XCTAssertTrue(appState.shouldShowChatReconnectOverlay)
+
+        var cancelIssued = false
+        var connectCalls = 0
+        var openCalls = 0
+        appState.autoReconnectConnectHandler = { _ in
+            connectCalls += 1
+            while !cancelIssued {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        appState.autoReconnectOpenHandler = { _, _ in
+            openCalls += 1
+        }
+
+        let recoveryTask = Task {
+            await self.appState.recoverInterruptedSessionIfNeeded(modelContext: self.modelContext)
+        }
+
+        try await waitFor(timeout: 5) { self.appState.isAutoReconnectInProgressForLifecycle }
+        appState.cancelInterruptedSessionRecovery()
+        cancelIssued = true
+        await recoveryTask.value
+
+        XCTAssertEqual(connectCalls, 1)
+        XCTAssertEqual(openCalls, 0, "Cancel during connect should stop recovery before open starts")
+        XCTAssertFalse(appState.shouldShowChatReconnectOverlay)
+        XCTAssertFalse(appState.shouldAutoReconnectInterruptedSessionForLifecycle)
+        XCTAssertEqual(appState.connectionError, "Reconnect canceled")
+        XCTAssertEqual(appState.connectionStatus, .failed)
+    }
+
+    func testOpenSessionDetachesCanceledRecoveryAttachmentFromDaemon() async throws {
+        try await connectMock()
+        try await appState.createNewSession(modelContext: modelContext)
+
+        guard let transport = appState.mockTransport else {
+            XCTFail("Mock transport not available")
+            return
+        }
+        let conversationId = try XCTUnwrap(appState.activeSession?.conversationId)
+        await transport.setMockConversationList([
+            [
+                "conversationId": .string(conversationId),
+                "state": .string("restorable"),
+                "cwd": .string("/test/path"),
+                "origin": .string("managed"),
+                "lastEventSeq": .int(0),
+            ]
+        ])
+        appState.shouldAutoReconnectInterruptedSessionForLifecycle = true
+
+        try await ConversationLifecycle.openSession(
+            appState: appState,
+            conversationId: conversationId,
+            modelContext: modelContext,
+            expectedRecoveryGeneration: appState.autoReconnectRecoveryGenerationForLifecycle &+ 1
+        )
+
+        let methods = await transport.getReceivedMethods()
+        let detachedSessionIds = await transport.getDetachedSessionIds()
+        let openedConversationId = await transport.getLastOpenConversationId()
+        let openIndex = try XCTUnwrap(methods.lastIndex(of: DaemonMethods.conversationOpen))
+        let detachIndex = try XCTUnwrap(methods.lastIndex(of: DaemonMethods.conversationDetach))
+        XCTAssertEqual(openedConversationId, conversationId)
+        XCTAssertLessThan(openIndex, detachIndex, "Canceled recovery should detach after the daemon-side open completes")
+        XCTAssertFalse(detachedSessionIds.isEmpty, "Canceled recovery should detach the daemon-side attachment it just created")
+    }
+
     func testRecoverInterruptedPromptReconnectsAndReplaysBufferedTail() async throws {
         try await connectMock()
         try await appState.createNewSession(modelContext: modelContext)
@@ -2636,13 +2710,14 @@ final class AppStateTests: XCTestCase {
         )
     }
 
-    func testReconnectRetryDelaySecondsUsesExponentialBackoffWithCap() {
-        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 0), 1)
-        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 1), 2)
-        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 2), 4)
-        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 4), 16)
-        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 5), 30)
-        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 8), 30)
+    func testReconnectRetryDelaySecondsUsesJitteredBackoffWithCap() {
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 0, randomUnit: 0.5), 1, accuracy: 0.001)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 1, randomUnit: 0.5), 2, accuracy: 0.001)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 4, randomUnit: 0.0), 12.8, accuracy: 0.001)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 4, randomUnit: 0.5), 16, accuracy: 0.001)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 4, randomUnit: 1.0), 19.2, accuracy: 0.001)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 5, randomUnit: 0.0), 25.6, accuracy: 0.001)
+        XCTAssertEqual(reconnectRetryDelaySeconds(forAttempt: 8, randomUnit: 1.0), 30, accuracy: 0.001)
     }
 
     // MARK: - Helpers

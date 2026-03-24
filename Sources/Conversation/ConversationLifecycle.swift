@@ -196,11 +196,22 @@ enum ConversationLifecycle {
         if let expectedRecoveryGeneration,
            expectedRecoveryGeneration != appState.autoReconnectRecoveryGenerationForLifecycle
             || !appState.shouldAutoReconnectInterruptedSessionForLifecycle {
+            do {
+                try await daemon.detachConversation(conversationId: conversationId, traceId: traceId)
+            } catch {
+                Log.log(
+                    level: "warning",
+                    component: "ConversationLifecycle",
+                    "failed to detach canceled recovery attachment for \(conversationId): \(error.localizedDescription)",
+                    traceId: traceId,
+                    sessionId: runtimeId
+                )
+            }
             Log.log(
                 component: "ConversationLifecycle",
                 "skipping canceled recovery apply for conversation open",
                 traceId: traceId,
-                sessionId: conversationId
+                sessionId: runtimeId
             )
             return
         }

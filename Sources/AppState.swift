@@ -146,6 +146,7 @@ final class AppState {
         connectionStatus == .connected
             && acpService != nil
             && currentSessionId != nil
+            && !isPrompting
             && !shouldShowChatReconnectOverlay
     }
 

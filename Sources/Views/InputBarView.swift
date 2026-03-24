@@ -90,7 +90,13 @@ struct InputBarView: View {
     }
 
     private var textFieldPlaceholder: String {
-        appState.canSendMessages ? "Message..." : "Read-only while disconnected"
+        if appState.shouldShowChatReconnectOverlay || appState.connectionStatus != .connected {
+            return "Read-only while disconnected"
+        }
+        if appState.isPrompting {
+            return "Wait for the current response"
+        }
+        return "Message..."
     }
 
     private func send() {

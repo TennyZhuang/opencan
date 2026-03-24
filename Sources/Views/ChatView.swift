@@ -1,9 +1,12 @@
 import SwiftUI
 import SwiftData
 
-func reconnectRetryDelaySeconds(forAttempt attempt: Int) -> TimeInterval {
+func reconnectRetryDelaySeconds(forAttempt attempt: Int, randomUnit: Double = Double.random(in: 0 ... 1)) -> TimeInterval {
     let clampedAttempt = max(attempt, 0)
-    return min(pow(2, Double(clampedAttempt)), 30)
+    let baseDelay = pow(2, Double(clampedAttempt))
+    let clampedRandom = min(max(randomUnit, 0), 1)
+    let jitterFactor = 0.8 + (clampedRandom * 0.4)
+    return min(30, max(1, baseDelay * jitterFactor))
 }
 
 struct ChatView: View {
@@ -173,11 +176,11 @@ struct ChatView: View {
                 if !appState.shouldShowChatReconnectOverlay {
                     break
                 }
-                let nextDelay = Int(reconnectRetryDelaySeconds(forAttempt: attempt))
+                let nextDelay = reconnectRetryDelaySeconds(forAttempt: attempt)
                 await MainActor.run {
-                    nextReconnectDelaySeconds = nextDelay
+                    nextReconnectDelaySeconds = max(1, Int(ceil(nextDelay)))
                 }
-                try? await Task.sleep(for: .seconds(Double(nextDelay)))
+                try? await Task.sleep(for: .seconds(nextDelay))
                 attempt += 1
             }
             await MainActor.run {
